@@ -1,0 +1,169 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.3
+    container_name: super-agent-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-app
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      - qdrant
+    volumes:
+      - .:/app
+    stdin_open: true
+    tty: true
+    command: python app.py
+
+  daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-daemon
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+    depends_on:
+      - qdrant
+    volumes:
+      - .:/app
+    command: python -m superagent.cli daemon --poll-interval 30 --heartbeat-interval 300
+
+  research-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-research-mcp
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8001
+      MCP_TRANSPORT: http
+    depends_on:
+      - qdrant
+    volumes:
+      - .:/app
+    ports:
+      - "8001:8001"
+    command: python mcp_servers/research_server.py
+
+  vector-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-vector-mcp
+    env_file:
+      - .env
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8002
+      MCP_TRANSPORT: http
+    depends_on:
+      - qdrant
+    volumes:
+      - .:/app
+    ports:
+      - "8002:8002"
+    command: python mcp_servers/vector_server.py
+
+  nmap-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-nmap-mcp
+    env_file:
+      - .env
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8003
+      MCP_TRANSPORT: http
+    volumes:
+      - .:/app
+    ports:
+      - "8003:8003"
+    command: python mcp_servers/nmap_server.py
+
+  zap-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-zap-mcp
+    env_file:
+      - .env
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8004
+      MCP_TRANSPORT: http
+    volumes:
+      - .:/app
+    ports:
+      - "8004:8004"
+    command: python mcp_servers/zap_server.py
+
+  screenshot-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-screenshot-mcp
+    env_file:
+      - .env
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8005
+      MCP_TRANSPORT: http
+    volumes:
+      - .:/app
+    ports:
+      - "8005:8005"
+    command: python mcp_servers/screenshot_server.py
+
+  http-fuzzing-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-http-fuzzing-mcp
+    env_file:
+      - .env
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8006
+      MCP_TRANSPORT: http
+    volumes:
+      - .:/app
+    ports:
+      - "8006:8006"
+    command: python mcp_servers/http_fuzzing_server.py
+
+  cve-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: super-agent-cve-mcp
+    env_file:
+      - .env
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8007
+      MCP_TRANSPORT: http
+    volumes:
+      - .:/app
+    ports:
+      - "8007:8007"
+    command: python mcp_servers/cve_server.py
+
+volumes:
+  qdrant_data:

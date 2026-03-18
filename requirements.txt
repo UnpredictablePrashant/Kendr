@@ -1,0 +1,13 @@
+langgraph 
+langchain 
+langchain-openai 
+openai
+python-dotenv
+beautifulsoup4
+pypdf
+python-docx
+qdrant-client
+fastmcp
+telethon
+boto3
+playwright
