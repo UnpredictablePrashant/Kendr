@@ -1,5 +1,0 @@
-Decision: deny
-Scan Profile: deep
-Allowed Actions: 
-Disallowed Actions: exploit, credential_attack, service_disruption
-Reason: Authorization flag not present.
