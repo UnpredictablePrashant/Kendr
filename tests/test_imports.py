@@ -11,6 +11,14 @@ class ImportSmokeTests(unittest.TestCase):
         import app  # noqa: F401
         import gateway_server  # noqa: F401
         import setup_ui  # noqa: F401
+        import superagent.domain.local_drive  # noqa: F401
+
+    def test_legacy_persistence_imports_remain_compatible(self):
+        import superagent.persistence as persistence
+        import tasks.sqlite_store as legacy_store
+
+        self.assertIs(legacy_store.initialize_db, persistence.initialize_db)
+        self.assertIs(legacy_store.list_recent_runs, persistence.list_recent_runs)
 
     @unittest.skipUnless(importlib.util.find_spec("fastmcp") is not None, "fastmcp is not installed in the active interpreter")
     def test_import_mcp_servers(self):

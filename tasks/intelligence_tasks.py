@@ -1,13 +1,21 @@
 import json
 import os
-import re
 from pathlib import Path
+
+from superagent.domain.local_drive import (
+    discover_local_drive_files as _discover_local_drive_files,
+    maybe_search_memory as _maybe_search_memory,
+    maybe_upsert_memory as _maybe_upsert_memory,
+    merge_documents as _merge_documents,
+    normalize_extension_set as _normalize_extension_set,
+    resolve_paths as _resolve_paths,
+    safe_slug as _safe_slug,
+    textual_sources_for_memory as _textual_sources_for_memory,
+)
 
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.research_infra import (
-    LOCAL_DRIVE_SUPPORTED_EXTENSIONS,
     build_evidence_bundle,
-    chunk_text,
     crawl_urls,
     evidence_text,
     llm_json,
@@ -15,11 +23,9 @@ from tasks.research_infra import (
     llm_text,
     openai_ocr_image,
     parse_documents,
-    search_memory,
     search_result_urls,
     serp_search,
     summarize_pages,
-    upsert_memory_records,
 )
 from tasks.utils import OUTPUT_DIR, log_task_update, write_text_file
 
@@ -69,149 +75,6 @@ def _write_agent_artifacts(agent_name: str, call_number: int, text_output: str, 
             _safe_json_filename(agent_name, call_number),
             json.dumps(structured_output, indent=2, ensure_ascii=False),
         )
-
-
-def _resolve_paths(raw_paths, working_directory: str | None = None) -> list[str]:
-    if isinstance(raw_paths, str):
-        raw_paths = [raw_paths]
-    results = []
-    for raw_path in raw_paths or []:
-        candidate = str(raw_path or "").strip()
-        if not candidate:
-            continue
-        windows_drive_match = re.match(r"^([a-zA-Z]):[\\/](.*)$", candidate)
-        if windows_drive_match:
-            drive = windows_drive_match.group(1).lower()
-            tail = windows_drive_match.group(2).replace("\\", "/")
-            wsl_path = Path(f"/mnt/{drive}/{tail}")
-            path = wsl_path if wsl_path.exists() else Path(candidate)
-        else:
-            path = Path(candidate)
-        if not path.is_absolute():
-            path = Path(working_directory or ".").resolve() / path
-        results.append(str(path))
-    return results
-
-
-def _normalize_extension_set(raw_extensions) -> set[str]:
-    if isinstance(raw_extensions, str):
-        items = [item.strip() for item in raw_extensions.split(",")]
-    elif isinstance(raw_extensions, list):
-        items = [str(item).strip() for item in raw_extensions]
-    else:
-        items = []
-    normalized = {f".{item.lower().lstrip('.')}" for item in items if item}
-    return normalized or set(LOCAL_DRIVE_SUPPORTED_EXTENSIONS)
-
-
-def _discover_local_drive_files(
-    roots: list[str],
-    *,
-    recursive: bool,
-    include_hidden: bool,
-    max_files: int,
-    allowed_extensions: set[str],
-) -> list[str]:
-    discovered = []
-    seen = set()
-    for root_item in roots:
-        root = Path(root_item).expanduser().resolve()
-        candidates = []
-        if root.is_file():
-            candidates = [root]
-        elif root.is_dir():
-            iterator = root.rglob("*") if recursive else root.glob("*")
-            candidates = [path for path in iterator if path.is_file()]
-        for path in sorted(candidates):
-            if path in seen:
-                continue
-            if not include_hidden and any(part.startswith(".") for part in path.parts):
-                continue
-            if path.suffix.lower() not in allowed_extensions:
-                continue
-            discovered.append(str(path))
-            seen.add(path)
-            if len(discovered) >= max_files:
-                return discovered
-    return discovered
-
-
-def _merge_documents(existing: list[dict], incoming: list[dict]) -> list[dict]:
-    by_path = {}
-    for item in existing or []:
-        if isinstance(item, dict):
-            by_path[str(item.get("path", ""))] = item
-    for item in incoming or []:
-        if isinstance(item, dict):
-            by_path[str(item.get("path", ""))] = item
-    return [item for key, item in sorted(by_path.items()) if key]
-
-
-def _safe_slug(value: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "_", str(value or "").strip()).strip("_").lower()
-    return slug[:64] or "document"
-
-
-def _textual_sources_for_memory(state: dict) -> list[dict]:
-    records = []
-    for page in state.get("web_crawl_pages", []) or []:
-        if page.get("text"):
-            for index, chunk in enumerate(chunk_text(page["text"])):
-                records.append(
-                    {
-                        "source": page.get("url", "web"),
-                        "text": chunk,
-                        "payload": {"source_type": "web_page", "chunk_index": index},
-                    }
-                )
-    for document in state.get("documents", []) or []:
-        if document.get("text"):
-            for index, chunk in enumerate(chunk_text(document["text"])):
-                records.append(
-                    {
-                        "source": document.get("path", "document"),
-                        "text": chunk,
-                        "payload": {"source_type": "document", "chunk_index": index},
-                    }
-                )
-    for item in state.get("ocr_results", []) or []:
-        if item.get("text"):
-            records.append(
-                {
-                    "source": item.get("path", "ocr"),
-                    "text": item["text"],
-                    "payload": {"source_type": "ocr"},
-                }
-            )
-    for item in state.get("local_drive_document_summaries", []) or []:
-        summary_text = (item or {}).get("summary", "")
-        if summary_text:
-            records.append(
-                {
-                    "source": f"{item.get('path', 'document')}#summary",
-                    "text": summary_text,
-                    "payload": {"source_type": "document_summary", "document_type": item.get("type", "unknown")},
-                }
-            )
-    return records
-
-
-def _maybe_upsert_memory(state: dict, records: list[dict]):
-    try:
-        result = upsert_memory_records(records)
-        state["memory_index_result"] = result
-        return result
-    except Exception as exc:
-        state["memory_index_error"] = str(exc)
-        return {"indexed": 0, "collection": "unavailable", "error": str(exc)}
-
-
-def _maybe_search_memory(state: dict, query: str, top_k: int = 5) -> list[dict]:
-    try:
-        return search_memory(query, top_k=top_k)
-    except Exception as exc:
-        state["memory_search_error"] = str(exc)
-        return []
 
 
 def access_control_agent(state):
@@ -492,6 +355,40 @@ Input:
 """
     rollup_summary = llm_text(rollup_prompt)
 
+    type_counts: dict[str, int] = {}
+    extraction_issues: list[str] = []
+    for item in document_summaries:
+        document_type = str(item.get("type", "") or "unknown").strip() or "unknown"
+        type_counts[document_type] = int(type_counts.get(document_type, 0) or 0) + 1
+        if str(item.get("error", "") or "").strip():
+            extraction_issues.append(str(item.get("file_name", "") or item.get("path", "")).strip())
+
+    catalog_lines = [
+        "Catalog Summary",
+        f"- Roots: {', '.join(roots)}",
+        f"- Files discovered: {len(files)}",
+        f"- Documents summarized: {len(document_summaries)}",
+        f"- Extraction issues: {len(extraction_issues)}",
+        "",
+        "File Type Counts",
+    ]
+    for document_type, count in sorted(type_counts.items()):
+        catalog_lines.append(f"- {document_type}: {count}")
+
+    catalog_lines.extend(["", "Representative Files"])
+    for item in document_summaries[: min(12, len(document_summaries))]:
+        error = str(item.get("error", "") or "").strip() or "none"
+        catalog_lines.append(
+            f"- {item['file_name']} | type={item['type']} | chars={item['char_count']} | error={error}"
+        )
+
+    if extraction_issues:
+        catalog_lines.extend(["", "Files With Extraction Issues"])
+        for name in extraction_issues[:10]:
+            catalog_lines.append(f"- {name}")
+
+    final_summary = "\n".join(catalog_lines + ["", "Rollup Findings", rollup_summary])
+
     payload = {
         "roots": roots,
         "recursive": recursive,
@@ -509,23 +406,32 @@ Input:
             for item in documents
         ],
         "document_summaries": document_summaries,
+        "catalog": {
+            "file_count": len(files),
+            "document_count": len(document_summaries),
+            "type_counts": type_counts,
+            "extraction_issue_count": len(extraction_issues),
+            "extraction_issues": extraction_issues,
+        },
     }
-    _write_agent_artifacts("local_drive_agent", call_number, rollup_summary, payload)
+    _write_agent_artifacts("local_drive_agent", call_number, final_summary, payload)
 
     state["local_drive_files"] = files
     state["local_drive_documents"] = documents
     state["local_drive_document_summaries"] = document_summaries
     state["local_drive_summary_bank"] = {item["path"]: item["summary"] for item in document_summaries}
+    state["local_drive_catalog"] = payload["catalog"]
+    state["local_drive_rollup_summary"] = rollup_summary
     state["documents"] = _merge_documents(state.get("documents", []), documents)
-    state["local_drive_summary"] = rollup_summary
-    state["document_summary"] = rollup_summary
-    state["draft_response"] = rollup_summary
+    state["local_drive_summary"] = final_summary
+    state["document_summary"] = final_summary
+    state["draft_response"] = final_summary
     if state.get("local_drive_index_to_memory", True):
         _maybe_upsert_memory(state, _textual_sources_for_memory(state))
     return publish_agent_output(
         state,
         "local_drive_agent",
-        rollup_summary,
+        final_summary,
         f"local_drive_result_{call_number}",
         recipients=["orchestrator_agent", "worker_agent", "reviewer_agent", "report_agent"],
     )

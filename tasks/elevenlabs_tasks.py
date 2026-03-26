@@ -6,9 +6,10 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+from superagent.providers import get_secret
+
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.research_infra import llm_text
-from tasks.setup_registry import get_secret
 from tasks.utils import log_task_update, resolve_output_path, write_binary_file, write_text_file
 
 

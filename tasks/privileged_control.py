@@ -10,7 +10,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tasks.sqlite_store import insert_privileged_audit_event
+from superagent.persistence import insert_privileged_audit_event
 
 
 _SUSPECT_SECRET_PATTERNS = [

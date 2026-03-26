@@ -119,6 +119,56 @@ class RuntimeRoutingTests(unittest.TestCase):
         self.assertEqual(routed_state["next_agent"], "__finish__")
         self.assertEqual(routed_state["final_output"], "Research completed.")
 
+    def test_planned_step_dispatch_includes_step_context_for_review(self):
+        with patch("superagent.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Create a funding report from local files.")
+            state["plan_ready"] = True
+            state["plan_approval_status"] = "approved"
+            state["plan_steps"] = [
+                {
+                    "id": "step-1",
+                    "title": "Catalog files",
+                    "agent": "local_drive_agent",
+                    "task": "Catalog the local files and summarize the evidence.",
+                    "success_criteria": "A file catalog and evidence summary exist.",
+                }
+            ]
+
+            routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "local_drive_agent")
+        self.assertEqual(routed_state["planned_active_step_id"], "step-1")
+        self.assertEqual(routed_state["planned_active_step_title"], "Catalog files")
+        self.assertEqual(routed_state["planned_active_step_success_criteria"], "A file catalog and evidence summary exist.")
+        self.assertTrue(routed_state.get("a2a", {}).get("tasks"))
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "local_drive_agent")
+        self.assertEqual(task["state_updates"]["current_plan_step_id"], "step-1")
+        self.assertEqual(task["state_updates"]["current_plan_step_title"], "Catalog files")
+        self.assertEqual(
+            task["state_updates"]["current_plan_step_success_criteria"],
+            "A file catalog and evidence summary exist.",
+        )
+
+    def test_reviewer_revision_limit_raises_after_too_many_retries(self):
+        with patch("superagent.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Create a funding report from local files.")
+            state["plan_ready"] = True
+            state["plan_approval_status"] = "approved"
+            state["last_agent"] = "reviewer_agent"
+            state["review_decision"] = "revise"
+            state["review_target_agent"] = "local_drive_agent"
+            state["review_subject_step_id"] = "step-1"
+            state["review_subject_agent"] = "local_drive_agent"
+            state["review_reason"] = "Still missing the structured file catalog."
+            state["review_revision_counts"] = {"step-1|local_drive_agent": 3}
+            state["max_step_revisions"] = 3
+
+            with self.assertRaises(RuntimeError):
+                runtime.orchestrator_agent(state)
+
     def test_superrag_request_routes_to_planner_first(self):
         with patch("superagent.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
             runtime = AgentRuntime(build_registry())

@@ -13,7 +13,7 @@ from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from tasks.setup_config_store import apply_setup_env_defaults, get_setup_component_snapshot
-from tasks.sqlite_store import get_setup_provider_tokens, set_setup_provider_tokens
+from superagent.persistence import get_setup_provider_tokens, set_setup_provider_tokens
 
 load_dotenv()
 apply_setup_env_defaults()

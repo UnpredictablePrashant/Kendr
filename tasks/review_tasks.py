@@ -23,11 +23,31 @@ def _parse_review_output(raw_output: str) -> dict:
 
 def reviewer_agent(state):
     active_task, task_content, _ = begin_agent_session(state, "reviewer_agent")
-    state['reviewer_calls']+=1
+    state["reviewer_calls"] = state.get("reviewer_calls", 0) + 1
     a2a_context = recent_messages_for_agent(state, "reviewer_agent")
     current_objective = state.get("current_objective") or state["user_query"]
     latest_output = state.get("last_agent_output") or state.get("draft_response", "")
     latest_agent = state.get("last_agent", "unknown")
+    planned_step_id = str(
+        state.get("last_completed_plan_step_id")
+        or state.get("current_plan_step_id")
+        or ""
+    ).strip()
+    planned_step_title = str(
+        state.get("last_completed_plan_step_title")
+        or state.get("current_plan_step_title")
+        or ""
+    ).strip()
+    planned_step_success = str(
+        state.get("last_completed_plan_step_success_criteria")
+        or state.get("current_plan_step_success_criteria")
+        or ""
+    ).strip()
+    revision_counts = state.get("review_revision_counts", {})
+    if not isinstance(revision_counts, dict):
+        revision_counts = {}
+    revision_key = f"{planned_step_id or 'adhoc-step'}|{latest_agent or 'unknown-agent'}"
+    revision_attempts = int(revision_counts.get(revision_key, 0) or 0)
     recent_history = state.get("agent_history", [])[-8:]
     available_agents = [
         card.get("agent_name")
@@ -55,6 +75,10 @@ def reviewer_agent(state):
     Current objective: {current_objective}
     Original user query: {state['user_query']}
     Latest agent: {latest_agent}
+    Current planned step id: {planned_step_id or 'n/a'}
+    Current planned step title: {planned_step_title or 'n/a'}
+    Current planned step success criteria: {planned_step_success or 'n/a'}
+    Prior revision attempts for this step: {revision_attempts}
     Latest output:
     {latest_output}
 
@@ -67,7 +91,9 @@ def reviewer_agent(state):
     Current setup summary:
     {state.get("setup_summary", "")}
 
-    Review every recent step and decide whether the latest output is correct for the objective.
+    Review the latest output against the current planned step, not against the final end-to-end deliverable.
+    Approve the step if it materially satisfies the current objective and success criteria, even if the full user request is not finished yet.
+    Do not request a retry unless you can name a concrete deficiency that the next attempt can realistically fix.
     Allowed next agents when revision is needed:
     {allowed_text}
 
@@ -130,6 +156,8 @@ def reviewer_agent(state):
     state["review_target_agent"] = next_agent
     state["review_corrected_values"] = corrected_values
     state["review_revised_objective"] = revised_objective
+    state["review_subject_step_id"] = planned_step_id
+    state["review_subject_agent"] = latest_agent
     state["current_objective"] = revised_objective
 
     write_text_file(

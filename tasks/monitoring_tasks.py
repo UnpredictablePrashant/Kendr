@@ -9,17 +9,13 @@ from datetime import UTC, datetime
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+from superagent.persistence import initialize_db, insert_heartbeat_event, insert_monitor_event, upsert_monitor_rule
+from superagent.setup import build_setup_snapshot
+
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.file_memory import bootstrap_file_memory, run_memory_maintenance
 from tasks.gateway_tasks import notification_dispatch_agent
 from tasks.research_infra import llm_text
-from tasks.setup_registry import build_setup_snapshot
-from tasks.sqlite_store import (
-    initialize_db,
-    insert_heartbeat_event,
-    insert_monitor_event,
-    upsert_monitor_rule,
-)
 from tasks.utils import log_task_update, write_text_file
 
 

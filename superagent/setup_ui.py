@@ -6,6 +6,19 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
+from superagent.providers import (
+    build_google_oauth_config,
+    build_google_oauth_start_url,
+    build_microsoft_oauth_config,
+    build_microsoft_oauth_start_url,
+    build_slack_oauth_config,
+    build_slack_oauth_start_url,
+    exchange_google_oauth_code,
+    exchange_microsoft_oauth_code,
+    exchange_slack_oauth_code,
+)
+from superagent.setup import build_setup_snapshot, issue_oauth_state_token
+
 from tasks.setup_config_store import (
     apply_setup_env_defaults,
     export_env_lines,
@@ -14,19 +27,6 @@ from tasks.setup_config_store import (
     save_component_values,
     set_component_enabled,
     setup_overview,
-)
-from tasks.setup_registry import (
-    build_google_oauth_config,
-    build_google_oauth_start_url,
-    build_microsoft_oauth_config,
-    build_microsoft_oauth_start_url,
-    build_setup_snapshot,
-    build_slack_oauth_config,
-    build_slack_oauth_start_url,
-    exchange_google_oauth_code,
-    exchange_microsoft_oauth_code,
-    exchange_slack_oauth_code,
-    issue_oauth_state_token,
 )
 
 

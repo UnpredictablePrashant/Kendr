@@ -4,7 +4,7 @@ from tempfile import TemporaryDirectory
 
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 
-from tasks.sqlite_store import (
+from superagent.persistence import (
     get_superrag_session,
     initialize_db,
     insert_superrag_chat_message,

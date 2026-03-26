@@ -112,8 +112,32 @@ Treat the stable workflows as the best-supported path today.
 ```bash
 superagent --help
 superagent help run
+superagent help resume
 superagent setup status
 superagent daemon --once
+```
+
+## A Run Was Interrupted Or Looks Stuck
+
+Start by inspecting the latest persisted run state:
+
+```bash
+superagent resume --working-directory . --latest --inspect
+```
+
+Common cases:
+
+- `awaiting_user_input`: the run is paused on clarification or approval and needs `--reply`.
+- `failed`: the run captured a resumable checkpoint and can continue from the saved step.
+- `running_stale`: the last heartbeat is old; resume with `--force` to take it over.
+- `completed`: use `--branch` if you want to continue from the prior context without overwriting the original run.
+
+Examples:
+
+```bash
+superagent resume --output-folder ./output/runs/run_cli_123 --reply approve
+superagent resume --output-folder ./output/runs/run_cli_123 --force
+superagent resume --output-folder ./output/runs/run_cli_123 --branch "Continue with implementation."
 ```
 
 For repository-level checks:

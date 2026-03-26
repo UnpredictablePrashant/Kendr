@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 
-from tasks.sqlite_store import (
+from superagent.persistence import (
     initialize_db,
     insert_heartbeat_event,
     insert_monitor_event,

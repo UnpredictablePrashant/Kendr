@@ -9,6 +9,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from superagent.persistence import (
+    get_superrag_session,
+    insert_superrag_chat_message,
+    insert_superrag_ingestion,
+    list_superrag_chat_messages,
+    list_superrag_ingestions,
+    list_superrag_sessions,
+    upsert_superrag_session,
+)
+from superagent.providers import get_microsoft_graph_access_token
+
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.research_infra import (
     LOCAL_DRIVE_SUPPORTED_EXTENSIONS,
@@ -18,16 +29,6 @@ from tasks.research_infra import (
     parse_documents,
     search_memory,
     upsert_memory_records,
-)
-from tasks.setup_registry import get_microsoft_graph_access_token
-from tasks.sqlite_store import (
-    get_superrag_session,
-    insert_superrag_chat_message,
-    insert_superrag_ingestion,
-    list_superrag_chat_messages,
-    list_superrag_ingestions,
-    list_superrag_sessions,
-    upsert_superrag_session,
 )
 from tasks.utils import log_task_update, write_text_file
 

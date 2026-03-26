@@ -19,6 +19,22 @@ import zipfile
 import webbrowser
 from pathlib import Path
 
+from superagent.http import (
+    build_resume_state_overrides,
+    infer_resume_working_directory,
+    resume_candidate_requires_branch,
+    resume_candidate_requires_force,
+    resume_candidate_requires_reply,
+)
+from superagent.orchestration import state_awaiting_user_input
+from superagent.setup import (
+    build_google_oauth_config,
+    build_microsoft_oauth_config,
+    build_setup_snapshot,
+    build_slack_oauth_config,
+)
+
+from .recovery import discover_resume_candidates, load_resume_candidate, render_resume_candidate
 from .discovery import build_registry
 from tasks.security_policy import (
     SECURITY_SCAN_PROFILES,
@@ -34,12 +50,6 @@ from tasks.setup_config_store import (
     save_component_values,
     set_component_enabled,
     setup_overview,
-)
-from tasks.setup_registry import build_setup_snapshot
-from tasks.setup_registry import (
-    build_google_oauth_config,
-    build_microsoft_oauth_config,
-    build_slack_oauth_config,
 )
 
 
@@ -1133,6 +1143,19 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     sessions_parser.add_argument("session_key", nargs="?")
     sessions_parser.add_argument("--limit", type=int, default=20)
     sessions_parser.add_argument("--json", action="store_true")
+
+    resume_parser = subparsers.add_parser("resume", help="Inspect or resume a persisted run from an output folder.")
+    command_parsers["resume"] = resume_parser
+    resume_parser.add_argument("target", nargs="?", default="", help="Run folder, manifest/checkpoint file, or working directory.")
+    resume_parser.add_argument("query", nargs="*", help="Optional reply or new query when resuming/branching.")
+    resume_parser.add_argument("--output-folder", default="", help="Explicit run output folder or manifest/checkpoint path.")
+    resume_parser.add_argument("--working-directory", default="", help="Working directory to search for persisted run folders.")
+    resume_parser.add_argument("--latest", action="store_true", help="Use the newest discovered candidate automatically.")
+    resume_parser.add_argument("--inspect", action="store_true", help="Only inspect the discovered session without executing it.")
+    resume_parser.add_argument("--branch", action="store_true", help="Start a new child run using the saved context instead of resuming in place.")
+    resume_parser.add_argument("--reply", default="", help="Explicit reply text for paused runs awaiting user input.")
+    resume_parser.add_argument("--force", action="store_true", help="Take over a running or stale run.")
+    resume_parser.add_argument("--json", action="store_true", help="Emit resume candidate or result as JSON.")
     return parser, command_parsers
 
 
@@ -1551,6 +1574,152 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return 0
     finally:
         _clear_transient_status_line()
+
+
+def _resume_search_target(args: argparse.Namespace) -> str:
+    explicit_output = str(getattr(args, "output_folder", "") or "").strip()
+    if explicit_output:
+        return explicit_output
+    explicit_target = str(getattr(args, "target", "") or "").strip()
+    if explicit_target:
+        return explicit_target
+    working_dir = str(getattr(args, "working_directory", "") or "").strip()
+    if working_dir:
+        return working_dir
+    configured = _configured_working_dir()
+    if configured:
+        return configured
+    return str(Path.cwd())
+
+
+def _choose_resume_candidate(args: argparse.Namespace, candidates: list[dict]) -> dict:
+    if not candidates:
+        return {}
+    if len(candidates) == 1 or bool(getattr(args, "latest", False)) or not bool(getattr(sys.stdin, "isatty", lambda: False)()):
+        return candidates[0]
+
+    rows = []
+    for index, item in enumerate(candidates, start=1):
+        rows.append(
+            [
+                str(index),
+                str(item.get("run_id", "")),
+                str(item.get("resume_status", "")),
+                _truncate(str(item.get("objective", "")), 56),
+                _truncate(str(item.get("updated_at", "")), 24),
+            ]
+        )
+    print(_render_table(["#", "RUN_ID", "STATUS", "OBJECTIVE", "UPDATED_AT"], rows))
+    while True:
+        raw = input("Select session number to resume: ").strip()
+        if raw.isdigit():
+            choice = int(raw)
+            if 1 <= choice <= len(candidates):
+                return candidates[choice - 1]
+        print("Enter a valid session number.")
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    style = _style_from_args(args)
+    search_target = _resume_search_target(args)
+    candidates = discover_resume_candidates(search_target, limit=50)
+    if not candidates:
+        raise SystemExit(f"No persisted run folders were found under: {search_target}")
+
+    candidate = _choose_resume_candidate(args, candidates)
+    if not candidate:
+        raise SystemExit("No resumable candidate was selected.")
+
+    rendered = render_resume_candidate(candidate)
+    if bool(args.inspect) and args.json:
+        print(json.dumps(candidate, indent=2, ensure_ascii=False))
+    elif not args.json:
+        print(style.heading("Recovered session"))
+        print(rendered)
+        print()
+
+    if bool(args.inspect):
+        return 0
+
+    if resume_candidate_requires_branch(candidate, branch=bool(args.branch)):
+        if not args.json:
+            print(style.warn("This run is already completed. Use --branch to start a new child run from its saved context."))
+        return 0
+
+    if str(candidate.get("resume_status", "")).strip() == "running" and resume_candidate_requires_force(candidate, force=bool(args.force)):
+        raise SystemExit("This run still looks active. Re-run with --force to take it over.")
+
+    if str(candidate.get("resume_status", "")).strip() == "running_stale" and resume_candidate_requires_force(candidate, force=bool(args.force)):
+        if bool(getattr(sys.stdin, "isatty", lambda: False)()):
+            confirm = input("The run looks stale. Take over and resume it? [y/N]: ").strip().lower()
+            if confirm not in {"y", "yes"}:
+                raise SystemExit("Resume canceled.")
+        else:
+            raise SystemExit("This run looks stale. Re-run with --force to take it over.")
+
+    reply_text = str(getattr(args, "reply", "") or "").strip()
+    if not reply_text:
+        reply_text = " ".join(getattr(args, "query", [])).strip()
+
+    interactive = bool(getattr(sys.stdin, "isatty", lambda: False)()) and not bool(args.json)
+    if resume_candidate_requires_reply(candidate) and not reply_text:
+        if not interactive:
+            raise SystemExit("This run is paused for user input. Pass --reply or use an interactive terminal.")
+        reply_text = input("Reply: ").strip()
+        if not reply_text:
+            raise SystemExit("Resume canceled: empty reply.")
+
+    run_query = reply_text or (" ".join(getattr(args, "query", [])).strip() if args.branch else "resume")
+    if not run_query:
+        run_query = str(candidate.get("objective", "") or candidate.get("user_query", "")).strip() or "resume"
+
+    working_directory = _resolve_working_dir(infer_resume_working_directory(candidate, fallback=str(Path.cwd())))
+    overrides = build_resume_state_overrides(
+        candidate,
+        branch=bool(args.branch),
+        working_directory=working_directory,
+        incoming_channel="local",
+        incoming_workspace_id="default",
+        incoming_sender_id="cli_user",
+        incoming_chat_id="cli_user",
+        incoming_is_group=False,
+    )
+
+    from superagent import AgentRuntime
+
+    runtime = AgentRuntime(build_registry())
+    current_query = run_query
+    current_candidate = candidate
+
+    while True:
+        result = runtime.run_query(current_query, state_overrides=overrides)
+        paused = state_awaiting_user_input(result)
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        else:
+            final_text = str(result.get("final_output") or result.get("draft_response") or "").strip()
+            if final_text:
+                print(final_text)
+
+        if not paused or not interactive:
+            return 0
+
+        current_candidate = load_resume_candidate(str(current_candidate.get("run_output_dir", "") or ""))
+        pending_question = str(
+            current_candidate.get("pending_user_question", "")
+            or result.get("pending_user_question", "")
+            or result.get("final_output", "")
+            or ""
+        ).strip()
+        if pending_question:
+            print()
+            print(pending_question)
+        current_query = input("Reply: ").strip()
+        if not current_query:
+            raise SystemExit("Resume canceled: empty reply.")
+        overrides["resume_checkpoint_payload"] = current_candidate.get("checkpoint", {})
+        if not bool(args.branch):
+            overrides["resume_output_dir"] = str(current_candidate.get("run_output_dir", "") or "")
 
 
 def _cmd_gateway(args: argparse.Namespace) -> int:
@@ -2067,17 +2236,19 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
         return 0
     rows = []
     for item in sessions:
+        state = item.get("state", {}) if isinstance(item.get("state"), dict) else {}
         rows.append(
             [
                 str(item.get("session_key", "")),
                 str(item.get("channel", "")),
                 str(item.get("workspace_id", "")),
                 str(item.get("chat_id", "")),
+                str(state.get("last_status", "")),
                 str(item.get("updated_at", "")),
             ]
         )
     print(style.heading(f"Sessions ({len(rows)}):"))
-    print(_render_table(["SESSION_KEY", "CHANNEL", "WORKSPACE", "CHAT", "UPDATED_AT"], rows))
+    print(_render_table(["SESSION_KEY", "CHANNEL", "WORKSPACE", "CHAT", "STATUS", "UPDATED_AT"], rows))
     return 0
 
 
@@ -2197,6 +2368,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "status":
         return _cmd_status(args)
+    if args.command == "resume":
+        return _cmd_resume(args)
     if args.command == "sessions":
         return _cmd_sessions(args)
     if args.command == "rollback":

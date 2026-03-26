@@ -132,6 +132,39 @@ superagent run \
   --superrag-chat "What are the main operating risks and where are they sourced from?"
 ```
 
+## 7. Resume An Interrupted Run
+
+Every run now writes resumable state into its run folder under `output/runs/<run_id>/`.
+
+Inspect the latest saved run in a working directory:
+
+```bash
+superagent resume --working-directory . --latest --inspect
+```
+
+Resume directly from a run folder:
+
+```bash
+superagent resume --output-folder ./output/runs/run_cli_123
+```
+
+Resume a paused approval step with an explicit reply:
+
+```bash
+superagent resume \
+  --output-folder ./output/runs/run_cli_123 \
+  --reply approve
+```
+
+Start a new child run from a completed session's saved context:
+
+```bash
+superagent resume \
+  --output-folder ./output/runs/run_cli_123 \
+  --branch \
+  "Expand the report into an investor-facing memo."
+```
+
 ## Where To Go Next
 
 - [Install](install.md) for the full setup surface

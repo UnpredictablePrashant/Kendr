@@ -6,6 +6,9 @@ from tasks.file_memory import update_planning_file
 from tasks.utils import OUTPUT_DIR, llm, log_task_update, logger, model_selection_for_agent, write_text_file
 
 
+NON_EXECUTABLE_PLAN_AGENTS = {"planner_agent"}
+
+
 def _strip_code_fences(text: str) -> str:
     stripped = (text or "").strip()
     if stripped.startswith("```") and stripped.endswith("```"):
@@ -71,6 +74,21 @@ def _collect_model_assignments(steps: list[dict[str, Any]], prefix: str = "") ->
     return assignments
 
 
+def _collect_execution_steps(steps: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    execution_steps: list[dict[str, Any]] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        agent = str(step.get("agent") or "").strip()
+        if agent in NON_EXECUTABLE_PLAN_AGENTS:
+            child_steps = step.get("substeps", [])
+            if isinstance(child_steps, list) and child_steps:
+                execution_steps.extend(_collect_execution_steps(child_steps))
+            continue
+        execution_steps.append(step)
+    return execution_steps
+
+
 def normalize_plan_data(raw_plan: Any, objective: str) -> dict[str, Any]:
     fallback = {
         "needs_clarification": False,
@@ -123,6 +141,10 @@ def normalize_plan_data(raw_plan: Any, objective: str) -> dict[str, Any]:
         "summary": str(raw_plan.get("summary") or fallback["summary"]).strip() or fallback["summary"],
         "steps": steps,
     }
+    execution_steps = _collect_execution_steps(steps)
+    if not execution_steps:
+        execution_steps = [_normalize_step(fallback["steps"][0], objective, 1)]
+    plan_data["execution_steps"] = execution_steps
     plan_data["model_assignments"] = _collect_model_assignments(steps)
     return plan_data
 
@@ -227,9 +249,12 @@ The user must review and approve the plan before execution starts.
 
 Requirements:
 - Prefer concrete agents from the available agent list.
+- Top-level steps are the actual execution units the runtime will run in order.
 - Build a detailed top-level plan with explicit success criteria.
 - Add substeps for complex deliverables, especially long reports, multi-document outputs, or 50-page style requests.
+- If substeps are included, the parent step must still be independently executable by its assigned agent. Do not rely on substeps as hidden executable work.
 - If the request is ambiguous, ask clarification questions instead of guessing.
+- Do not assign planner_agent as a step agent in steps or substeps. Planning happens before execution.
 - Do not start execution. Only plan.
 
 Planning context:
@@ -281,7 +306,7 @@ Return ONLY valid JSON in this schema:
 
     state["plan"] = plan_md
     state["plan_data"] = plan_data
-    state["plan_steps"] = plan_data.get("steps", [])
+    state["plan_steps"] = plan_data.get("execution_steps", plan_data.get("steps", []))
     state["plan_step_index"] = 0
     state["plan_version"] = plan_version
     state["plan_ready"] = False

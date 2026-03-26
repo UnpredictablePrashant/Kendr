@@ -89,10 +89,14 @@ The current codebase already includes:
 
 - dynamic registry and discovery in [`superagent/discovery.py`](superagent/discovery.py)
 - orchestration runtime in [`superagent/runtime.py`](superagent/runtime.py)
+- shared runtime-state typing in [`superagent/orchestration/state.py`](superagent/orchestration/state.py)
 - CLI entrypoint in [`superagent/cli.py`](superagent/cli.py)
 - optional HTTP gateway and dashboard in [`superagent/gateway_server.py`](superagent/gateway_server.py)
+- HTTP session/resume helpers in [`superagent/http/`](superagent/http)
+- setup and provider boundaries in [`superagent/setup/`](superagent/setup) and [`superagent/providers/`](superagent/providers)
+- domain-specific workflow slices in [`superagent/domain/`](superagent/domain)
 - internal A2A-inspired task and artifact protocol in [`tasks/a2a_protocol.py`](tasks/a2a_protocol.py)
-- durable SQLite persistence in [`tasks/sqlite_store.py`](tasks/sqlite_store.py)
+- durable SQLite persistence in [`superagent/persistence/`](superagent/persistence) with a compatibility shim at [`tasks/sqlite_store.py`](tasks/sqlite_store.py)
 - shared research infrastructure in [`tasks/research_infra.py`](tasks/research_infra.py)
 - Docker and MCP deployment assets in [`docker-compose.yml`](docker-compose.yml) and [`mcp_servers/`](mcp_servers)
 

@@ -109,7 +109,7 @@ def resolve_output_path(filename: str | os.PathLike[str]) -> str:
     return str(Path(get_output_dir()) / path)
 
 
-def set_active_output_dir(path: str) -> str:
+def set_active_output_dir(path: str, *, append: bool = False) -> str:
     global ACTIVE_OUTPUT_DIR, file_handler
 
     ACTIVE_OUTPUT_DIR = path
@@ -123,7 +123,7 @@ def set_active_output_dir(path: str) -> str:
 
     file_handler = logging.FileHandler(
         os.path.join(ACTIVE_OUTPUT_DIR, "execution.log"),
-        mode="w",
+        mode="a" if append else "w",
         encoding="utf-8",
     )
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))

@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from tasks.sqlite_store import (
+from superagent.persistence import (
     delete_setup_config_value,
     get_setup_component,
     get_setup_config_value,

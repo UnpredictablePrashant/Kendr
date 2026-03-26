@@ -8,16 +8,19 @@ from pathlib import Path
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
-from tasks.research_infra import html_to_text, llm_text
-from tasks.setup_registry import get_slack_bot_token
-from tasks.sqlite_store import (
+from superagent.http import normalize_channel, session_id_for_payload
+from superagent.orchestration import state_awaiting_user_input
+from superagent.persistence import (
     get_channel_session,
     initialize_db,
     insert_notification,
     insert_scheduled_job,
     upsert_channel_session,
 )
+from superagent.providers import get_slack_bot_token
+
+from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
+from tasks.research_infra import html_to_text, llm_text
 from tasks.utils import log_task_update, resolve_output_path, write_text_file
 
 
@@ -28,16 +31,6 @@ def _now_iso() -> str:
 def _write_outputs(agent_name: str, call_number: int, summary: str, payload: dict):
     write_text_file(f"{agent_name}_{call_number}.txt", summary)
     write_text_file(f"{agent_name}_{call_number}.json", json.dumps(payload, indent=2, ensure_ascii=False))
-
-
-def _normalize_channel(value: str) -> str:
-    channel = (value or "webchat").strip().lower()
-    aliases = {
-        "ms_teams": "teams",
-        "microsoft_teams": "teams",
-        "web": "webchat",
-    }
-    return aliases.get(channel, channel)
 
 
 def _request_text(url: str, timeout: int = 30) -> str:
@@ -292,8 +285,15 @@ def session_router_agent(state):
     chat_id = str(message.get("chat_id") or state.get("incoming_chat_id") or sender_id)
     workspace_id = str(message.get("workspace_id") or state.get("incoming_workspace_id") or "")
     is_group = bool(message.get("is_group", state.get("incoming_is_group", False)))
-    session_scope = "group" if is_group else "main"
-    session_key = ":".join(part for part in [channel, workspace_id or "default", chat_id or sender_id or "unknown", session_scope] if part)
+    session_key = session_id_for_payload(
+        {
+            "channel": channel,
+            "workspace_id": workspace_id,
+            "sender_id": sender_id,
+            "chat_id": chat_id,
+            "is_group": is_group,
+        }
+    )
 
     previous_session = get_channel_session(session_key) or {}
     previous_state = previous_session.get("state", {}) if isinstance(previous_session, dict) else {}
@@ -324,11 +324,7 @@ def session_router_agent(state):
             "history": history,
             "last_objective": state.get("current_objective", state.get("user_query", "")),
             "last_plan": state.get("plan", ""),
-            "awaiting_user_input": bool(
-                state.get("plan_needs_clarification", False)
-                or state.get("plan_waiting_for_approval", False)
-                or state.get("long_document_plan_waiting_for_approval", False)
-            ),
+            "awaiting_user_input": state_awaiting_user_input(state),
             "pending_user_input_kind": state.get("pending_user_input_kind", ""),
             "approval_pending_scope": state.get("approval_pending_scope", ""),
             "pending_user_question": state.get("pending_user_question", ""),

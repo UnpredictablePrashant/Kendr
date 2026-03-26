@@ -14,6 +14,52 @@ from superagent.cli import main
 
 
 class CliSmokeTests(unittest.TestCase):
+    @staticmethod
+    def _resume_candidate(*, status: str = "failed", resumable: bool = True) -> dict:
+        return {
+            "run_id": "run_resume_test",
+            "session_id": "session_resume_test",
+            "status": status,
+            "resume_status": status,
+            "resumable": resumable,
+            "branchable": True,
+            "resume_strategy": "step_resume",
+            "working_directory": "/tmp/work",
+            "run_output_dir": "/tmp/work/runs/run_resume_test",
+            "updated_at": "2026-03-26T00:00:00+00:00",
+            "completed_at": "",
+            "objective": "Resume the previous run",
+            "user_query": "Resume the previous run",
+            "active_agent": "worker_agent",
+            "last_agent": "worker_agent",
+            "last_error": "",
+            "pending_user_input_kind": "",
+            "pending_user_question": "",
+            "approval_pending_scope": "",
+            "plan_step_index": 1,
+            "plan_step_count": 3,
+            "current_plan_step_id": "step-2",
+            "current_plan_step_title": "Draft the report",
+            "last_completed_plan_step_id": "step-1",
+            "last_completed_plan_step_title": "Catalog the files",
+            "failure_checkpoint": {"can_resume": True, "step_index": 1, "task_content": "Draft the report"},
+            "channel_session_key": "cli_user:default:cli_user:cli_user:direct",
+            "parent_run_id": "",
+            "checkpoint": {
+                "summary": {
+                    "run_id": "run_resume_test",
+                    "status": status,
+                },
+                "state_snapshot": {
+                    "run_id": "run_resume_test",
+                    "session_id": "session_resume_test",
+                    "working_directory": "/tmp/work",
+                    "plan_steps": [{"id": "step-2", "agent": "worker_agent", "task": "Draft the report"}],
+                    "plan_step_index": 0,
+                },
+            },
+        }
+
     def test_style_status_message_colors_warning_and_error_levels(self):
         class _FakeStdout(io.StringIO):
             def isatty(self):
@@ -92,7 +138,8 @@ class CliSmokeTests(unittest.TestCase):
             finally:
                 cli._clear_transient_status_line()
 
-        self.assertIn("\r[run] waiting for completion... 17s elapsed", stderr.getvalue())
+        rendered = cli._ANSI_ESCAPE_RE.sub("", stderr.getvalue())
+        self.assertIn("\r[run] waiting for completion... 17s elapsed", rendered)
 
     def test_run_progress_message_includes_active_task_summary(self):
         message = cli._build_run_progress_message(
@@ -363,6 +410,68 @@ class CliSmokeTests(unittest.TestCase):
         output = buffer.getvalue()
         self.assertIn("Please confirm the reporting period.", output)
         self.assertIn("analysis complete", output)
+
+    def test_resume_inspect_json_outputs_single_candidate_document(self):
+        candidate = self._resume_candidate()
+        buffer = io.StringIO()
+        with (
+            patch("superagent.cli.discover_resume_candidates", return_value=[candidate]),
+            redirect_stdout(buffer),
+        ):
+            exit_code = main(["resume", "--inspect", "--json", "/tmp/work"])
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["run_id"], "run_resume_test")
+        self.assertEqual(payload["resume_status"], "failed")
+
+    def test_resume_json_outputs_final_result_only(self):
+        candidate = self._resume_candidate()
+        result = {
+            "status": "completed",
+            "run_id": "run_resume_test",
+            "final_output": "done",
+            "last_agent": "worker_agent",
+        }
+
+        class _FakeRuntime:
+            def __init__(self, registry):  # noqa: ARG002
+                pass
+
+            def run_query(self, current_query, *, state_overrides=None, create_outputs=True):  # noqa: ARG002
+                self.current_query = current_query
+                return result
+
+        buffer = io.StringIO()
+        with (
+            patch("superagent.cli.discover_resume_candidates", return_value=[candidate]),
+            patch("superagent.AgentRuntime", _FakeRuntime),
+            redirect_stdout(buffer),
+        ):
+            exit_code = main(["resume", "--json", "/tmp/work"])
+
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["final_output"], "done")
+
+    def test_resume_stale_run_requires_force_when_not_interactive(self):
+        candidate = self._resume_candidate(status="running_stale", resumable=True)
+
+        class _FakeStdin(io.StringIO):
+            def isatty(self):
+                return False
+
+        buffer = io.StringIO()
+        with (
+            patch("superagent.cli.discover_resume_candidates", return_value=[candidate]),
+            patch.object(cli.sys, "stdin", _FakeStdin()),
+            redirect_stdout(buffer),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                main(["resume", "/tmp/work"])
+
+        self.assertEqual(str(exc.exception), "This run looks stale. Re-run with --force to take it over.")
 
 
 if __name__ == "__main__":

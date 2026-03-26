@@ -19,6 +19,8 @@ At a high level, a run goes through these stages:
 
 - [`superagent/runtime.py`](../superagent/runtime.py)
   Dynamic orchestration runtime and routing loop.
+- [`superagent/orchestration/state.py`](../superagent/orchestration/state.py)
+  Shared runtime-state typing and pause/resume state helpers.
 - [`superagent/discovery.py`](../superagent/discovery.py)
   Discovery of built-in agents, external plugins, providers, and channels.
 - [`superagent/registry.py`](../superagent/registry.py)
@@ -27,10 +29,20 @@ At a high level, a run goes through these stages:
   Main command surface.
 - [`superagent/gateway_server.py`](../superagent/gateway_server.py)
   Lightweight HTTP gateway and dashboard surface.
+- [`superagent/http/`](../superagent/http/)
+  HTTP-facing session-key and resume helpers shared by CLI and gateway surfaces.
+- [`superagent/setup/`](../superagent/setup/)
+  Setup-aware integration detection surface used by runtime and setup UI.
+- [`superagent/providers/`](../superagent/providers/)
+  Provider and OAuth access helpers used by communication and ingestion agents.
+- [`superagent/domain/`](../superagent/domain/)
+  Shared domain workflow logic extracted from large agent modules by responsibility.
 - [`tasks/a2a_protocol.py`](../tasks/a2a_protocol.py)
   Internal task/message/artifact protocol.
+- [`superagent/persistence/`](../superagent/persistence/)
+  Durable SQLite persistence split by runtime, setup, and superRAG responsibilities.
 - [`tasks/sqlite_store.py`](../tasks/sqlite_store.py)
-  Durable SQLite storage.
+  Backward-compatible import shim for the legacy persistence path.
 - [`tasks/research_infra.py`](../tasks/research_infra.py)
   Shared research helpers, document parsing, OCR, chunking, and vector support.
 
@@ -55,7 +67,7 @@ External plugins are simple Python modules that expose `register(registry)`.
 
 SuperAgent does not route against the full theoretical surface by default.
 
-`tasks/setup_registry.py` detects:
+`superagent/setup` and `tasks/setup_registry.py` detect:
 
 - configured API providers
 - installed local tools

@@ -156,6 +156,9 @@ def _template_session_md() -> str:
 - last_update_at:
 - active_agent:
 - objective:
+- run_output_dir:
+- pending_user_input_kind:
+- plan_step_index:
 
 ## Last Event
 - 
@@ -310,6 +313,9 @@ def update_session_file(
         f"- last_update_at: {_now_iso()}",
         f"- active_agent: {active_agent or state.get('last_agent', '')}",
         f"- objective: {state.get('current_objective', state.get('user_query', ''))}",
+        f"- run_output_dir: {state.get('run_output_dir', '')}",
+        f"- pending_user_input_kind: {state.get('pending_user_input_kind', '')}",
+        f"- plan_step_index: {state.get('plan_step_index', 0)}",
         "",
         "## Last Event",
         f"- {(note or 'none').strip()}",

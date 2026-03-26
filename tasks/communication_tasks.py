@@ -4,13 +4,10 @@ from pathlib import Path
 from urllib.parse import urlencode, quote
 from urllib.request import Request, urlopen
 
+from superagent.providers import get_google_access_token, get_microsoft_graph_access_token, get_slack_bot_token
+
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.research_infra import html_to_text, llm_text
-from tasks.setup_registry import (
-    get_google_access_token,
-    get_microsoft_graph_access_token,
-    get_slack_bot_token,
-)
 from tasks.utils import OUTPUT_DIR, log_task_update, write_text_file
 
 

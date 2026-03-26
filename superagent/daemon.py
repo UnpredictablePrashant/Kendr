@@ -5,7 +5,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from tasks.sqlite_store import initialize_db, list_monitor_rules
+from superagent.persistence import initialize_db, list_monitor_rules
 from tasks.utils import OUTPUT_DIR, log_task_update, set_active_output_dir
 
 from .discovery import build_registry

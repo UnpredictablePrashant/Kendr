@@ -2,10 +2,25 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from langgraph.graph import END, StateGraph
+from superagent.orchestration import ResumeStateOverrides, RuntimeState, state_awaiting_user_input
+from superagent.persistence import (
+    get_channel_session,
+    initialize_db,
+    insert_agent_execution,
+    insert_run,
+    insert_run_checkpoint,
+    update_run,
+    upsert_channel_session,
+    upsert_task_session,
+)
+from superagent.setup import build_setup_snapshot
 
 from tasks.a2a_protocol import (
     append_artifact,
@@ -29,18 +44,9 @@ from tasks.file_memory import (
 )
 from tasks.privileged_control import append_privileged_audit_event, build_privileged_policy
 from tasks.review_tasks import reviewer_agent
-from tasks.setup_registry import build_setup_snapshot
-from tasks.sqlite_store import (
-    get_channel_session,
-    initialize_db,
-    insert_agent_execution,
-    insert_run,
-    update_run,
-    upsert_channel_session,
-    upsert_task_session,
-)
 from tasks.utils import (
     OUTPUT_DIR,
+    append_text_file,
     agent_model_context,
     create_run_output_dir,
     llm,
@@ -52,6 +58,7 @@ from tasks.utils import (
     set_active_output_dir,
     write_text_file,
 )
+from .recovery import write_recovery_files
 
 from .registry import Registry
 
@@ -110,13 +117,8 @@ class AgentRuntime:
             return cleaned
         return cleaned[: limit - 3] + "..."
 
-    def _awaiting_user_input(self, state: dict) -> bool:
-        return bool(
-            state.get("plan_needs_clarification", False)
-            or state.get("plan_waiting_for_approval", False)
-            or state.get("long_document_plan_waiting_for_approval", False)
-            or str(state.get("pending_user_input_kind", "")).strip()
-        )
+    def _awaiting_user_input(self, state: Mapping[str, Any]) -> bool:
+        return state_awaiting_user_input(state)
 
     def _interpret_user_input_response(self, text: str) -> dict[str, str]:
         raw = str(text or "").strip()
@@ -194,7 +196,7 @@ class AgentRuntime:
         }
         return agent_map.get(agent_name, "")
 
-    def _active_task_summary(self, state: dict, active_task: dict | None = None) -> str:
+    def _active_task_summary(self, state: Mapping[str, Any], active_task: dict | None = None) -> str:
         task = active_task if isinstance(active_task, dict) else state.get("active_task", {})
         if not isinstance(task, dict):
             task = {}
@@ -335,7 +337,7 @@ class AgentRuntime:
         self._write_session_record(state, status="running", active_agent=agent_name)
         return state
 
-    def _session_payload(self, state: dict, *, status: str, active_agent: str = "", completed_at: str = "") -> dict:
+    def _session_payload(self, state: RuntimeState, *, status: str, active_agent: str = "", completed_at: str = "") -> dict:
         channel_session = state.get("channel_session", {}) if isinstance(state.get("channel_session"), dict) else {}
         return {
             "session_id": state.get("session_id", ""),
@@ -354,7 +356,7 @@ class AgentRuntime:
                 "last_status": state.get("last_agent_status", ""),
                 "last_error": state.get("last_error", ""),
                 "active_task": self._active_task_summary(state),
-                "awaiting_user_input": self._awaiting_user_input(state),
+                "awaiting_user_input": state_awaiting_user_input(state),
                 "pending_user_input_kind": state.get("pending_user_input_kind", ""),
                 "approval_pending_scope": state.get("approval_pending_scope", ""),
                 "pending_user_question": state.get("pending_user_question", ""),
@@ -362,7 +364,7 @@ class AgentRuntime:
             },
         }
 
-    def _write_session_record(self, state: dict, *, status: str, active_agent: str = "", completed_at: str = "") -> None:
+    def _write_session_record(self, state: RuntimeState, *, status: str, active_agent: str = "", completed_at: str = "") -> None:
         if not state.get("session_id"):
             return
         upsert_task_session(self._session_payload(state, status=status, active_agent=active_agent, completed_at=completed_at))
@@ -377,8 +379,9 @@ class AgentRuntime:
         update_session_file(state, status=status, active_agent=active_agent, note=note)
         append_session_event(state, "runtime", "session_status", note)
         self._write_channel_session_progress(state, status=status, active_agent=active_agent, completed_at=completed_at)
+        self._persist_recovery_state(state, status=status, active_agent=active_agent, completed_at=completed_at)
 
-    def _base_channel_session_key(self, state: dict) -> str:
+    def _base_channel_session_key(self, state: Mapping[str, Any]) -> str:
         key = str(state.get("channel_session_key", "")).strip()
         if key:
             return key
@@ -389,7 +392,7 @@ class AgentRuntime:
         scope = "group" if bool(state.get("incoming_is_group", False)) else "main"
         return ":".join([channel, workspace_id, chat_id, scope])
 
-    def _write_channel_session_progress(self, state: dict, *, status: str, active_agent: str = "", completed_at: str = "") -> None:
+    def _write_channel_session_progress(self, state: RuntimeState, *, status: str, active_agent: str = "", completed_at: str = "") -> None:
         session_key = self._base_channel_session_key(state)
         if not session_key:
             return
@@ -433,12 +436,13 @@ class AgentRuntime:
                 "plan_revision_count": int(state.get("plan_revision_count", 0) or 0),
                 "plan_version": int(state.get("plan_version", 0) or 0),
                 "planning_notes": state.get("planning_notes", []),
+                "review_revision_counts": state.get("review_revision_counts", {}),
                 "last_status": status,
                 "last_active_agent": active_agent or state.get("last_agent", ""),
                 "last_error": state.get("last_error", ""),
                 "failure_checkpoint": state.get("failure_checkpoint", {}),
                 "completed_at": completed_at,
-                "awaiting_user_input": self._awaiting_user_input(state),
+                "awaiting_user_input": state_awaiting_user_input(state),
                 "pending_user_input_kind": state.get("pending_user_input_kind", ""),
                 "approval_pending_scope": state.get("approval_pending_scope", ""),
                 "pending_user_question": state.get("pending_user_question", ""),
@@ -456,6 +460,46 @@ class AgentRuntime:
         }
         upsert_channel_session(session_key, session_payload)
         state["channel_session"] = session_payload
+
+    def _persist_recovery_state(self, state: RuntimeState, *, status: str, active_agent: str = "", completed_at: str = "") -> None:
+        run_id = str(state.get("run_id", "")).strip()
+        if not run_id:
+            return
+        payloads = write_recovery_files(
+            state,
+            status=status,
+            active_agent=active_agent,
+            completed_at=completed_at,
+        )
+        checkpoint = payloads.get("checkpoint", {}) if isinstance(payloads, dict) else {}
+        checkpoint_json = json.dumps(checkpoint, ensure_ascii=False) if checkpoint else ""
+        resumable = False
+        if isinstance(checkpoint, dict):
+            summary = checkpoint.get("summary", {}) if isinstance(checkpoint.get("summary"), dict) else {}
+            resumable = bool(summary.get("resumable", False))
+        update_run(
+            run_id,
+            status=status,
+            updated_at=datetime.now(UTC).isoformat(),
+            working_directory=str(state.get("working_directory", "")).strip(),
+            run_output_dir=str(state.get("run_output_dir", "")).strip(),
+            session_id=str(state.get("session_id", "")).strip(),
+            parent_run_id=str(state.get("parent_run_id", "")).strip(),
+            resumable=resumable,
+            checkpoint_json=checkpoint_json,
+        )
+        if checkpoint:
+            insert_run_checkpoint(
+                {
+                    "checkpoint_id": f"{run_id}_{uuid.uuid4().hex}",
+                    "run_id": run_id,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "checkpoint_kind": "session_update",
+                    "step_index": int(state.get("plan_step_index", 0) or 0),
+                    "status": status,
+                    "data": checkpoint,
+                }
+            )
 
     def _infer_agent_output(self, before: dict, after: dict) -> str:
         if after.get("draft_response") and after.get("draft_response") != before.get("draft_response"):
@@ -711,6 +755,32 @@ class AgentRuntime:
             ),
         )
 
+    def _review_revision_key(self, step_id: str, agent_name: str) -> str:
+        resolved_step = str(step_id or "").strip() or "adhoc-step"
+        resolved_agent = str(agent_name or "").strip() or "unknown-agent"
+        return f"{resolved_step}|{resolved_agent}"
+
+    def _record_review_revision(self, state: dict, *, step_id: str, agent_name: str) -> int:
+        counts = state.get("review_revision_counts", {})
+        if not isinstance(counts, dict):
+            counts = {}
+        key = self._review_revision_key(step_id, agent_name)
+        next_count = int(counts.get(key, 0) or 0) + 1
+        counts[key] = next_count
+        state["review_revision_counts"] = counts
+        state["revision_count"] = next_count
+        return next_count
+
+    def _clear_review_revision(self, state: dict, *, step_id: str, agent_name: str) -> None:
+        counts = state.get("review_revision_counts", {})
+        if not isinstance(counts, dict):
+            return
+        key = self._review_revision_key(step_id, agent_name)
+        if key in counts:
+            counts.pop(key, None)
+            state["review_revision_counts"] = counts
+        state["revision_count"] = 0
+
     def _execute_agent(self, state: dict, agent_name: str) -> dict:
         if self._kill_switch_triggered(state):
             raise RuntimeError("Kill switch triggered. Refusing further execution.")
@@ -783,9 +853,16 @@ class AgentRuntime:
             append_daily_memory_note(state, agent_name, "completed", self._truncate(output_text, 1000))
             append_session_event(state, agent_name, "completed", self._truncate(output_text, 600))
             if agent_name == str(state.get("planned_active_agent", "")).strip():
+                state["last_completed_plan_step_id"] = str(state.get("planned_active_step_id", "")).strip()
+                state["last_completed_plan_step_title"] = str(state.get("planned_active_step_title", "")).strip()
+                state["last_completed_plan_step_success_criteria"] = str(state.get("planned_active_step_success_criteria", "")).strip()
+                state["last_completed_plan_step_agent"] = str(agent_name).strip()
                 if not hold_step_completion:
                     self._mark_planned_step_complete(state)
                 state["planned_active_agent"] = ""
+                state["planned_active_step_id"] = ""
+                state["planned_active_step_title"] = ""
+                state["planned_active_step_success_criteria"] = ""
         except Exception as exc:
             error_message = str(exc)
             state["last_error"] = error_message
@@ -997,6 +1074,26 @@ class AgentRuntime:
             if not isinstance(corrected_values, dict):
                 corrected_values = {}
             revised_objective = state.get("review_revised_objective") or current_objective
+            subject_step_id = str(
+                state.get("review_subject_step_id")
+                or state.get("last_completed_plan_step_id")
+                or state.get("current_plan_step_id")
+                or ""
+            ).strip()
+            subject_agent = str(state.get("review_subject_agent") or next_agent).strip() or next_agent
+            revision_attempt = self._record_review_revision(
+                state,
+                step_id=subject_step_id,
+                agent_name=subject_agent,
+            )
+            max_revisions = max(1, int(state.get("max_step_revisions", 3) or 3))
+            if revision_attempt > max_revisions:
+                state["last_error"] = (
+                    f"Reviewer requested more than {max_revisions} revisions for "
+                    f"{subject_step_id or 'the current step'} handled by {subject_agent}. "
+                    f"Last reason: {reason}"
+                )
+                raise RuntimeError(state["last_error"])
             corrected_values = {**corrected_values, "current_objective": revised_objective}
             state["orchestrator_reason"] = reason
             state["next_agent"] = next_agent
@@ -1013,6 +1110,24 @@ class AgentRuntime:
             return state
 
         if state.get("last_agent") == "reviewer_agent" and state.get("review_decision") == "approve":
+            approved_step_id = str(
+                state.get("review_subject_step_id")
+                or state.get("last_completed_plan_step_id")
+                or state.get("current_plan_step_id")
+                or ""
+            ).strip()
+            approved_agent = str(
+                state.get("review_subject_agent")
+                or state.get("last_completed_plan_step_agent")
+                or state.get("review_target_agent")
+                or ""
+            ).strip()
+            if approved_step_id or approved_agent:
+                self._clear_review_revision(
+                    state,
+                    step_id=approved_step_id,
+                    agent_name=approved_agent,
+                )
             update_planning_file(
                 state,
                 status="executing" if self._next_planned_agents(state) else "completed",
@@ -1050,6 +1165,9 @@ class AgentRuntime:
             state["orchestrator_reason"] = reason
             state["next_agent"] = next_agent
             state["planned_active_agent"] = next_agent
+            state["planned_active_step_id"] = str(next_step.get("id", "")).strip()
+            state["planned_active_step_title"] = str(next_step.get("title", "")).strip()
+            state["planned_active_step_success_criteria"] = str(next_step.get("success_criteria", "")).strip()
             state = append_task(
                 state,
                 make_task(
@@ -1057,7 +1175,12 @@ class AgentRuntime:
                     recipient=next_agent,
                     intent="planned-step",
                     content=task_content,
-                    state_updates={"current_objective": task_content},
+                    state_updates={
+                        "current_objective": task_content,
+                        "current_plan_step_id": str(next_step.get("id", "")).strip(),
+                        "current_plan_step_title": str(next_step.get("title", "")).strip(),
+                        "current_plan_step_success_criteria": str(next_step.get("success_criteria", "")).strip(),
+                    },
                 ),
             )
             return state
@@ -1407,7 +1530,7 @@ Return ONLY valid JSON in this exact schema:
     def new_run_id(self) -> str:
         return f"run_{datetime.now(UTC).timestamp()}"
 
-    def _restore_pending_user_input(self, initial_state: dict, prior_channel_state: dict, user_query: str) -> None:
+    def _restore_pending_user_input(self, initial_state: RuntimeState, prior_channel_state: Mapping[str, Any], user_query: str) -> None:
         pending_kind = str(prior_channel_state.get("pending_user_input_kind", "") or "").strip()
         if not pending_kind and prior_channel_state.get("awaiting_user_input"):
             pending_kind = "clarification"
@@ -1485,10 +1608,126 @@ Return ONLY valid JSON in this exact schema:
             initial_state["long_document_plan_waiting_for_approval"] = True
             initial_state["plan_ready"] = bool(initial_state.get("plan_steps")) and initial_state.get("plan_approval_status") == "approved"
 
-    def build_initial_state(self, user_query: str, **overrides) -> dict:
+    def _restore_from_resume_checkpoint(
+        self,
+        initial_state: RuntimeState,
+        checkpoint_payload: Mapping[str, Any],
+        user_query: str,
+    ) -> None:
+        if not isinstance(checkpoint_payload, Mapping):
+            return
+
+        summary = checkpoint_payload.get("summary", {})
+        if not isinstance(summary, dict):
+            summary = {}
+        snapshot = checkpoint_payload.get("state_snapshot", {})
+        if not isinstance(snapshot, dict):
+            snapshot = {}
+
+        mode = str(initial_state.get("resume_mode", "resume") or "resume").strip().lower()
+        source_run_id = str(summary.get("run_id") or snapshot.get("run_id", "")).strip()
+        source_status = str(summary.get("status", "") or snapshot.get("last_status", "")).strip().lower()
+
+        if mode == "branch":
+            inherited_prefixes = ("local_drive_", "superrag_", "ocr_", "web_crawl_")
+            inherited_keys = {
+                "documents",
+                "document_summary",
+                "draft_response",
+                "final_output",
+                "agent_history",
+                "last_agent_output",
+            }
+            for key, value in snapshot.items():
+                if key in inherited_keys or key.startswith(inherited_prefixes):
+                    initial_state[key] = value
+            initial_state["parent_run_id"] = source_run_id
+            initial_state["branch_source_run_id"] = source_run_id
+            initial_state["current_objective"] = str(user_query or snapshot.get("current_objective") or snapshot.get("user_query", "")).strip()
+            initial_state["plan"] = ""
+            initial_state["plan_data"] = {}
+            initial_state["plan_steps"] = []
+            initial_state["plan_step_index"] = 0
+            initial_state["plan_execution_count"] = 0
+            initial_state["plan_ready"] = False
+            initial_state["plan_waiting_for_approval"] = False
+            initial_state["plan_approval_status"] = "not_started"
+            initial_state["plan_needs_clarification"] = False
+            initial_state["pending_user_input_kind"] = ""
+            initial_state["pending_user_question"] = ""
+            initial_state["approval_pending_scope"] = ""
+            initial_state["long_document_plan_waiting_for_approval"] = False
+            initial_state["long_document_plan_status"] = ""
+            initial_state["failure_checkpoint"] = {}
+            initial_state["review_pending"] = False
+            initial_state["review_decision"] = ""
+            initial_state["review_reason"] = ""
+            initial_state["resume_requested"] = False
+            initial_state["resume_ready"] = False
+            initial_state["resume_blocked"] = False
+            return
+
+        protected_keys = {
+            "run_id",
+            "run_output_dir",
+            "working_directory",
+            "parent_run_id",
+            "resume_mode",
+            "resume_output_dir",
+            "resume_checkpoint_payload",
+        }
+        for key, value in snapshot.items():
+            if key in protected_keys and initial_state.get(key):
+                continue
+            initial_state[key] = value
+
+        initial_state["resume_source_run_id"] = source_run_id
+        if source_run_id and not initial_state.get("parent_run_id"):
+            initial_state["parent_run_id"] = str(snapshot.get("parent_run_id", "") or "")
+
+        last_objective = str(snapshot.get("current_objective", "") or snapshot.get("user_query", "")).strip()
+        if last_objective:
+            initial_state["session_previous_objective"] = last_objective
+
+        prior_state_like = dict(snapshot)
+        prior_state_like.setdefault("last_objective", last_objective)
+        prior_state_like.setdefault("last_status", source_status)
+        if bool(summary.get("awaiting_user_input", False)) or str(snapshot.get("pending_user_input_kind", "")).strip():
+            prior_state_like["awaiting_user_input"] = True
+            self._restore_pending_user_input(initial_state, prior_state_like, user_query)
+            return
+
+        failure_checkpoint = initial_state.get("failure_checkpoint", {})
+        if not isinstance(failure_checkpoint, dict):
+            failure_checkpoint = {}
+            initial_state["failure_checkpoint"] = {}
+
+        if source_status in {"failed", "running", "running_stale"}:
+            initial_state["resume_requested"] = True
+            can_resume = bool(failure_checkpoint.get("can_resume", True))
+            if source_status in {"running", "running_stale"}:
+                can_resume = True
+            block_reason = str(failure_checkpoint.get("block_reason", "") or "")
+            if can_resume and initial_state.get("plan_steps"):
+                failed_index = int(failure_checkpoint.get("step_index", initial_state.get("plan_step_index", 0)) or 0)
+                initial_state["plan_step_index"] = max(
+                    0,
+                    min(failed_index, max(0, len(initial_state.get("plan_steps", [])) - 1)),
+                )
+                initial_state["plan_ready"] = initial_state.get("plan_approval_status") == "approved" and not state_awaiting_user_input(initial_state)
+                initial_state["plan_needs_clarification"] = False
+                initial_state["resume_ready"] = True
+                failed_task = str(failure_checkpoint.get("task_content", "") or "").strip()
+                if failed_task:
+                    initial_state["current_objective"] = failed_task
+            elif not can_resume:
+                initial_state["resume_blocked"] = True
+                initial_state["resume_block_reason"] = block_reason or "missing plan checkpoints for safe restart"
+
+    def build_initial_state(self, user_query: str, **overrides: Any) -> RuntimeState:
         resolved_run_id = overrides.get("run_id", self.new_run_id())
         session_started_at = overrides.get("session_started_at") or datetime.now(UTC).isoformat()
-        initial_state = {
+        initial_state: RuntimeState = {
             "run_id": resolved_run_id,
             "session_id": overrides.get("session_id") or f"session_{resolved_run_id}",
             "session_started_at": session_started_at,
@@ -1509,6 +1748,16 @@ Return ONLY valid JSON in this exact schema:
             "plan_needs_clarification": False,
             "plan_clarification_questions": [],
             "planned_active_agent": "",
+            "planned_active_step_id": "",
+            "planned_active_step_title": "",
+            "planned_active_step_success_criteria": "",
+            "current_plan_step_id": "",
+            "current_plan_step_title": "",
+            "current_plan_step_success_criteria": "",
+            "last_completed_plan_step_id": "",
+            "last_completed_plan_step_title": "",
+            "last_completed_plan_step_success_criteria": "",
+            "last_completed_plan_step_agent": "",
             "active_agent_task": "",
             "pending_user_question": "",
             "pending_user_input_kind": "",
@@ -1535,9 +1784,13 @@ Return ONLY valid JSON in this exact schema:
             "review_step_assessments": [],
             "review_is_output_correct": False,
             "review_pending": False,
+            "review_subject_step_id": "",
+            "review_subject_agent": "",
+            "review_revision_counts": {},
             "worker_calls": 0,
             "reviewer_calls": 0,
             "revision_count": 0,
+            "max_step_revisions": overrides.get("max_step_revisions", 3),
             "orchestrator_calls": 0,
             "next_agent": "",
             "orchestrator_reason": "",
@@ -1565,6 +1818,7 @@ Return ONLY valid JSON in this exact schema:
             initial_state["plan_revision_count"] = int(prior_channel_state.get("plan_revision_count", 0) or 0)
             initial_state["plan_version"] = int(prior_channel_state.get("plan_version", 0) or 0)
             initial_state["planning_notes"] = prior_channel_state.get("planning_notes", [])
+            initial_state["review_revision_counts"] = prior_channel_state.get("review_revision_counts", {})
             initial_state["pending_user_input_kind"] = str(prior_channel_state.get("pending_user_input_kind", "") or "")
             initial_state["approval_pending_scope"] = str(prior_channel_state.get("approval_pending_scope", "") or "")
             initial_state["pending_user_question"] = str(prior_channel_state.get("pending_user_question", "") or "")
@@ -1599,7 +1853,7 @@ Return ONLY valid JSON in this exact schema:
                 if can_resume and initial_state.get("plan_steps"):
                     failed_index = int(resume_checkpoint.get("step_index", initial_state.get("plan_step_index", 0)) or 0)
                     initial_state["plan_step_index"] = max(0, min(failed_index, max(0, len(initial_state.get("plan_steps", [])) - 1)))
-                    initial_state["plan_ready"] = initial_state.get("plan_approval_status") == "approved" and not self._awaiting_user_input(initial_state)
+                    initial_state["plan_ready"] = initial_state.get("plan_approval_status") == "approved" and not state_awaiting_user_input(initial_state)
                     initial_state["plan_needs_clarification"] = False
                     initial_state["resume_ready"] = True
                     failed_task = str(resume_checkpoint.get("task_content", "") or "").strip()
@@ -1608,6 +1862,9 @@ Return ONLY valid JSON in this exact schema:
                 else:
                     initial_state["resume_blocked"] = True
                     initial_state["resume_block_reason"] = block_reason or "missing plan checkpoints for safe restart"
+        resume_checkpoint_payload = initial_state.get("resume_checkpoint_payload", {})
+        if isinstance(resume_checkpoint_payload, dict) and resume_checkpoint_payload:
+            self._restore_from_resume_checkpoint(initial_state, resume_checkpoint_payload, user_query)
         initial_state = self.apply_runtime_setup(initial_state)
         initial_state["privileged_policy"] = build_privileged_policy(initial_state)
         if self._is_project_audit_request(initial_state):
@@ -1641,13 +1898,19 @@ Return ONLY valid JSON in this exact schema:
         )
         return initial_state
 
-    def invoke(self, initial_state: dict) -> dict:
+    def invoke(self, initial_state: RuntimeState) -> RuntimeState:
         app = self.build_workflow()
         return app.invoke(initial_state)
 
-    def run_query(self, user_query: str, *, state_overrides: dict | None = None, create_outputs: bool = True) -> dict:
+    def run_query(
+        self,
+        user_query: str,
+        *,
+        state_overrides: ResumeStateOverrides | None = None,
+        create_outputs: bool = True,
+    ) -> RuntimeState:
         initialize_db()
-        overrides = dict(state_overrides or {})
+        overrides: ResumeStateOverrides = dict(state_overrides or {})
         if not overrides.get("channel_session_key"):
             overrides["channel_session_key"] = self._base_channel_session_key(overrides)
         existing_channel_session = None
@@ -1658,12 +1921,30 @@ Return ONLY valid JSON in this exact schema:
         working_directory = self._resolve_working_directory(overrides)
         run_id = overrides.get("run_id", self.new_run_id())
         started_at = datetime.now(UTC).isoformat()
-        run_output_dir = create_run_output_dir(run_id, base_dir=working_directory) if create_outputs else working_directory
-        insert_run(run_id, user_query, started_at, "running")
-        reset_text_file(
-            "agent_work_notes.txt",
-            f"Run ID: {run_id}\nStarted At: {started_at}\nUser Query: {user_query}\n{'=' * 72}\n\n",
+        requested_output_dir = str(overrides.get("resume_output_dir") or overrides.get("run_output_dir") or "").strip()
+        if requested_output_dir:
+            run_output_dir = set_active_output_dir(str(Path(requested_output_dir).expanduser().resolve()), append=True)
+        elif create_outputs:
+            run_output_dir = create_run_output_dir(run_id, base_dir=working_directory)
+        else:
+            run_output_dir = set_active_output_dir(working_directory, append=False)
+        insert_run(
+            run_id,
+            user_query,
+            started_at,
+            "running",
+            updated_at=started_at,
+            working_directory=working_directory,
+            run_output_dir=run_output_dir,
+            session_id=str(overrides.get("session_id", "")).strip(),
+            parent_run_id=str(overrides.get("parent_run_id", "")).strip(),
+            resumable=True,
         )
+        work_note_header = f"Run ID: {run_id}\nStarted At: {started_at}\nUser Query: {user_query}\n{'=' * 72}\n\n"
+        if requested_output_dir:
+            append_text_file("agent_work_notes.txt", work_note_header)
+        else:
+            reset_text_file("agent_work_notes.txt", work_note_header)
         initial_state_overrides = dict(overrides)
         initial_state_overrides["run_id"] = run_id
         initial_state_overrides["run_output_dir"] = run_output_dir
@@ -1741,5 +2022,4 @@ Return ONLY valid JSON in this exact schema:
             )
             raise
         finally:
-            if create_outputs:
-                set_active_output_dir(OUTPUT_DIR)
+            set_active_output_dir(OUTPUT_DIR)

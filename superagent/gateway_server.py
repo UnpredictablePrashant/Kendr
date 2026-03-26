@@ -3,47 +3,34 @@ from __future__ import annotations
 import html
 import json
 import os
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from superagent import AgentRuntime, build_registry
-from tasks.sqlite_store import (
-    list_privileged_audit_events,
+from superagent.http import (
+    build_resume_state_overrides,
+    infer_resume_working_directory,
+    resume_candidate_requires_branch,
+    resume_candidate_requires_force,
+    resume_candidate_requires_reply,
+    session_id_for_payload,
+)
+from superagent.persistence import (
+    get_run,
     list_channel_sessions,
     list_heartbeat_events,
     list_monitor_events,
     list_monitor_rules,
+    list_privileged_audit_events,
     list_recent_runs,
     list_scheduled_jobs,
     list_task_sessions,
 )
+from superagent.recovery import discover_resume_candidates, load_resume_candidate
 
 
 REGISTRY = build_registry()
 RUNTIME = AgentRuntime(REGISTRY)
-
-
-def _normalize_channel(value: str) -> str:
-    channel = (value or "webchat").strip().lower()
-    aliases = {
-        "ms_teams": "teams",
-        "microsoft_teams": "teams",
-        "web": "webchat",
-    }
-    return aliases.get(channel, channel)
-
-
-def _session_id_for_payload(payload: dict, *, force_new: bool = False) -> str:
-    channel = _normalize_channel(str(payload.get("channel", "webchat")))
-    workspace_id = str(payload.get("workspace_id", "") or "default")
-    sender_id = str(payload.get("sender_id", "") or "")
-    chat_id = str(payload.get("chat_id", "") or sender_id or "unknown")
-    scope = "group" if bool(payload.get("is_group", False)) else "main"
-    base = ":".join([channel, workspace_id, chat_id, scope])
-    if force_new:
-        return f"{base}:{int(time.time())}"
-    return base
 
 
 def _html_page(title: str, body: str) -> bytes:
@@ -128,12 +115,20 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if not run_id:
                 self._send_json(400, {"error": "missing_run_id"})
                 return
-            runs = list_recent_runs(500)
-            match = next((item for item in runs if str(item.get("run_id", "")) == run_id), None)
+            match = get_run(run_id)
             if not match:
                 self._send_json(404, {"error": "run_not_found", "run_id": run_id})
                 return
             self._send_json(200, match)
+            return
+        if parsed.path == "/resume-candidates":
+            params = parse_qs(parsed.query or "")
+            search_path = str((params.get("path") or [""])[0] or "").strip()
+            if not search_path:
+                self._send_json(400, {"error": "missing_path", "detail": "Provide ?path=<output-folder-or-working-directory>."})
+                return
+            limit = int(str((params.get("limit") or ["20"])[0] or "20"))
+            self._send_json(200, discover_resume_candidates(search_path, limit=limit))
             return
         if parsed.path == "/sessions":
             self._send_json(200, list_channel_sessions())
@@ -170,7 +165,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not_found"})
 
     def do_POST(self):
-        if self.path != "/ingest":
+        if self.path not in {"/ingest", "/resume"}:
             self._send_json(404, {"error": "not_found"})
             return
         try:
@@ -183,14 +178,65 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "invalid_json", "detail": str(exc)})
             return
 
-        text = str(payload.get("text") or payload.get("message") or payload.get("user_query") or "").strip()
-        if not text:
-            self._send_json(400, {"error": "missing_text", "detail": "Provide text, message, or user_query."})
-            return
+        if self.path == "/resume":
+            search_path = str(
+                payload.get("output_folder")
+                or payload.get("working_directory")
+                or payload.get("path")
+                or ""
+            ).strip()
+            if not search_path:
+                self._send_json(400, {"error": "missing_path", "detail": "Provide output_folder, working_directory, or path."})
+                return
+            candidate = load_resume_candidate(search_path)
+            if not candidate:
+                self._send_json(404, {"error": "resume_candidate_not_found", "path": search_path})
+                return
+
+            branch = bool(payload.get("branch", False))
+            force = bool(payload.get("force", False))
+            if resume_candidate_requires_branch(candidate, branch=branch):
+                self._send_json(409, {"error": "completed_run_requires_branch", "candidate": candidate})
+                return
+            if resume_candidate_requires_force(candidate, force=force):
+                self._send_json(409, {"error": "takeover_required", "candidate": candidate})
+                return
+            if resume_candidate_requires_reply(candidate):
+                pending_text = str(payload.get("reply") or payload.get("text") or "").strip()
+                if not pending_text:
+                    self._send_json(409, {"error": "reply_required", "candidate": candidate})
+                    return
+                text = pending_text
+            else:
+                text = str(payload.get("text") or payload.get("message") or payload.get("user_query") or "").strip() or "resume"
+
+            working_directory = infer_resume_working_directory(candidate)
+            if not working_directory:
+                self._send_json(400, {"error": "working_directory_required", "candidate": candidate})
+                return
+
+            state_overrides = build_resume_state_overrides(
+                candidate,
+                branch=branch,
+                working_directory=working_directory,
+                incoming_channel=str(payload.get("channel", "webchat") or "webchat"),
+                incoming_sender_id=str(payload.get("sender_id", "") or ""),
+                incoming_chat_id=str(payload.get("chat_id", "") or ""),
+                incoming_workspace_id=str(payload.get("workspace_id", "") or ""),
+                incoming_is_group=bool(payload.get("is_group", False)),
+            )
+        else:
+            text = str(payload.get("text") or payload.get("message") or payload.get("user_query") or "").strip()
+            if not text:
+                self._send_json(400, {"error": "missing_text", "detail": "Provide text, message, or user_query."})
+                return
         force_new_session = bool(payload.get("new_session", False) or text.lower() == "/new")
         if text.lower() == "/new":
             text = str(payload.get("next_text") or "Started a new session.")
-        working_directory = str(payload.get("working_directory") or os.getenv("SUPERAGENT_WORKING_DIR", "")).strip()
+        working_directory = str(
+            (state_overrides.get("working_directory", "") if self.path == "/resume" else payload.get("working_directory"))
+            or os.getenv("SUPERAGENT_WORKING_DIR", "")
+        ).strip()
         if not working_directory:
             self._send_json(
                 400,
@@ -206,23 +252,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             return
 
-        state_overrides = {
-            "run_id": str(payload.get("run_id", "")).strip(),
-            "max_steps": int(payload.get("max_steps", 20)),
-            "incoming_channel": payload.get("channel", "webchat"),
-            "incoming_sender_id": payload.get("sender_id", ""),
-            "incoming_chat_id": payload.get("chat_id", ""),
-            "incoming_workspace_id": payload.get("workspace_id", ""),
-            "incoming_text": text,
-            "incoming_is_group": bool(payload.get("is_group", False)),
-            "incoming_mentions_assistant": bool(payload.get("mentions_assistant", False)),
-            "incoming_payload": payload,
-            "session_id": _session_id_for_payload(payload, force_new=force_new_session),
-            "channel_session_key": _session_id_for_payload(payload, force_new=False),
-            "memory_force_new_session": force_new_session,
-            "working_directory": working_directory,
-        }
-        if not state_overrides["run_id"]:
+        if self.path != "/resume":
+            state_overrides = {
+                "run_id": str(payload.get("run_id", "")).strip(),
+                "max_steps": int(payload.get("max_steps", 20)),
+                "incoming_channel": payload.get("channel", "webchat"),
+                "incoming_sender_id": payload.get("sender_id", ""),
+                "incoming_chat_id": payload.get("chat_id", ""),
+                "incoming_workspace_id": payload.get("workspace_id", ""),
+                "incoming_text": text,
+                "incoming_is_group": bool(payload.get("is_group", False)),
+                "incoming_mentions_assistant": bool(payload.get("mentions_assistant", False)),
+                "incoming_payload": payload,
+                "session_id": session_id_for_payload(payload, force_new=force_new_session),
+                "channel_session_key": session_id_for_payload(payload, force_new=False),
+                "memory_force_new_session": force_new_session,
+                "working_directory": working_directory,
+            }
+        else:
+            state_overrides["max_steps"] = int(payload.get("max_steps", 20))
+            state_overrides["incoming_text"] = text
+            state_overrides["incoming_mentions_assistant"] = bool(payload.get("mentions_assistant", False))
+            state_overrides["incoming_payload"] = payload
+        if not str(state_overrides.get("run_id", "")).strip():
             state_overrides.pop("run_id", None)
         passthrough_keys = [
             "privileged_mode",
@@ -314,6 +366,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "awaiting_user_input": awaiting_user_input,
                     "pending_user_input_kind": result.get("pending_user_input_kind", ""),
                     "pending_user_question": result.get("pending_user_question", ""),
+                    "resume_candidate": candidate if self.path == "/resume" else {},
                 },
             )
         except Exception as exc:
@@ -349,6 +402,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             <p><a href="/runs">/runs</a></p>
             <p><a href="/sessions">/sessions</a></p>
             <p><a href="/task-sessions">/task-sessions</a></p>
+            <p><a href="/resume-candidates?path=output">/resume-candidates?path=output</a></p>
             <p><a href="/jobs">/jobs</a></p>
             <p><a href="/monitors">/monitors</a></p>
             <p><a href="/monitor-events">/monitor-events</a></p>
