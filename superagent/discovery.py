@@ -9,6 +9,7 @@ from pathlib import Path
 
 import tasks
 
+from .setup.catalog import channel_catalog, provider_catalog
 from .registry import Registry
 from .types import AgentDefinition, ChannelDefinition, PluginDefinition, ProviderDefinition
 
@@ -22,36 +23,6 @@ IGNORE_TASK_MODULES = {
     "sqlite_store",
     "utils",
 }
-
-
-PROVIDER_DEFINITIONS = [
-    ("openai", "Core LLM provider for orchestration, reasoning, OCR, and research."),
-    ("elevenlabs", "Speech and voice provider for text-to-speech and transcription."),
-    ("serpapi", "Search provider for web, travel, scholarly, and patent lookup."),
-    ("google_workspace", "Gmail and Google Drive workspace provider."),
-    ("telegram", "Telegram bot or session provider."),
-    ("slack", "Slack workspace provider."),
-    ("microsoft_graph", "Outlook, Teams, and OneDrive provider."),
-    ("aws", "AWS cloud provider."),
-    ("qdrant", "Vector memory provider."),
-    ("whatsapp", "WhatsApp Cloud API provider."),
-    ("playwright", "Browser automation provider."),
-    ("nmap", "Local network scanning provider."),
-    ("zap", "OWASP ZAP baseline scanning provider."),
-    ("cve_database", "CVE/NVD lookup provider."),
-]
-
-
-CHANNEL_DEFINITIONS = [
-    ("webchat", "Browser-based chat surface."),
-    ("telegram", "Telegram chat channel."),
-    ("slack", "Slack channel surface."),
-    ("whatsapp", "WhatsApp chat surface."),
-    ("teams", "Microsoft Teams channel."),
-    ("discord", "Discord channel."),
-    ("matrix", "Matrix channel."),
-    ("signal", "Signal channel."),
-]
 
 
 def _titleize(name: str) -> str:
@@ -77,10 +48,25 @@ def _register_builtin_capabilities(registry: Registry) -> None:
             description="Built-in channels and providers for the superagent runtime.",
         )
     )
-    for name, description in PROVIDER_DEFINITIONS:
-        registry.register_provider(ProviderDefinition(name=name, description=description, plugin_name="builtin.core"))
-    for name, description in CHANNEL_DEFINITIONS:
-        registry.register_channel(ChannelDefinition(name=name, description=description, plugin_name="builtin.core"))
+    for provider in provider_catalog():
+        registry.register_provider(
+            ProviderDefinition(
+                name=provider["name"],
+                description=provider["description"],
+                auth_mode=provider.get("auth_mode", "api_key"),
+                plugin_name="builtin.core",
+                metadata=provider.get("metadata", {}),
+            )
+        )
+    for channel in channel_catalog():
+        registry.register_channel(
+            ChannelDefinition(
+                name=channel["name"],
+                description=channel["description"],
+                plugin_name="builtin.core",
+                metadata=channel.get("metadata", {}),
+            )
+        )
 
 
 def _register_task_module_agents(registry: Registry, module_name: str) -> None:

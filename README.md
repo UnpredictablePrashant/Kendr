@@ -25,7 +25,8 @@ SuperAgent is a setup-aware orchestration runtime that combines specialized agen
 
 ```bash
 cp .env.example .env
-superagent workdir here
+superagent setup set core_runtime SUPERAGENT_WORKING_DIR /absolute/path/to/workdir
+superagent setup set openai OPENAI_API_KEY sk-...
 superagent setup status
 ```
 
@@ -69,6 +70,8 @@ The runtime may stop first on an approval-ready plan before executing the workfl
   Workflow families, status labels, and the full built-in inventory.
 - [Integrations](docs/integrations.md)
   Providers, channels, OAuth-backed setup, plugin discovery, and MCP services.
+- [Integration Checklist](docs/integration_checklist.md)
+  Contract for adding integrations without drifting setup, detection, routing, docs, and tests.
 - [Security](docs/security.md)
   Safety boundaries, authorized security workflow, and privileged controls.
 - [Troubleshooting](docs/troubleshooting.md)

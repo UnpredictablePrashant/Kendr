@@ -33,6 +33,8 @@ At a high level, a run goes through these stages:
   HTTP-facing session-key and resume helpers shared by CLI and gateway surfaces.
 - [`superagent/setup/`](../superagent/setup/)
   Setup-aware integration detection surface used by runtime and setup UI.
+- [`superagent/setup/catalog.py`](../superagent/setup/catalog.py)
+  Canonical integration declaration source for setup fields, discovery metadata, docs links, and routing contracts.
 - [`superagent/providers/`](../superagent/providers/)
   Provider and OAuth access helpers used by communication and ingestion agents.
 - [`superagent/domain/`](../superagent/domain/)

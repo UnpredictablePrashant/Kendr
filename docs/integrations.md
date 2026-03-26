@@ -1,29 +1,52 @@
 # Integrations
 
-SuperAgent routes against real setup, not just against the full theoretical ecosystem.
+SuperAgent routes against configured integrations, not against the full theoretical ecosystem.
 
-If an integration is missing or disabled, setup-aware routing filters the dependent agents out of the available runtime card list.
+The integration lifecycle is standardized across:
+
+- declaration in [`superagent/setup/catalog.py`](../superagent/setup/catalog.py)
+- configuration via `superagent setup ...` and [`.env.example`](../.env.example)
+- setup detection and health reporting in [`tasks/setup_registry.py`](../tasks/setup_registry.py)
+- routing eligibility through agent `requirements`
+- docs and tests
+
+If an integration is missing or disabled, setup-aware routing removes dependent agents from `available_agents`.
+
+Future integrations should follow [Integration Checklist](integration_checklist.md).
+
+## Lifecycle
+
+Each integration should provide one contract:
+
+| Stage | Source Of Truth |
+| --- | --- |
+| declaration | `superagent/setup/catalog.py` |
+| configuration fields | `tasks/setup_config_store.py` via the shared catalog |
+| health/detection | `tasks/setup_registry.py` |
+| routing eligibility | `AGENT_METADATA["requirements"]` |
+| concrete setup examples | `.env.example`, `README.md`, `SampleTasks.md` |
+| regression coverage | `tests/test_setup_registry.py` and related routing tests |
 
 ## Built-In Providers
 
-These providers are registered by the discovery layer today.
+These providers are registered from the shared integration catalog.
 
 | Provider | Purpose | Typical Configuration |
 | --- | --- | --- |
-| `openai` | orchestration, reasoning, OCR, embeddings, deep research | `OPENAI_API_KEY`, model env vars |
+| `openai` | orchestration, reasoning, OCR, embeddings, deep research | `OPENAI_API_KEY`, `OPENAI_MODEL_GENERAL`, `OPENAI_MODEL_CODING` |
 | `elevenlabs` | speech and voice workflows | `ELEVENLABS_API_KEY` |
 | `serpapi` | web, travel, scholarly, and patent search | `SERP_API_KEY` |
-| `google_workspace` | Gmail and Google Drive | `GOOGLE_*` |
-| `telegram` | Telegram bot or session access | `TELEGRAM_*` |
-| `slack` | Slack workspace access | `SLACK_*` |
-| `microsoft_graph` | Outlook, Teams, OneDrive | `MICROSOFT_*` |
+| `google_workspace` | Gmail and Google Drive | `GOOGLE_ACCESS_TOKEN` or OAuth client fields |
+| `telegram` | Telegram bot or session access | `TELEGRAM_BOT_TOKEN` or `TELEGRAM_SESSION_STRING` + API fields |
+| `slack` | Slack workspace access | `SLACK_BOT_TOKEN` or OAuth client fields |
+| `microsoft_graph` | Outlook, Teams, OneDrive | `MICROSOFT_GRAPH_ACCESS_TOKEN` or OAuth client fields |
 | `aws` | AWS cloud workflows | `AWS_*` |
 | `qdrant` | vector memory | `QDRANT_URL`, `QDRANT_COLLECTION` |
 | `whatsapp` | WhatsApp Cloud API | `WHATSAPP_*` |
-| `playwright` | browser automation and screenshots | Python package plus browser install |
+| `playwright` | browser automation and screenshots | Playwright package or CLI |
 | `nmap` | local network scanning | local `nmap` binary |
-| `zap` | OWASP ZAP baseline scanning | local `zap-baseline.py` |
-| `cve_database` | CVE and NVD lookup | optional `NVD_API_KEY` |
+| `zap` | OWASP ZAP baseline scanning | `zap-baseline.py` or `owasp-zap` on PATH |
+| `cve_database` | CVE and NVD lookup | `CVE_API_BASE_URL`, optional `NVD_API_KEY` |
 
 ## Built-In Channels
 
@@ -63,10 +86,72 @@ Useful setup commands:
 ```bash
 superagent setup status
 superagent setup components
+superagent setup show core_runtime --json
 superagent setup show openai --json
 superagent setup export-env
 superagent setup install --yes
 ```
+
+Concrete first-run baseline:
+
+```bash
+superagent setup set core_runtime SUPERAGENT_WORKING_DIR /absolute/path/to/workdir
+superagent setup set openai OPENAI_API_KEY sk-...
+superagent setup status
+```
+
+## Health And Routing
+
+`build_setup_snapshot()` reports each integration with:
+
+- `configured`
+- `enabled`
+- `status`
+- `health.detail`
+- `setup_hint`
+- `docs_path`
+
+Routing uses those results to populate:
+
+- `available_agents`
+- `disabled_agents`
+- `setup_actions`
+
+An agent should depend on integrations only through declared `requirements`. Missing integrations should never leave those agents eligible for routing.
+
+## Specific Integrations
+
+### OpenAI
+
+- Required for the core runtime.
+- Minimum concrete setup:
+  - `OPENAI_API_KEY`
+  - `SUPERAGENT_WORKING_DIR`
+
+### Google Workspace
+
+- Configure either a direct `GOOGLE_ACCESS_TOKEN` or OAuth client credentials.
+- If OAuth client credentials exist but no token has been acquired yet, setup status will show the integration as OAuth-ready but not configured.
+
+### Microsoft Graph
+
+- Configure either `MICROSOFT_GRAPH_ACCESS_TOKEN` or the OAuth client fields.
+- OneDrive/Outlook/Teams dependent agents stay disabled until a usable token exists.
+
+### Slack
+
+- Configure either `SLACK_BOT_TOKEN` or OAuth client fields plus app installation.
+- Communication and notification surfaces remain filtered out without a usable token.
+
+### Security Tools
+
+- `nmap`, `zap`, and `dependency-check` are local dependencies, not remote APIs.
+- Security agents stay hidden when their required tools are missing.
+
+### Qdrant
+
+- A `QDRANT_URL` alone is not enough.
+- `superagent setup status` checks reachability and keeps vector-dependent agents disabled until the service responds.
 
 ## Plugin Discovery
 

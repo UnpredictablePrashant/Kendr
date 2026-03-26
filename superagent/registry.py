@@ -40,6 +40,7 @@ class Registry:
                     agent.skills,
                     agent.input_keys,
                     agent.output_keys,
+                    agent.requirements,
                 )
             )
         return cards

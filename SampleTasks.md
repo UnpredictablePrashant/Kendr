@@ -22,6 +22,10 @@ superagent plugins list
 
 ### Research Brief (Stable)
 
+Prerequisites:
+- `OPENAI_API_KEY`
+- `SUPERAGENT_WORKING_DIR`
+
 ```bash
 superagent run "analyze this company and build a report"
 ```
@@ -31,6 +35,10 @@ Expected behavior:
 - Produces a final narrative output plus run artifacts.
 
 ### Local Drive Intelligence (Stable)
+
+Prerequisites:
+- `OPENAI_API_KEY`
+- `SUPERAGENT_WORKING_DIR`
 
 ```bash
 superagent run \
@@ -43,6 +51,11 @@ Expected behavior:
 - Produces per-document summaries and run-level artifacts for downstream reporting.
 
 ### superRAG Build + Chat (Stable)
+
+Prerequisites:
+- `OPENAI_API_KEY`
+- `SUPERAGENT_WORKING_DIR`
+- reachable `QDRANT_URL`
 
 ```bash
 superagent run \
@@ -105,6 +118,10 @@ Expected behavior:
 
 Goal: Find and screen prospects in a target sector.
 
+Prerequisites:
+- `OPENAI_API_KEY`
+- `SERP_API_KEY`
+
 ```bash
 superagent run "Identify India-based B2B SaaS startups likely in Series A/B range, then provide a screened shortlist with rationale."
 ```
@@ -117,6 +134,10 @@ Expected behavior:
 ### Case Study 4: Research Proposal and Prior Art (Beta)
 
 Goal: Compare a research idea against literature and patents.
+
+Prerequisites:
+- `OPENAI_API_KEY`
+- `SERP_API_KEY`
 
 ```bash
 superagent run "Review this proposal topic: low-cost edge AI for crop disease detection; summarize prior art, key papers, and novelty gaps."
@@ -148,6 +169,10 @@ Expected behavior:
 ### Case Study 6: Travel Planning Flow (Beta)
 
 Goal: Build practical travel routing suggestions.
+
+Prerequisites:
+- `OPENAI_API_KEY`
+- `SERP_API_KEY`
 
 ```bash
 superagent run "Plan best travel options from Bangalore to Singapore next month with likely flight windows and routing advice."
@@ -186,6 +211,10 @@ superagent run --no-auto-install-security-tools --security-authorized --security
 ### Case Study 8: Master Coding Agent (Detailed Long-Running Build) (Experimental)
 
 Goal: Deliver a complete project blueprint and route implementation/setup work to the right specialist agents.
+
+Prerequisites:
+- `OPENAI_API_KEY` or local `codex` CLI on PATH
+- `SUPERAGENT_WORKING_DIR`
 
 ```bash
 superagent run --max-steps 30 "Use master_coding_agent to design and deliver a complete production-ready SaaS starter: API, auth, database migrations, CI, tests, docs, and deployment instructions."
@@ -375,5 +404,6 @@ superagent setup install --yes --only nmap zap dependency-check playwright
 ## Notes
 
 - Agent routing is setup-aware: unconfigured integrations are filtered out automatically.
+- `superagent setup status` is the canonical way to inspect configuration gaps, health, and routing eligibility.
 - Every run writes logs and artifacts into `output/runs/<run_id>/` (including `execution.log` and `final_output.txt`).
 - Use `--json` when integrating `superagent` output into another app or pipeline.

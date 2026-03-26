@@ -87,6 +87,22 @@ class RuntimeRoutingTests(unittest.TestCase):
         summary = runtime._active_task_summary(state, task)
         self.assertIn("Scan the configured drive files", summary)
 
+    def test_apply_runtime_setup_filters_unavailable_agents_from_agent_cards(self):
+        registry = build_registry()
+        snapshot = {
+            "available_agents": ["worker_agent"],
+            "disabled_agents": {"scanner_agent": {"available": False, "missing_services": ["nmap_or_zap"]}},
+            "setup_actions": [{"service": "nmap", "action": "manual"}],
+            "summary_text": "worker_agent only",
+        }
+
+        with patch("superagent.runtime.build_setup_snapshot", return_value=snapshot):
+            runtime = AgentRuntime(registry)
+            state = runtime.apply_runtime_setup({})
+
+        self.assertEqual(state["available_agents"], ["worker_agent"])
+        self.assertEqual([card["agent_name"] for card in state["available_agent_cards"]], ["worker_agent"])
+
     def test_explicit_deep_research_request_routes_to_planner_first(self):
         with patch("superagent.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
             runtime = AgentRuntime(build_registry())

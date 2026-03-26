@@ -26,6 +26,8 @@ Use this page as the starting point for the structured docs. The repository stil
 
 - [Integrations](integrations.md)
   Providers, channels, OAuth-backed setup, plugin discovery, and MCP services.
+- [Integration Checklist](integration_checklist.md)
+  Contract for adding integrations without drifting declaration, setup, routing, docs, and tests.
 - [Security](security.md)
   Safety model, authorized security-assessment workflow, and privileged controls.
 - [Troubleshooting](troubleshooting.md)

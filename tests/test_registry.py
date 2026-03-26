@@ -33,6 +33,12 @@ class RegistryDiscoveryTests(unittest.TestCase):
         for provider_name in ["openai", "playwright", "nmap", "zap", "cve_database"]:
             self.assertIn(provider_name, registry.providers)
 
+    def test_provider_metadata_comes_from_integration_catalog(self):
+        registry = build_registry()
+        openai = registry.providers["openai"]
+        self.assertEqual(openai.metadata.get("component_id"), "openai")
+        self.assertIn("docs/integrations.md", openai.metadata.get("docs_path", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

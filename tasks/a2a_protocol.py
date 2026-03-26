@@ -16,6 +16,7 @@ def make_agent_card(
     skills: list[str],
     input_keys: list[str],
     output_keys: list[str],
+    requirements: list[str] | None = None,
 ) -> dict:
     return {
         "agent_name": agent_name,
@@ -23,6 +24,7 @@ def make_agent_card(
         "skills": skills,
         "input_keys": input_keys,
         "output_keys": output_keys,
+        "requirements": list(requirements or []),
     }
 
 

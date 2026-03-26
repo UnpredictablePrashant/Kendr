@@ -12,6 +12,7 @@ class ImportSmokeTests(unittest.TestCase):
         import gateway_server  # noqa: F401
         import setup_ui  # noqa: F401
         import superagent.domain.local_drive  # noqa: F401
+        import superagent.setup.catalog  # noqa: F401
 
     def test_legacy_persistence_imports_remain_compatible(self):
         import superagent.persistence as persistence

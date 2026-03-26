@@ -12,14 +12,15 @@ This guide covers local setup, environment configuration, Docker services, and v
 
 Start from `.env.example`.
 
-Required for the main research stack:
+Required for the core runtime:
 
 - `OPENAI_API_KEY`
-- `SERP_API_KEY`
+- `SUPERAGENT_WORKING_DIR`
 
 Recommended:
 
-- `OPENAI_MODEL`
+- `OPENAI_MODEL_GENERAL`
+- `OPENAI_MODEL_CODING`
 - `OPENAI_VISION_MODEL`
 - `OPENAI_EMBEDDING_MODEL`
 - `QDRANT_URL`
@@ -30,6 +31,7 @@ Recommended:
 
 Workflow-specific or optional:
 
+- `SERP_API_KEY`
 - `ELEVENLABS_API_KEY`
 - `GOOGLE_*`
 - `SLACK_*`
@@ -40,6 +42,7 @@ Workflow-specific or optional:
 - `NVD_API_KEY`
 
 See [Integrations](integrations.md) for provider-specific details.
+Use [Integration Checklist](integration_checklist.md) when adding new integrations.
 
 ## Local Installation
 
@@ -86,6 +89,7 @@ superagent setup components
 Set values in the local setup store:
 
 ```bash
+superagent setup set core_runtime SUPERAGENT_WORKING_DIR /absolute/path/to/workdir
 superagent setup set openai OPENAI_API_KEY sk-...
 superagent setup set openai OPENAI_MODEL_GENERAL gpt-4.1-mini
 ```
