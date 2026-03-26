@@ -277,6 +277,54 @@ def _parse_master_coding_output(raw_output: str) -> dict:
     return parsed
 
 
+def _project_plan_markdown(summary: str, objective: str, project_plan: dict, delegation: dict) -> str:
+    phases = project_plan.get("phases", []) if isinstance(project_plan, dict) else []
+    components = project_plan.get("required_components", []) if isinstance(project_plan, dict) else []
+    lines = [
+        "# Master Coding Plan",
+        "",
+        f"Objective: {objective}",
+        "",
+        f"Summary: {summary}",
+        "",
+        "## Phases",
+    ]
+    if phases:
+        for index, phase in enumerate(phases, start=1):
+            lines.append(f"{index}. {phase.get('name', 'Unnamed phase')}")
+            tasks = phase.get("tasks", []) if isinstance(phase, dict) else []
+            deliverables = phase.get("deliverables", []) if isinstance(phase, dict) else []
+            acceptance = phase.get("acceptance_criteria", []) if isinstance(phase, dict) else []
+            if tasks:
+                lines.append(f"Tasks: {', '.join(str(item) for item in tasks)}")
+            if deliverables:
+                lines.append(f"Deliverables: {', '.join(str(item) for item in deliverables)}")
+            if acceptance:
+                lines.append(f"Acceptance: {', '.join(str(item) for item in acceptance)}")
+            lines.append("")
+    else:
+        lines.extend(["- none", ""])
+
+    lines.append("## Required Components")
+    if components:
+        for item in components:
+            lines.append(
+                f"- {item.get('name', 'component')} | status={item.get('status', 'unknown')} | purpose={item.get('purpose', '')}"
+            )
+    else:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            "## Delegation",
+            f"Next agent: {delegation.get('next_agent', 'finish')}",
+            f"Reason: {delegation.get('reason', '')}",
+            f"Task: {delegation.get('task_content', '')}",
+        ]
+    )
+    return "\n".join(lines).strip()
+
+
 def _call_codex_cli(prompt: str, model: str, working_directory: Path, timeout_seconds: int) -> str:
     temp_output_path = Path(resolve_output_path("coding_agent_codex_cli_last_message.txt"))
     command = [
@@ -392,6 +440,11 @@ def coding_agent(state):
         missing_files=missing_files,
     )
 
+    raw_filename = f"coding_agent_raw_{call_number}.txt"
+    code_filename = f"coding_agent_code_{call_number}.txt"
+    report_filename = f"coding_agent_output_{call_number}.txt"
+    report_json_filename = f"coding_agent_output_{call_number}.json"
+
     backend_errors = []
     raw_output = ""
     backend_used = None
@@ -412,7 +465,13 @@ def coding_agent(state):
             backend_errors.append(f"{backend}: {exc}")
 
     if not backend_used:
-        raise RuntimeError("coding_agent could not generate code.\n" + "\n".join(backend_errors))
+        error_report = (
+            "coding_agent could not generate code.\n"
+            "Configure OPENAI_API_KEY or install the Codex CLI (`codex`) on PATH.\n"
+            + "\n".join(backend_errors)
+        ).strip()
+        write_text_file(report_filename, error_report)
+        raise RuntimeError(error_report)
 
     summary, detected_language, code = _parse_coding_response(raw_output)
     state["coding_summary"] = summary
@@ -421,10 +480,6 @@ def coding_agent(state):
     state["coding_model"] = model
     state["coding_backend_used"] = backend_used
     state["coding_raw_output"] = raw_output
-
-    raw_filename = f"coding_agent_raw_{call_number}.txt"
-    code_filename = f"coding_agent_code_{call_number}.txt"
-    report_filename = f"coding_agent_output_{call_number}.txt"
 
     write_text_file(raw_filename, raw_output)
     write_text_file(code_filename, code)
@@ -467,8 +522,20 @@ def coding_agent(state):
         code,
     ]
     report = "\n".join(report_lines).strip()
+    report_payload = {
+        "backend": backend_used,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        "summary": summary,
+        "language": detected_language,
+        "target_write_path": str(written_path) if written_path else "",
+        "context_files": list(context_files),
+        "missing_context_files": list(missing_files),
+        "code": code,
+    }
 
     write_text_file(report_filename, report)
+    write_text_file(report_json_filename, json.dumps(report_payload, indent=2, ensure_ascii=False))
 
     state["draft_response"] = report
     log_task_update(
@@ -608,7 +675,9 @@ def master_coding_agent(state):
         },
         "final_response": final_response,
     }
+    plan_markdown = _project_plan_markdown(summary, objective, project_plan, report_payload["delegation"])
     write_text_file(f"master_coding_agent_output_{call_number}.txt", json.dumps(report_payload, indent=2, ensure_ascii=False))
+    write_text_file(f"master_coding_agent_plan_{call_number}.md", plan_markdown)
     write_text_file(f"master_coding_agent_raw_{call_number}.txt", raw_output)
 
     log_task_update(

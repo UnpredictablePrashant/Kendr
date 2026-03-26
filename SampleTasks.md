@@ -4,9 +4,11 @@ This file shows practical entry points for the SuperAgent intelligence workspace
 
 If you are new to the repo, start with the stable workflows first:
 
-- research briefs
+- deep research
 - local-drive intelligence
 - `superRAG` build and chat
+- coding project builder
+- local command execution
 
 Use the beta and experimental workflows only after the core stack is configured and understood.
 
@@ -35,6 +37,31 @@ Expected behavior:
 - Routes through the core research and reporting surface.
 - Produces a final narrative output plus run artifacts.
 
+Acceptance:
+- final output is substantive and saved under `output/runs/<run_id>/`
+
+### Deep Research (Beta)
+
+Prerequisites:
+- `OPENAI_API_KEY`
+- `SUPERAGENT_WORKING_DIR`
+
+```bash
+superagent run \
+  --current-folder \
+  --research-model o4-mini-deep-research \
+  --research-instructions "Cite concrete sources and call out uncertainty." \
+  "Do deep research on battery recycling market structure, current leaders, and investment risks."
+```
+
+Expected behavior:
+- Routes into `deep_research_agent` for OpenAI web-grounded deep research.
+- Produces both a human-readable output and a raw API payload artifact.
+
+Acceptance:
+- `deep_research_output_<n>.txt` exists in the run folder
+- `deep_research_raw_<n>.json` exists in the run folder
+
 ### Local Drive Intelligence (Stable)
 
 Prerequisites:
@@ -50,6 +77,10 @@ superagent run \
 Expected behavior:
 - Uses `local_drive_agent` to scan supported files one at a time.
 - Produces per-document summaries and run-level artifacts for downstream reporting.
+
+Acceptance:
+- rollup output includes `Catalog Summary`
+- per-document summary artifacts are written
 
 ### superRAG Build + Chat (Stable)
 
@@ -78,6 +109,59 @@ superagent run \
 Expected behavior:
 - Builds a persistent knowledge session and then queries it.
 - Stores session, ingestion, and chat state for reuse.
+
+Acceptance:
+- build output includes a session id and indexed chunk count
+- chat output references the chosen session
+
+### Coding Project Builder (Beta)
+
+Prerequisites:
+- `SUPERAGENT_WORKING_DIR`
+- `OPENAI_API_KEY` or local `codex` CLI on `PATH`
+
+```bash
+superagent run \
+  --current-folder \
+  --max-steps 30 \
+  --coding-context-file README.md \
+  --coding-instructions "Prefer FastAPI, pytest, docs, and CI verification commands." \
+  "Use master_coding_agent to design and deliver a production-ready internal tools API with tests, docs, CI, and deployment files."
+```
+
+Expected behavior:
+- Starts with a blueprint approval gate before implementation.
+- Produces blueprint, plan, and coding artifacts as the workflow progresses.
+
+Acceptance:
+- `blueprint_output_<n>.md` exists
+- `master_coding_agent_plan_<n>.md` exists
+- `coding_agent_output_<n>.txt` or `.json` exists after implementation
+
+### Local Command Execution (Beta)
+
+Prerequisites:
+- `SUPERAGENT_WORKING_DIR`
+- explicit approval per run
+
+```bash
+superagent run \
+  --current-folder \
+  --os-command "Get-ChildItem" \
+  --os-shell powershell \
+  --target-os windows \
+  --privileged-approved \
+  --privileged-approval-note "OPS-123 approved repo inspection" \
+  "List the project root."
+```
+
+Expected behavior:
+- Routes into `os_agent` for controlled shell execution.
+- Writes an execution report and privileged audit entry even if the command is blocked.
+
+Acceptance:
+- `os_agent_output_<n>.txt` exists
+- the report includes shell, command, return code, stdout, and stderr
 
 ### Useful Flags
 

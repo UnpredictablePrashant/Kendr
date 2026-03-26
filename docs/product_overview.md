@@ -10,9 +10,11 @@ The project already contains many agents and domain surfaces, but the strongest 
 
 ## What SuperAgent Is Best At
 
-- research briefs on people, companies, organizations, and document collections
+- deep research on people, companies, markets, and document collections
 - local-drive intelligence across mixed files with OCR and per-document summaries
 - persistent `superRAG` sessions over files, URLs, databases, and OneDrive
+- coding project delivery through blueprint, planning, and delegated implementation
+- controlled local command execution with privileged audit trails
 - evidence-backed synthesis with artifacts, logs, and reusable memory
 
 ## Primary Workflows
@@ -55,5 +57,7 @@ If you are new to the repository, start here:
 1. run a research brief from the CLI
 2. run a local-drive intelligence pass on a small folder
 3. build and query a `superRAG` session
+4. run one coding-builder workflow
+5. run one approved local command execution workflow
 
 Then move to the broader domain-specific surfaces only after the core stack is working.

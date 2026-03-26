@@ -637,6 +637,33 @@ class AgentRuntime:
         )
         return any(marker in text for marker in markers)
 
+    def _is_local_command_request(self, state: dict) -> bool:
+        explicit_keys = ("os_command", "target_os", "shell", "os_working_directory", "os_timeout")
+        if any(state.get(key) for key in explicit_keys):
+            return True
+
+        text = " ".join(
+            [
+                str(state.get("user_query", "")),
+                str(state.get("current_objective", "")),
+            ]
+        ).lower()
+        if not text.strip():
+            return False
+
+        markers = (
+            "run this command",
+            "execute this command",
+            "run a shell command",
+            "execute a shell command",
+            "execute in terminal",
+            "run in terminal",
+            "powershell command",
+            "bash command",
+            "cmd /c",
+        )
+        return any(marker in text for marker in markers)
+
     def _is_long_document_request(self, state: dict) -> bool:
         if bool(state.get("long_document_mode", False)):
             return True
@@ -989,6 +1016,29 @@ class AgentRuntime:
                 intent="project-blueprint", content=current_objective,
                 state_updates={"blueprint_request": current_objective},
             ))
+            return state
+
+        if (
+            not state.get("plan_steps")
+            and state.get("last_agent") != "os_agent"
+            and self._is_agent_available(state, "os_agent")
+            and self._is_local_command_request(state)
+            and not self._is_project_build_request(state)
+        ):
+            reason = "The request is a local command execution workflow. Route to os_agent for controlled shell execution."
+            objective = state.get("current_objective") or state.get("user_query", "")
+            state["orchestrator_reason"] = reason
+            state["next_agent"] = "os_agent"
+            state = append_task(
+                state,
+                make_task(
+                    sender="orchestrator_agent",
+                    recipient="os_agent",
+                    intent="local-command-dispatch",
+                    content=objective,
+                    state_updates={"current_objective": objective},
+                ),
+            )
             return state
 
         # --- Project builder: blueprint approval gate ---

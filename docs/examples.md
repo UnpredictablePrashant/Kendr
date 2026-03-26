@@ -1,23 +1,19 @@
 # Examples
 
-These examples are grouped by the current product status labels.
+These examples start with the current recommended workflow entry points.
 
+For a walkthrough with artifacts and acceptance checks, see [Core Workflows](core_workflows.md).
 For a longer command list, see [Extended CLI Examples](../SampleTasks.md).
 
-## Stable Workflows
+## Recommended Entry Points
 
-### Research Brief
-
-```bash
-superagent run --current-folder \
-  "Create an intelligence brief on Stripe: business model, products, competitors, recent strategy moves, and top risks."
-```
-
-### People And Organization Mapping
+### Deep Research
 
 ```bash
 superagent run --current-folder \
-  "Research Satya Nadella's recent public interviews and connect themes to Microsoft product priorities."
+  --research-model o4-mini-deep-research \
+  --research-instructions "Cite concrete sources and call out uncertainty." \
+  "Do deep research on Stripe's enterprise strategy, current moat, and main risks."
 ```
 
 ### Local-Drive Intelligence
@@ -49,7 +45,42 @@ superagent run \
   --superrag-chat "What are the main operating risks and where are they sourced from?"
 ```
 
-## Beta Workflows
+### Coding Project Builder
+
+```bash
+superagent run --current-folder --max-steps 30 \
+  --coding-context-file README.md \
+  --coding-instructions "Prefer FastAPI, pytest, docs, and CI verification commands." \
+  "Use master_coding_agent to design and deliver a production-ready internal tools API with tests, docs, CI, and deployment files."
+```
+
+### Local Command Execution
+
+```bash
+superagent run --current-folder \
+  --os-command "Get-ChildItem" \
+  --os-shell powershell \
+  --target-os windows \
+  --privileged-approved \
+  --privileged-approval-note "OPS-123 approved repo inspection" \
+  "List the project root."
+```
+
+## Additional Examples
+
+### Research Brief
+
+```bash
+superagent run --current-folder \
+  "Create an intelligence brief on Stripe: business model, products, competitors, recent strategy moves, and top risks."
+```
+
+### People And Organization Mapping
+
+```bash
+superagent run --current-folder \
+  "Research Satya Nadella's recent public interviews and connect themes to Microsoft product priorities."
+```
 
 ### Deal Advisory
 

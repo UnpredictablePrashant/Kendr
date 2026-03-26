@@ -12,6 +12,8 @@ Use this page as the starting point for the structured docs. The repository stil
   Local install, environment setup, Docker, and verification commands.
 - [Verification](verification.md)
   Verification buckets, bootstrap path, and CI/local commands.
+- [Core Workflows](core_workflows.md)
+  Recommended entry points, walkthroughs, artifacts, and acceptance checks.
 - [Examples](examples.md)
   Stable, beta, and experimental example workflows.
 

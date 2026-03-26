@@ -275,6 +275,30 @@ class CliSmokeTests(unittest.TestCase):
             self.assertIn("Gateway restarted", buffer.getvalue())
             start_gateway.assert_called_once()
 
+    def test_run_superrag_chat_requires_session(self):
+        with (
+            patch("superagent.cli._configured_working_dir", return_value="/tmp/work"),
+            patch("superagent.cli._resolve_working_dir", return_value="/tmp/work"),
+            patch(
+                "superagent.cli._workflow_setup_snapshot",
+                return_value={"available_agents": ["superrag_agent"], "agents": {"superrag_agent": {"missing_services": []}}},
+            ),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                main(["run", "--superrag-mode", "chat", "What are the top risks?"])
+
+        self.assertIn("--superrag-session", str(exc.exception))
+
+    def test_run_os_command_requires_explicit_privileged_approval(self):
+        with (
+            patch("superagent.cli._configured_working_dir", return_value="/tmp/work"),
+            patch("superagent.cli._resolve_working_dir", return_value="/tmp/work"),
+        ):
+            with self.assertRaises(SystemExit) as exc:
+                main(["run", "--os-command", "Get-Location", "Show the working directory"])
+
+        self.assertIn("--privileged-approved", str(exc.exception))
+
     def test_setup_oauth_no_browser_outputs_url(self):
         with (
             patch("superagent.cli._setup_ui_ready", return_value=True),
@@ -312,6 +336,7 @@ class CliSmokeTests(unittest.TestCase):
             patch("superagent.cli._configured_working_dir", return_value="/tmp/work"),
             patch("superagent.cli._resolve_working_dir", return_value="/tmp/work"),
             patch("superagent.cli._http_json_get", return_value=[]),
+            patch("superagent.cli._validate_run_workflows", return_value={}),
             patch("superagent.cli.urllib.request.urlopen", side_effect=_fake_urlopen),
         ):
             buffer = io.StringIO()
@@ -332,6 +357,70 @@ class CliSmokeTests(unittest.TestCase):
         self.assertTrue(payload.get("local_drive_force_long_document"))
         self.assertTrue(payload.get("long_document_mode"))
         self.assertEqual(payload.get("long_document_pages"), 50)
+
+    def test_run_forwards_coding_and_research_controls(self):
+        captured = {"payload": {}}
+
+        class _FakeResponse:
+            def __init__(self, body: str):
+                self._body = body.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self._body
+
+        def _fake_urlopen(request, timeout=0):  # noqa: ARG001
+            body = request.data.decode("utf-8") if getattr(request, "data", None) else "{}"
+            captured["payload"] = json.loads(body)
+            return _FakeResponse(json.dumps({"run_id": "run_code", "final_output": "ok", "last_agent": "coding_agent"}))
+
+        with (
+            patch("superagent.cli._gateway_ready", return_value=True),
+            patch("superagent.cli._configured_working_dir", return_value="/tmp/work"),
+            patch("superagent.cli._resolve_working_dir", return_value="/tmp/work"),
+            patch("superagent.cli._http_json_get", return_value=[]),
+            patch(
+                "superagent.cli._workflow_setup_snapshot",
+                return_value={"available_agents": ["coding_agent", "master_coding_agent", "deep_research_agent"], "agents": {}},
+            ),
+            patch("superagent.cli.urllib.request.urlopen", side_effect=_fake_urlopen),
+        ):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = main(
+                    [
+                        "run",
+                        "--json",
+                        "--quiet",
+                        "--coding-context-file",
+                        "README.md",
+                        "--coding-write-path",
+                        "app/main.py",
+                        "--coding-instructions",
+                        "Prefer FastAPI.",
+                        "--coding-language",
+                        "python",
+                        "--research-model",
+                        "o4-mini-deep-research",
+                        "--research-instructions",
+                        "Cite concrete sources.",
+                        "Build a production-ready API starter.",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        payload = captured["payload"]
+        self.assertEqual(payload.get("coding_context_files"), ["README.md"])
+        self.assertEqual(payload.get("coding_write_path"), "app/main.py")
+        self.assertEqual(payload.get("coding_instructions"), "Prefer FastAPI.")
+        self.assertEqual(payload.get("coding_language"), "python")
+        self.assertEqual(payload.get("research_model"), "o4-mini-deep-research")
+        self.assertEqual(payload.get("research_instructions"), "Cite concrete sources.")
 
     def test_run_interactive_follow_up_resubmits_paused_session(self):
         captured_payloads = []

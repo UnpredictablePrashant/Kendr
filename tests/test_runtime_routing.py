@@ -201,6 +201,19 @@ class RuntimeRoutingTests(unittest.TestCase):
         task = routed_state["a2a"]["tasks"][-1]
         self.assertEqual(task["recipient"], "planner_agent")
 
+    def test_explicit_os_command_routes_to_os_agent(self):
+        with patch("superagent.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Run a local command to inspect the repository.")
+            state["os_command"] = "Get-Location"
+
+            routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "os_agent")
+        self.assertTrue(routed_state.get("a2a", {}).get("tasks"))
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "os_agent")
+
     def test_local_drive_request_routes_to_planner_first(self):
         with patch("superagent.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
             runtime = AgentRuntime(build_registry())

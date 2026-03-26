@@ -30,16 +30,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 Manual install on any OS:
 
 ```bash
-python3 -m pip install -e .
+python3 -m pip install -e ".[dev]"
+python3 scripts/bootstrap_local_state.py
 ```
 
 ## 2. Configure Environment
 
-Use `.env.example` as your baseline:
-
-```bash
-cp .env.example .env
-```
+The install/bootstrap scripts create a local `.env` for you. If you are configuring manually, use `.env.example` as the baseline.
 
 Set at least:
 
@@ -84,6 +81,7 @@ superagent --help
 superagent agents list
 superagent plugins list
 superagent setup status
+python scripts/verify.py smoke
 ```
 
 ## 5. First Run
@@ -102,6 +100,15 @@ What to expect:
 - after approval, SuperAgent executes the workflow and writes artifacts under `output/runs/<run_id>/`
 
 ## 6. Recommended Next Runs
+
+Deep research:
+
+```bash
+superagent run --current-folder \
+  --research-model o4-mini-deep-research \
+  --research-instructions "Cite concrete sources and call out uncertainty." \
+  "Do deep research on battery recycling market structure, current leaders, and investment risks."
+```
 
 Local-drive intelligence:
 
@@ -130,6 +137,28 @@ superagent run \
   --superrag-mode chat \
   --superrag-session product_ops_kb \
   --superrag-chat "What are the main operating risks and where are they sourced from?"
+```
+
+Coding project builder:
+
+```bash
+superagent run --current-folder \
+  --max-steps 30 \
+  --coding-context-file README.md \
+  --coding-instructions "Prefer FastAPI, pytest, docs, and CI verification commands." \
+  "Use master_coding_agent to design and deliver a production-ready internal tools API with tests, docs, CI, and deployment files."
+```
+
+Local command execution:
+
+```bash
+superagent run --current-folder \
+  --os-command "Get-ChildItem" \
+  --os-shell powershell \
+  --target-os windows \
+  --privileged-approved \
+  --privileged-approval-note "OPS-123 approved repo inspection" \
+  "List the project root."
 ```
 
 ## 7. Resume An Interrupted Run
@@ -168,5 +197,6 @@ superagent resume \
 ## Where To Go Next
 
 - [Install](install.md) for the full setup surface
+- [Core Workflows](core_workflows.md) for the recommended product entry points
 - [Examples](examples.md) for more workflows
 - [Troubleshooting](troubleshooting.md) if the first run does not behave as expected

@@ -188,8 +188,10 @@ This is part of the generated-agent scaffold-and-run path, but it is not a built
 
 For new users, start with:
 
-- research briefs
+- deep research
 - local-drive intelligence
 - `superRAG`
+- coding project builder
+- local command execution
 
 Then expand into the more setup-heavy domain workflows as needed.

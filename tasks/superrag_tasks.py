@@ -278,6 +278,12 @@ def _format_eta(seconds: int) -> str:
     return f"{minutes}m {rem}s"
 
 
+def _superrag_dependency_error(stage: str, exc: Exception) -> ValueError:
+    return ValueError(
+        f"superRAG {stage} failed. Confirm OPENAI_API_KEY and a reachable QDRANT_URL, then re-run `superagent setup status`. Root cause: {exc}"
+    )
+
+
 def _write_mode_artifacts(mode: str, call_number: int, summary: str, payload: dict):
     write_text_file(f"superrag_{mode}_{call_number}.txt", summary)
     write_text_file(f"superrag_{mode}_{call_number}.json", json.dumps(payload, indent=2, ensure_ascii=False))
@@ -861,7 +867,10 @@ def _build_mode(state: dict, task_content: str, call_number: int) -> tuple[str, 
             "This stage can take some time for larger datasets."
         ),
     )
-    index_result = upsert_memory_records(records, collection_name=collection_name)
+    try:
+        index_result = upsert_memory_records(records, collection_name=collection_name)
+    except Exception as exc:  # noqa: BLE001
+        raise _superrag_dependency_error("indexing", exc) from exc
 
     now = _now_iso()
     stats = {
@@ -1042,7 +1051,10 @@ def _chat_mode(state: dict, task_content: str, call_number: int) -> tuple[str, d
         raise ValueError("chat mode requires a non-empty question.")
 
     top_k = max(1, min(int(state.get("superrag_top_k", 8) or 8), 40))
-    hits = search_memory(query, top_k=top_k, collection_name=collection)
+    try:
+        hits = search_memory(query, top_k=top_k, collection_name=collection)
+    except Exception as exc:  # noqa: BLE001
+        raise _superrag_dependency_error("chat retrieval", exc) from exc
     context_blocks = []
     citations = []
     for index, hit in enumerate(hits, start=1):

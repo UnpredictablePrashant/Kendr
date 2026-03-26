@@ -41,10 +41,11 @@ The runtime may stop first on an approval-ready plan before executing the workfl
 
 ## Primary Workflows
 
-- research briefs on people, companies, organizations, and document sets
+- deep research for source-aware, web-grounded analysis
 - local-drive intelligence across mixed file types with OCR and per-document summaries
 - persistent `superRAG` sessions over files, URLs, databases, and OneDrive
-- report-ready synthesis with citations, logs, memory, and per-run artifacts
+- coding project delivery through blueprint, planning, and delegated implementation
+- local command execution with explicit approval and privileged audit trails
 
 ## Feature Status Matrix
 
@@ -66,6 +67,8 @@ The runtime may stop first on an approval-ready plan before executing the workfl
   Local installation, environment configuration, Docker, and verification.
 - [Verification](docs/verification.md)
   Bootstrap path plus unit, smoke, docs, and Docker verification buckets.
+- [Core Workflows](docs/core_workflows.md)
+  Recommended workflow demos, artifacts, and acceptance checks.
 - [Architecture](docs/architecture.md)
   Runtime flow, discovery, setup-aware routing, persistence, and services.
 - [Agents](docs/agents.md)

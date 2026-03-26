@@ -320,7 +320,7 @@ Primary workflows:
 - deep research
 - local drive intelligence
 - superRAG
-- coding project master
+- coding project end to end builder
 - local command execution
 
 Tasks:

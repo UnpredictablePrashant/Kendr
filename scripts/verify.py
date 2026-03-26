@@ -26,6 +26,7 @@ UNIT_TEST_MODULES = [
     "tests.test_local_drive_agent",
     "tests.test_long_document_planning",
     "tests.test_monitoring_store",
+    "tests.test_os_agent",
     "tests.test_planning_tasks",
     "tests.test_privileged_control",
     "tests.test_recovery",

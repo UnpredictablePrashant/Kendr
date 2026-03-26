@@ -126,6 +126,9 @@ def _format_execution_report(
     command: str,
     working_directory: str,
     timeout_seconds: int,
+    thought: str = "",
+    classification: dict | None = None,
+    backup_path: str = "",
     completed: subprocess.CompletedProcess[str] | None = None,
     error_message: str | None = None,
 ) -> str:
@@ -144,20 +147,49 @@ def _format_execution_report(
         f"Shell: {shell_name}",
         f"Working directory: {working_directory}",
         f"Timeout seconds: {timeout_seconds}",
+        f"Thought: {thought or 'n/a'}",
         f"Command: {command}",
         f"Return code: {return_code}",
-        "",
-        "STDOUT:",
-        stdout or "<empty>",
-        "",
-        "STDERR:",
-        stderr or "<empty>",
     ]
+    if classification:
+        lines.extend(
+            [
+                f"Mutating: {bool(classification.get('mutating', False))}",
+                f"Destructive: {bool(classification.get('destructive', False))}",
+                f"Requests root: {bool(classification.get('root_requested', False))}",
+                f"Networking: {bool(classification.get('networking', False))}",
+            ]
+        )
+    if backup_path:
+        lines.append(f"Backup snapshot: {backup_path}")
+    lines.extend(
+        [
+            "",
+            "STDOUT:",
+            stdout or "<empty>",
+            "",
+            "STDERR:",
+            stderr or "<empty>",
+        ]
+    )
 
     if error_message:
         lines.extend(["", f"Error: {error_message}"])
 
     return "\n".join(lines)
+
+
+def _publish_os_result(state: dict, report: str, call_number: int) -> dict:
+    output_name = f"os_agent_output_{call_number}.txt"
+    write_text_file(output_name, report)
+    log_task_update("OS Agent", f"Execution report saved to {OUTPUT_DIR}/{output_name}", report)
+    return publish_agent_output(
+        state,
+        "os_agent",
+        report,
+        f"os_agent_result_{call_number}",
+        recipients=["orchestrator_agent", "worker_agent"],
+    )
 
 
 def os_agent(state):
@@ -196,18 +228,20 @@ def os_agent(state):
             command,
             working_directory,
             timeout_seconds,
+            thought=thought,
             error_message=error_message,
         )
         state["os_result"] = report
         state["os_success"] = False
         state["os_return_code"] = None
-        write_text_file(f"os_agent_output_{state['os_agent_calls']}.txt", report)
+        state["draft_response"] = report
         log_task_update("OS Agent", error_message, report)
-        return state
+        return _publish_os_result(state, report, state["os_agent_calls"])
 
     command = _unwrap_nested_shell_command(command, shell_name)
 
     resolved_working_directory = os.path.abspath(working_directory)
+    classification = classify_command(command)
     try:
         ensure_command_allowed(command, resolved_working_directory, privileged_policy)
     except Exception as exc:
@@ -218,12 +252,14 @@ def os_agent(state):
             command,
             resolved_working_directory,
             timeout_seconds,
+            thought=thought,
+            classification=classification,
             error_message=f"policy_blocked: {exc}",
         )
         state["os_result"] = report
         state["os_success"] = False
         state["os_return_code"] = None
-        write_text_file(f"os_agent_output_{state['os_agent_calls']}.txt", report)
+        state["draft_response"] = report
         append_privileged_audit_event(
             state,
             actor="os_agent",
@@ -236,10 +272,9 @@ def os_agent(state):
             },
         )
         log_task_update("OS Agent", "Command blocked by privileged policy.", report)
-        return state
+        return _publish_os_result(state, report, state["os_agent_calls"])
 
     backup_path = ""
-    classification = classify_command(command)
     if privileged_policy.get("enable_backup", True) and classification.get("mutating", False):
         try:
             backup_path = create_backup_snapshot(
@@ -288,6 +323,9 @@ def os_agent(state):
             command,
             resolved_working_directory,
             timeout_seconds,
+            thought=thought,
+            classification=classification,
+            backup_path=backup_path,
             completed=completed,
         )
         state["os_success"] = completed.returncode == 0
@@ -315,6 +353,9 @@ def os_agent(state):
             command,
             resolved_working_directory,
             timeout_seconds,
+            thought=thought,
+            classification=classification,
+            backup_path=backup_path,
             error_message=str(exc),
         )
         state["os_success"] = False
@@ -339,14 +380,4 @@ def os_agent(state):
     state["os_result"] = report
     state["draft_response"] = report
 
-    output_name = f"os_agent_output_{state['os_agent_calls']}.txt"
-    write_text_file(output_name, report)
-    log_task_update("OS Agent", f"Execution report saved to {OUTPUT_DIR}/{output_name}", report)
-    state = publish_agent_output(
-        state,
-        "os_agent",
-        report,
-        f"os_agent_result_{state['os_agent_calls']}",
-        recipients=["orchestrator_agent", "worker_agent"],
-    )
-    return state
+    return _publish_os_result(state, report, state["os_agent_calls"])

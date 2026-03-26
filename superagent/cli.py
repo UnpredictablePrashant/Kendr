@@ -549,6 +549,226 @@ def _configured_working_dir() -> str:
         return ""
 
 
+def _resolved_cli_input_path(raw_path: str, base_directory: str = "") -> Path:
+    path = Path(str(raw_path or "").strip()).expanduser()
+    if not path.is_absolute():
+        root = Path(base_directory).expanduser() if str(base_directory or "").strip() else Path.cwd()
+        path = root / path
+    return path.resolve()
+
+
+def _workflow_setup_snapshot() -> dict:
+    try:
+        registry = build_registry()
+        return build_setup_snapshot(registry.agent_cards())
+    except Exception:
+        return {}
+
+
+def _agent_setup_status(snapshot: dict, agent_name: str) -> dict:
+    agents = snapshot.get("agents", {})
+    status = agents.get(agent_name, {}) if isinstance(agents, dict) else {}
+    return status if isinstance(status, dict) else {}
+
+
+def _explicit_superrag_request(args: argparse.Namespace) -> bool:
+    return any(
+        [
+            str(args.superrag_mode or "").strip(),
+            str(args.superrag_session or "").strip(),
+            bool(args.superrag_new_session),
+            str(args.superrag_session_title or "").strip(),
+            list(args.superrag_path or []),
+            list(args.superrag_url or []),
+            str(args.superrag_db_url or "").strip(),
+            str(args.superrag_db_schema or "").strip(),
+            bool(args.superrag_onedrive),
+            str(args.superrag_onedrive_path or "").strip(),
+            str(args.superrag_chat or "").strip(),
+            int(args.superrag_top_k or 0) > 0,
+        ]
+    )
+
+
+def _explicit_deep_research_request(args: argparse.Namespace, query: str) -> bool:
+    if any(
+        [
+            str(getattr(args, "research_model", "") or "").strip(),
+            str(getattr(args, "research_instructions", "") or "").strip(),
+            int(args.research_max_wait_seconds or 0) > 0,
+            int(args.research_poll_interval_seconds or 0) > 0,
+            int(args.research_max_tool_calls or 0) > 0,
+            int(args.research_max_output_tokens or 0) > 0,
+        ]
+    ):
+        return True
+    text = str(query or "").lower()
+    markers = (
+        "deep research",
+        "deep-research",
+        "in-depth research",
+        "comprehensive research",
+        "source-backed research",
+        "with citations",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _explicit_coding_request(args: argparse.Namespace, query: str) -> bool:
+    if any(
+        [
+            list(getattr(args, "coding_context_file", []) or []),
+            str(getattr(args, "coding_write_path", "") or "").strip(),
+            str(getattr(args, "coding_instructions", "") or "").strip(),
+            str(getattr(args, "coding_language", "") or "").strip(),
+            str(getattr(args, "coding_backend", "") or "").strip(),
+        ]
+    ):
+        return True
+    text = str(query or "").lower()
+    build_markers = (
+        "master_coding_agent",
+        "production-ready saas",
+        "build a saas",
+        "build a project",
+        "create a project",
+        "scaffold a project",
+        "build an app",
+        "create an app",
+        "codebase audit",
+        "analyze my code",
+        "analyze my project",
+    )
+    return _is_project_code_request(query) or any(marker in text for marker in build_markers)
+
+
+def _explicit_local_command_request(args: argparse.Namespace, query: str) -> bool:
+    if any(
+        [
+            str(getattr(args, "os_command", "") or "").strip(),
+            str(getattr(args, "os_shell", "") or "").strip(),
+            str(getattr(args, "os_working_directory", "") or "").strip(),
+            str(getattr(args, "target_os", "") or "").strip(),
+            int(getattr(args, "os_timeout", 0) or 0) > 0,
+        ]
+    ):
+        return True
+    text = str(query or "").lower()
+    markers = (
+        "run this command",
+        "execute this command",
+        "run a command",
+        "execute a command",
+        "run in terminal",
+        "execute in terminal",
+        "run this locally",
+        "shell command",
+        "powershell command",
+        "bash command",
+    )
+    return any(marker in text for marker in markers)
+
+
+def _require_agent_available_for_workflow(snapshot: dict, agent_name: str, workflow_name: str) -> None:
+    available_agents = set(snapshot.get("available_agents", []) or [])
+    if agent_name in available_agents:
+        return
+    status = _agent_setup_status(snapshot, agent_name)
+    missing = status.get("missing_services", []) if isinstance(status, dict) else []
+    detail = ", ".join(str(item) for item in missing if str(item).strip()) or "see setup status for missing requirements"
+    summary = str(snapshot.get("summary_text", "") or "").strip()
+    message = (
+        f"{workflow_name} is not currently routing-eligible. Missing setup: {detail}. "
+        "Run `superagent setup status` to see the required services."
+    )
+    if summary:
+        message += f"\n{summary}"
+    raise SystemExit(message)
+
+
+def _validate_run_workflows(
+    args: argparse.Namespace,
+    query: str,
+    resolved_working_dir: str,
+    drive_paths: list[str],
+    superrag_paths: list[str],
+) -> dict:
+    missing_drive = [str(_resolved_cli_input_path(item)) for item in drive_paths if not _resolved_cli_input_path(item).exists()]
+    if missing_drive:
+        raise SystemExit("One or more --drive paths do not exist:\n- " + "\n- ".join(missing_drive))
+
+    missing_superrag_paths = [
+        str(_resolved_cli_input_path(item))
+        for item in superrag_paths
+        if not _resolved_cli_input_path(item, resolved_working_dir).exists()
+    ]
+    if missing_superrag_paths:
+        raise SystemExit("One or more --superrag-path values do not exist:\n- " + "\n- ".join(missing_superrag_paths))
+
+    if str(args.superrag_mode or "").strip().lower() in {"chat", "switch", "status"} and not str(args.superrag_session or "").strip():
+        raise SystemExit(
+            "superRAG chat/switch/status requires --superrag-session.\n"
+            "Example: superagent run --superrag-mode chat --superrag-session product_ops_kb --superrag-chat \"What changed?\""
+        )
+
+    if bool(args.privileged_approved) and not str(args.privileged_approval_note or "").strip():
+        raise SystemExit("Privileged execution requires --privileged-approval-note with a ticket or approval reference.")
+
+    if _explicit_local_command_request(args, query):
+        if not bool(args.privileged_approved):
+            raise SystemExit(
+                "Local command execution requires explicit approval.\n"
+                "Re-run with --privileged-approved --privileged-approval-note \"TICKET-123\"."
+            )
+
+    needs_snapshot = any(
+        [
+            _explicit_superrag_request(args),
+            _explicit_deep_research_request(args, query),
+            _explicit_coding_request(args, query),
+        ]
+    )
+    snapshot = _workflow_setup_snapshot() if needs_snapshot else {}
+
+    if _explicit_superrag_request(args):
+        _require_agent_available_for_workflow(snapshot, "superrag_agent", "superRAG workflow")
+
+    if _explicit_deep_research_request(args, query):
+        _require_agent_available_for_workflow(snapshot, "deep_research_agent", "Deep research workflow")
+
+    if _explicit_coding_request(args, query):
+        available = set(snapshot.get("available_agents", []) or [])
+        if "coding_agent" not in available and "master_coding_agent" not in available:
+            summary = str(snapshot.get("summary_text", "") or "").strip()
+            message = (
+                "Coding builder workflow is not currently routing-eligible. "
+                "Configure OpenAI or install the Codex CLI, then re-run `superagent setup status`."
+            )
+            if summary:
+                message += f"\n{summary}"
+            raise SystemExit(message)
+
+    return snapshot
+
+
+def _workflow_status_message(args: argparse.Namespace, query: str, base_ingest_payload: dict) -> str:
+    items: list[str] = []
+    if base_ingest_payload.get("local_drive_paths"):
+        items.append(f"local-drive(paths={len(base_ingest_payload['local_drive_paths'])})")
+    if base_ingest_payload.get("superrag_mode"):
+        session = str(base_ingest_payload.get("superrag_session_id", "") or "").strip()
+        session_hint = f", session={session}" if session else ""
+        items.append(f"superrag(mode={base_ingest_payload['superrag_mode']}{session_hint})")
+    if _explicit_deep_research_request(args, query):
+        items.append(f"deep-research(model={str(base_ingest_payload.get('research_model') or 'default')})")
+    if _explicit_coding_request(args, query):
+        items.append("coding-builder")
+    if _explicit_local_command_request(args, query):
+        shell_name = str(base_ingest_payload.get("shell") or "auto")
+        items.append(f"local-command(shell={shell_name})")
+    return ", ".join(items)
+
+
 def _truthy(value: str | bool | None) -> bool:
     if isinstance(value, bool):
         return value
@@ -925,6 +1145,69 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         default=0,
         help="Optional output token cap per deep-research pass (0 keeps defaults).",
     )
+    run_parser.add_argument(
+        "--research-model",
+        default="",
+        help="Override the deep-research model for this run.",
+    )
+    run_parser.add_argument(
+        "--research-instructions",
+        default="",
+        help="Extra instructions passed into the deep-research workflow.",
+    )
+    run_parser.add_argument(
+        "--coding-context-file",
+        action="append",
+        default=[],
+        help="Project file to load as coding context. Can be repeated.",
+    )
+    run_parser.add_argument(
+        "--coding-write-path",
+        default="",
+        help="Target file path for coding output when a coding workflow writes code.",
+    )
+    run_parser.add_argument(
+        "--coding-instructions",
+        default="",
+        help="Extra coding instructions for coding and master-coding workflows.",
+    )
+    run_parser.add_argument(
+        "--coding-language",
+        default="",
+        help="Optional coding language hint for code generation.",
+    )
+    run_parser.add_argument(
+        "--coding-backend",
+        choices=["auto", "codex-cli", "openai-sdk", "responses-http"],
+        default="",
+        help="Preferred backend for coding generation.",
+    )
+    run_parser.add_argument(
+        "--os-command",
+        default="",
+        help="Execute one explicit local command through os_agent.",
+    )
+    run_parser.add_argument(
+        "--os-shell",
+        default="",
+        help="Preferred shell for local command execution (for example powershell, bash, cmd).",
+    )
+    run_parser.add_argument(
+        "--os-timeout",
+        type=int,
+        default=0,
+        help="Timeout in seconds for local command execution (0 keeps agent default).",
+    )
+    run_parser.add_argument(
+        "--os-working-directory",
+        default="",
+        help="Working directory for local command execution.",
+    )
+    run_parser.add_argument(
+        "--target-os",
+        default="",
+        help="Target OS hint for local command execution (linux, macos, windows).",
+    )
     run_parser.add_argument("--json", action="store_true", help="Emit the final state as JSON.")
     run_parser.add_argument("--quiet", action="store_true", help="Suppress live progress messages.")
     run_parser.add_argument("--privileged-mode", action="store_true", help="Enable privileged policy controls for this run.")
@@ -1257,6 +1540,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         base_ingest_payload["research_max_tool_calls"] = int(args.research_max_tool_calls)
     if int(args.research_max_output_tokens or 0) > 0:
         base_ingest_payload["research_max_output_tokens"] = int(args.research_max_output_tokens)
+    if str(args.research_model or "").strip():
+        base_ingest_payload["research_model"] = str(args.research_model).strip()
+    if str(args.research_instructions or "").strip():
+        base_ingest_payload["research_instructions"] = str(args.research_instructions).strip()
 
     drive_paths = _normalize_drive_paths(args.drive)
     if drive_paths:
@@ -1323,6 +1610,44 @@ def _cmd_run(args: argparse.Namespace) -> int:
         base_ingest_payload["superrag_mode"] = "build"
     if base_ingest_payload.get("superrag_chat_query") and not base_ingest_payload.get("superrag_mode"):
         base_ingest_payload["superrag_mode"] = "chat"
+
+    if args.coding_context_file:
+        base_ingest_payload["coding_context_files"] = [str(item).strip() for item in args.coding_context_file if str(item).strip()]
+    if str(args.coding_write_path or "").strip():
+        base_ingest_payload["coding_write_path"] = str(args.coding_write_path).strip()
+    if str(args.coding_instructions or "").strip():
+        base_ingest_payload["coding_instructions"] = str(args.coding_instructions).strip()
+    if str(args.coding_language or "").strip():
+        base_ingest_payload["coding_language"] = str(args.coding_language).strip()
+    if str(args.coding_backend or "").strip():
+        base_ingest_payload["coding_backend"] = str(args.coding_backend).strip()
+    if any(
+        [
+            base_ingest_payload.get("coding_context_files"),
+            base_ingest_payload.get("coding_write_path"),
+            base_ingest_payload.get("coding_instructions"),
+            base_ingest_payload.get("coding_language"),
+            base_ingest_payload.get("coding_backend"),
+            _explicit_coding_request(args, query),
+        ]
+    ):
+        base_ingest_payload["coding_working_directory"] = resolved_working_dir
+
+    if str(args.os_command or "").strip():
+        base_ingest_payload["os_command"] = str(args.os_command).strip()
+    if str(args.os_shell or "").strip():
+        base_ingest_payload["shell"] = str(args.os_shell).strip()
+    if int(args.os_timeout or 0) > 0:
+        base_ingest_payload["os_timeout"] = int(args.os_timeout)
+    if str(args.os_working_directory or "").strip():
+        base_ingest_payload["os_working_directory"] = str(_resolve_working_dir(str(args.os_working_directory).strip()))
+    if str(args.target_os or "").strip():
+        base_ingest_payload["target_os"] = str(args.target_os).strip().lower()
+
+    _ = _validate_run_workflows(args, query, resolved_working_dir, drive_paths, superrag_paths)
+    workflow_status = _workflow_status_message(args, query, base_ingest_payload)
+    if workflow_status:
+        _emit_status(args, f"[workflow] {workflow_status}")
 
     if security_authorized:
         base_ingest_payload["security_authorized"] = True
