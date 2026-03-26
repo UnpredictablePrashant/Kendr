@@ -1205,7 +1205,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
         _start_gateway_process()
         _emit_status(args, f"[gateway] ready at {gateway_base}")
 
-    client_run_id = f"run_cli_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     selected_session = {}
     if str(args.session_key or "").strip():
         selected_session = _session_parts_from_key(str(args.session_key))
@@ -1213,146 +1212,171 @@ def _cmd_run(args: argparse.Namespace) -> int:
             raise SystemExit("Invalid --session-key format. Expected channel:workspace:chat:scope")
     else:
         selected_session = _load_cli_session()
-    ingest_payload = {
-        "run_id": client_run_id,
-        "text": query,
+    base_ingest_payload = {
         "max_steps": args.max_steps,
         "working_directory": resolved_working_dir,
     }
     if bool(args.long_document):
-        ingest_payload["long_document_mode"] = True
+        base_ingest_payload["long_document_mode"] = True
     if int(args.long_document_pages or 0) > 0:
-        ingest_payload["long_document_pages"] = int(args.long_document_pages)
+        base_ingest_payload["long_document_pages"] = int(args.long_document_pages)
     if int(args.long_document_sections or 0) > 0:
-        ingest_payload["long_document_sections"] = int(args.long_document_sections)
+        base_ingest_payload["long_document_sections"] = int(args.long_document_sections)
     if int(args.long_document_section_pages or 0) > 0:
-        ingest_payload["long_document_section_pages"] = int(args.long_document_section_pages)
+        base_ingest_payload["long_document_section_pages"] = int(args.long_document_section_pages)
     if str(args.long_document_title or "").strip():
-        ingest_payload["long_document_title"] = str(args.long_document_title).strip()
+        base_ingest_payload["long_document_title"] = str(args.long_document_title).strip()
     if int(args.research_max_wait_seconds or 0) > 0:
-        ingest_payload["research_max_wait_seconds"] = int(args.research_max_wait_seconds)
+        base_ingest_payload["research_max_wait_seconds"] = int(args.research_max_wait_seconds)
     if int(args.research_poll_interval_seconds or 0) > 0:
-        ingest_payload["research_poll_interval_seconds"] = int(args.research_poll_interval_seconds)
+        base_ingest_payload["research_poll_interval_seconds"] = int(args.research_poll_interval_seconds)
     if int(args.research_max_tool_calls or 0) > 0:
-        ingest_payload["research_max_tool_calls"] = int(args.research_max_tool_calls)
+        base_ingest_payload["research_max_tool_calls"] = int(args.research_max_tool_calls)
     if int(args.research_max_output_tokens or 0) > 0:
-        ingest_payload["research_max_output_tokens"] = int(args.research_max_output_tokens)
+        base_ingest_payload["research_max_output_tokens"] = int(args.research_max_output_tokens)
 
     drive_paths = _normalize_drive_paths(args.drive)
     if drive_paths:
-        ingest_payload["local_drive_paths"] = drive_paths
-        ingest_payload["local_drive_recursive"] = not bool(args.drive_no_recursive)
+        base_ingest_payload["local_drive_paths"] = drive_paths
+        base_ingest_payload["local_drive_recursive"] = not bool(args.drive_no_recursive)
         if bool(args.drive_include_hidden):
-            ingest_payload["local_drive_include_hidden"] = True
+            base_ingest_payload["local_drive_include_hidden"] = True
         if int(args.drive_max_files or 0) > 0:
-            ingest_payload["local_drive_max_files"] = int(args.drive_max_files)
+            base_ingest_payload["local_drive_max_files"] = int(args.drive_max_files)
         if str(args.drive_extensions or "").strip():
-            ingest_payload["local_drive_extensions"] = [item.strip() for item in str(args.drive_extensions).split(",") if item.strip()]
+            base_ingest_payload["local_drive_extensions"] = [
+                item.strip() for item in str(args.drive_extensions).split(",") if item.strip()
+            ]
         if bool(args.drive_disable_image_ocr):
-            ingest_payload["local_drive_enable_image_ocr"] = False
+            base_ingest_payload["local_drive_enable_image_ocr"] = False
         if str(args.drive_ocr_instruction or "").strip():
-            ingest_payload["local_drive_ocr_instruction"] = str(args.drive_ocr_instruction).strip()
+            base_ingest_payload["local_drive_ocr_instruction"] = str(args.drive_ocr_instruction).strip()
         if bool(args.drive_no_memory_index):
-            ingest_payload["local_drive_index_to_memory"] = False
-        ingest_payload["local_drive_working_directory"] = resolved_working_dir
+            base_ingest_payload["local_drive_index_to_memory"] = False
+        base_ingest_payload["local_drive_working_directory"] = resolved_working_dir
 
         inferred_pages = _extract_requested_page_count(query)
         inferred_long_document = _query_requests_long_document(query)
         explicit_long_document = bool(args.long_document) or int(args.long_document_pages or 0) > 0
         if inferred_long_document and not explicit_long_document:
-            ingest_payload["long_document_mode"] = True
+            base_ingest_payload["long_document_mode"] = True
             if inferred_pages >= 20:
-                ingest_payload["long_document_pages"] = inferred_pages
+                base_ingest_payload["long_document_pages"] = inferred_pages
         if inferred_long_document or explicit_long_document:
-            ingest_payload["local_drive_force_long_document"] = True
+            base_ingest_payload["local_drive_force_long_document"] = True
 
     superrag_paths = _normalize_drive_paths(args.superrag_path)
     superrag_urls = [str(item).strip() for item in list(args.superrag_url or []) if str(item).strip()]
     if str(args.superrag_mode or "").strip():
-        ingest_payload["superrag_mode"] = str(args.superrag_mode).strip().lower()
+        base_ingest_payload["superrag_mode"] = str(args.superrag_mode).strip().lower()
     if str(args.superrag_session or "").strip():
-        ingest_payload["superrag_session_id"] = str(args.superrag_session).strip()
+        base_ingest_payload["superrag_session_id"] = str(args.superrag_session).strip()
     if bool(args.superrag_new_session):
-        ingest_payload["superrag_new_session"] = True
+        base_ingest_payload["superrag_new_session"] = True
     if str(args.superrag_session_title or "").strip():
-        ingest_payload["superrag_session_title"] = str(args.superrag_session_title).strip()
+        base_ingest_payload["superrag_session_title"] = str(args.superrag_session_title).strip()
     if superrag_paths:
-        ingest_payload["superrag_local_paths"] = superrag_paths
+        base_ingest_payload["superrag_local_paths"] = superrag_paths
     if superrag_urls:
-        ingest_payload["superrag_urls"] = superrag_urls
+        base_ingest_payload["superrag_urls"] = superrag_urls
     if str(args.superrag_db_url or "").strip():
-        ingest_payload["superrag_db_url"] = str(args.superrag_db_url).strip()
+        base_ingest_payload["superrag_db_url"] = str(args.superrag_db_url).strip()
     if str(args.superrag_db_schema or "").strip():
-        ingest_payload["superrag_db_schema"] = str(args.superrag_db_schema).strip()
+        base_ingest_payload["superrag_db_schema"] = str(args.superrag_db_schema).strip()
     if bool(args.superrag_onedrive):
-        ingest_payload["superrag_onedrive_enabled"] = True
+        base_ingest_payload["superrag_onedrive_enabled"] = True
     if str(args.superrag_onedrive_path or "").strip():
-        ingest_payload["superrag_onedrive_path"] = str(args.superrag_onedrive_path).strip()
-        ingest_payload["superrag_onedrive_enabled"] = True
+        base_ingest_payload["superrag_onedrive_path"] = str(args.superrag_onedrive_path).strip()
+        base_ingest_payload["superrag_onedrive_enabled"] = True
     if str(args.superrag_chat or "").strip():
-        ingest_payload["superrag_chat_query"] = str(args.superrag_chat).strip()
+        base_ingest_payload["superrag_chat_query"] = str(args.superrag_chat).strip()
     if int(args.superrag_top_k or 0) > 0:
-        ingest_payload["superrag_top_k"] = int(args.superrag_top_k)
+        base_ingest_payload["superrag_top_k"] = int(args.superrag_top_k)
 
-    has_superrag_sources = bool(superrag_paths or superrag_urls or ingest_payload.get("superrag_db_url") or ingest_payload.get("superrag_onedrive_enabled"))
-    if has_superrag_sources and not ingest_payload.get("superrag_mode"):
-        ingest_payload["superrag_mode"] = "build"
-    if ingest_payload.get("superrag_chat_query") and not ingest_payload.get("superrag_mode"):
-        ingest_payload["superrag_mode"] = "chat"
+    has_superrag_sources = bool(
+        superrag_paths or superrag_urls or base_ingest_payload.get("superrag_db_url") or base_ingest_payload.get("superrag_onedrive_enabled")
+    )
+    if has_superrag_sources and not base_ingest_payload.get("superrag_mode"):
+        base_ingest_payload["superrag_mode"] = "build"
+    if base_ingest_payload.get("superrag_chat_query") and not base_ingest_payload.get("superrag_mode"):
+        base_ingest_payload["superrag_mode"] = "chat"
 
     if security_authorized:
-        ingest_payload["security_authorized"] = True
+        base_ingest_payload["security_authorized"] = True
     if security_target_url:
-        ingest_payload["security_target_url"] = security_target_url
+        base_ingest_payload["security_target_url"] = security_target_url
     if security_authorization_note:
-        ingest_payload["security_authorization_note"] = security_authorization_note
+        base_ingest_payload["security_authorization_note"] = security_authorization_note
     if security_scan_profile:
-        ingest_payload["security_scan_profile"] = security_scan_profile
+        base_ingest_payload["security_scan_profile"] = security_scan_profile
     if bool(args.privileged_mode):
-        ingest_payload["privileged_mode"] = True
+        base_ingest_payload["privileged_mode"] = True
     if bool(args.privileged_approved):
-        ingest_payload["privileged_approved"] = True
+        base_ingest_payload["privileged_approved"] = True
     if str(args.privileged_approval_note or "").strip():
-        ingest_payload["privileged_approval_note"] = str(args.privileged_approval_note).strip()
+        base_ingest_payload["privileged_approval_note"] = str(args.privileged_approval_note).strip()
     if bool(args.privileged_read_only):
-        ingest_payload["privileged_read_only"] = True
+        base_ingest_payload["privileged_read_only"] = True
     if bool(args.privileged_allow_root):
-        ingest_payload["privileged_allow_root"] = True
+        base_ingest_payload["privileged_allow_root"] = True
     if bool(args.privileged_allow_destructive):
-        ingest_payload["privileged_allow_destructive"] = True
+        base_ingest_payload["privileged_allow_destructive"] = True
     if bool(args.privileged_enable_backup):
-        ingest_payload["privileged_enable_backup"] = True
+        base_ingest_payload["privileged_enable_backup"] = True
     if args.privileged_allowed_path:
-        ingest_payload["privileged_allowed_paths"] = list(args.privileged_allowed_path)
+        base_ingest_payload["privileged_allowed_paths"] = list(args.privileged_allowed_path)
     if args.privileged_allowed_domain:
-        ingest_payload["privileged_allowed_domains"] = list(args.privileged_allowed_domain)
+        base_ingest_payload["privileged_allowed_domains"] = list(args.privileged_allowed_domain)
     if str(args.kill_switch_file or "").strip():
-        ingest_payload["kill_switch_file"] = str(args.kill_switch_file).strip()
+        base_ingest_payload["kill_switch_file"] = str(args.kill_switch_file).strip()
     channel = str(args.channel or selected_session.get("channel", "webchat") or "webchat").strip()
     workspace_id = str(args.workspace_id or selected_session.get("workspace_id", "default") or "default").strip()
     stored_sender = str(selected_session.get("sender_id", "") or "").strip()
     sender_id = str(args.sender_id or stored_sender or "cli_user").strip()
     chat_id = str(args.chat_id or selected_session.get("chat_id", sender_id) or sender_id).strip()
-    ingest_payload["channel"] = channel
-    ingest_payload["workspace_id"] = workspace_id
-    ingest_payload["sender_id"] = sender_id
-    ingest_payload["chat_id"] = chat_id
-    ingest_payload["is_group"] = bool(selected_session.get("scope", "main") == "group")
-    if bool(args.new_session):
-        ingest_payload["new_session"] = True
-    else:
-        _save_cli_session(
-            {
-                "session_key": f"{channel}:{workspace_id}:{chat_id}:{'group' if ingest_payload['is_group'] else 'main'}",
-                "channel": channel,
-                "workspace_id": workspace_id,
-                "chat_id": chat_id,
-                "sender_id": sender_id,
-                "scope": "group" if ingest_payload["is_group"] else "main",
-            }
-        )
+    is_group_session = bool(selected_session.get("scope", "main") == "group")
+    base_ingest_payload["channel"] = channel
+    base_ingest_payload["workspace_id"] = workspace_id
+    base_ingest_payload["sender_id"] = sender_id
+    base_ingest_payload["chat_id"] = chat_id
+    base_ingest_payload["is_group"] = is_group_session
+    _save_cli_session(
+        {
+            "session_key": f"{channel}:{workspace_id}:{chat_id}:{'group' if is_group_session else 'main'}",
+            "channel": channel,
+            "workspace_id": workspace_id,
+            "chat_id": chat_id,
+            "sender_id": sender_id,
+            "scope": "group" if is_group_session else "main",
+        }
+    )
 
-    def _ingest_once() -> dict:
+    interactive_follow_up = bool(getattr(sys.stdin, "isatty", lambda: False)()) and not bool(args.json)
+
+    def _new_client_run_id() -> str:
+        return f"run_cli_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+
+    def _build_ingest_payload(run_id: str, text: str, *, include_new_session: bool) -> dict:
+        payload = dict(base_ingest_payload)
+        payload["run_id"] = run_id
+        payload["text"] = text
+        if include_new_session:
+            payload["new_session"] = True
+        return payload
+
+    def _pending_question(result: dict) -> str:
+        return str(result.get("pending_user_question") or result.get("final_output") or "").strip()
+
+    def _fetch_task_session(run_id: str) -> dict:
+        try:
+            payload = _http_json_get(f"{gateway_base}/task-sessions/by-run/{run_id}", timeout_seconds=1.5)
+        except Exception:
+            return {}
+        if isinstance(payload, dict):
+            return payload
+        return {}
+
+    def _ingest_once(ingest_payload: dict, client_run_id: str) -> dict:
         request = urllib.request.Request(
             f"{gateway_base}/ingest",
             data=json.dumps(ingest_payload).encode("utf-8"),
@@ -1387,22 +1411,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
         except socket.timeout:
             return {"run_id": client_run_id, "_ingest_timed_out": True}
 
-    holder: dict[str, object] = {"result": None, "error": None}
-
-    def _submit_ingest() -> None:
-        try:
-            holder["result"] = _ingest_once()
-        except BaseException as exc:  # noqa: BLE001
-            holder["error"] = exc
-
-    worker = threading.Thread(target=_submit_ingest, daemon=True)
-    worker.start()
-
-    def _poll_task_session_progress(previous_message: str) -> str:
+    def _poll_task_session_progress(run_id: str, previous_message: str) -> str:
         try:
             sessions = _http_json_get(f"{gateway_base}/task-sessions", timeout_seconds=1.2)
             if isinstance(sessions, list):
-                match = next((item for item in sessions if str(item.get("run_id", "")) == client_run_id), None)
+                match = next((item for item in sessions if str(item.get("run_id", "")) == run_id), None)
                 if isinstance(match, dict):
                     message = _build_run_progress_message(match)
                     if message != previous_message:
@@ -1412,7 +1425,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
             pass
         return previous_message
 
-    try:
+    def _submit_run(ingest_payload: dict, client_run_id: str) -> dict:
+        holder: dict[str, object] = {"result": None, "error": None}
+
+        def _submit_ingest() -> None:
+            try:
+                holder["result"] = _ingest_once(ingest_payload, client_run_id)
+            except BaseException as exc:  # noqa: BLE001
+                holder["error"] = exc
+
+        worker = threading.Thread(target=_submit_ingest, daemon=True)
+        worker.start()
+
         _emit_status(
             args,
             f"[run] accepted request run_id={client_run_id} | working_directory={resolved_working_dir}",
@@ -1422,7 +1446,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         last_wait_emit = 0.0
         while worker.is_alive():
             worker.join(timeout=1.0)
-            last_progress = _poll_task_session_progress(last_progress)
+            last_progress = _poll_task_session_progress(client_run_id, last_progress)
 
             now = time.time()
             if now - last_wait_emit >= 8:
@@ -1443,7 +1467,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             _emit_status(args, "[run] ingest connection timed out; continuing to monitor run by run_id...")
             while True:
                 run_record: dict[str, object] | None = None
-                last_progress = _poll_task_session_progress(last_progress)
+                last_progress = _poll_task_session_progress(client_run_id, last_progress)
                 try:
                     payload = _http_json_get(f"{gateway_base}/runs/{client_run_id}", timeout_seconds=1.5)
                     if isinstance(payload, dict):
@@ -1453,12 +1477,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
                 if run_record is not None:
                     status = str(run_record.get("status", "")).strip().lower()
-                    if status == "completed":
+                    if status in {"completed", "awaiting_user_input"}:
                         result = {
                             "run_id": run_record.get("run_id", client_run_id),
                             "final_output": run_record.get("final_output", ""),
                             "last_agent": "",
+                            "status": status,
+                            "awaiting_user_input": status == "awaiting_user_input",
                         }
+                        if status == "awaiting_user_input":
+                            task_session = _fetch_task_session(client_run_id)
+                            summary = _task_session_summary(task_session)
+                            result["pending_user_input_kind"] = summary.get("pending_user_input_kind", "")
+                            result["pending_user_question"] = summary.get("pending_user_question", "")
                         break
                     if status == "failed":
                         raise SystemExit(
@@ -1473,17 +1504,51 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     last_wait_emit = now
                 time.sleep(1.0)
 
-        _emit_status(
-            args,
-            f"[run] completed run_id={result.get('run_id', client_run_id)} "
-            f"last_agent={result.get('last_agent', '') or '-'}",
-        )
+        return result
 
-        if args.json:
-            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
-        else:
-            print(result.get("final_output", ""))
-        return 0
+    current_query = query
+    include_new_session = bool(args.new_session)
+
+    try:
+        while True:
+            client_run_id = _new_client_run_id()
+            ingest_payload = _build_ingest_payload(
+                client_run_id,
+                current_query,
+                include_new_session=include_new_session,
+            )
+            include_new_session = False
+            result = _submit_run(ingest_payload, client_run_id)
+            paused = bool(result.get("awaiting_user_input")) or str(result.get("status", "")).strip().lower() == "awaiting_user_input"
+            terminal_state = "paused" if paused else "completed"
+            _emit_status(
+                args,
+                f"[run] {terminal_state} run_id={result.get('run_id', client_run_id)} "
+                f"last_agent={result.get('last_agent', '') or '-'}",
+            )
+
+            if paused and interactive_follow_up:
+                prompt = _pending_question(result)
+                if prompt:
+                    print(prompt)
+                while True:
+                    try:
+                        current_query = input("Reply: ").strip()
+                    except (EOFError, KeyboardInterrupt) as exc:
+                        raise SystemExit(
+                            "Run is paused and the session was preserved. "
+                            "Resume with `superagent run \"<your reply>\"`."
+                        ) from exc
+                    if current_query:
+                        break
+                    _emit_status(args, "[run] empty reply ignored; enter a response or press Ctrl+C to stop.")
+                continue
+
+            if args.json:
+                print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+            else:
+                print(result.get("final_output", ""))
+            return 0
     finally:
         _clear_transient_status_line()
 

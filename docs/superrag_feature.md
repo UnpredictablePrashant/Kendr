@@ -1,6 +1,8 @@
-# superRAG Feature
+# superRAG
 
-`superrag_agent` provides a session-based RAG pipeline that can ingest mixed sources and then serve chat retrieval over that indexed knowledge.
+Status: Stable core workflow.
+
+`superrag_agent` is one of SuperAgent's primary product workflows. It provides a session-based RAG pipeline that can ingest mixed sources and then serve chat retrieval over that indexed knowledge.
 
 ## Supported Sources
 

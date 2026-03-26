@@ -297,6 +297,12 @@ class GatewayHandler(BaseHTTPRequestHandler):
             state_overrides["security_scan_profile"] = str(payload.get("security_scan_profile")).strip().lower()
         try:
             result = RUNTIME.run_query(text, state_overrides=state_overrides)
+            awaiting_user_input = bool(
+                result.get("plan_needs_clarification", False)
+                or result.get("plan_waiting_for_approval", False)
+                or result.get("long_document_plan_waiting_for_approval", False)
+                or str(result.get("pending_user_input_kind", "")).strip()
+            )
             self._send_json(
                 200,
                 {
@@ -304,6 +310,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     "output_dir": result.get("run_output_dir", ""),
                     "final_output": result.get("final_output") or result.get("draft_response", ""),
                     "last_agent": result.get("last_agent", ""),
+                    "status": "awaiting_user_input" if awaiting_user_input else "completed",
+                    "awaiting_user_input": awaiting_user_input,
+                    "pending_user_input_kind": result.get("pending_user_input_kind", ""),
+                    "pending_user_question": result.get("pending_user_question", ""),
                 },
             )
         except Exception as exc:

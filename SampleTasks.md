@@ -1,8 +1,18 @@
 # SampleTasks
 
-This file shows example ways to run the multi-agent system using the `superagent` command.
+This file shows practical entry points for the SuperAgent intelligence workspace.
 
-## Quick Sanity Check
+If you are new to the repo, start with the stable workflows first:
+
+- research briefs
+- local-drive intelligence
+- `superRAG` build and chat
+
+Use the beta and experimental workflows only after the core stack is configured and understood.
+
+## Recommended First Runs
+
+### Quick Sanity Check
 
 ```bash
 superagent --help
@@ -10,31 +20,62 @@ superagent agents list
 superagent plugins list
 ```
 
-Run one query:
+### Research Brief (Stable)
 
 ```bash
 superagent run "analyze this company and build a report"
 ```
 
-Run in current terminal folder:
+Expected behavior:
+- Routes through the core research and reporting surface.
+- Produces a final narrative output plus run artifacts.
+
+### Local Drive Intelligence (Stable)
+
+```bash
+superagent run \
+  --drive="D:/xyz/folder" \
+  "Review this folder, summarize the important files, and produce an executive-ready intelligence brief."
+```
+
+Expected behavior:
+- Uses `local_drive_agent` to scan supported files one at a time.
+- Produces per-document summaries and run-level artifacts for downstream reporting.
+
+### superRAG Build + Chat (Stable)
+
+```bash
+superagent run \
+  --superrag-mode build \
+  --superrag-new-session \
+  --superrag-session-title "product_ops_kb" \
+  --superrag-path ./docs \
+  --superrag-url https://example.com/help-center \
+  "Create a reusable product operations knowledge session."
+```
+
+```bash
+superagent run \
+  --superrag-mode chat \
+  --superrag-session product_ops_kb \
+  --superrag-chat "What are the main operating risks and where are they sourced from?"
+```
+
+Expected behavior:
+- Builds a persistent knowledge session and then queries it.
+- Stores session, ingestion, and chat state for reuse.
+
+### Useful Flags
 
 ```bash
 superagent run --current-folder "analyze this company and build a report"
-```
-
-Run with stricter step limit:
-
-```bash
 superagent run --max-steps 12 "summarize key risks for a fintech startup"
-```
-
-Get machine-readable output:
-
-```bash
 superagent run --json "build a short research brief on OpenAI"
 ```
 
-## Case Study 1: Company Intelligence Brief
+## Extended Case Studies
+
+### Case Study 1: Company Intelligence Brief (Stable)
 
 Goal: Produce a quick, source-backed brief on a company.
 
@@ -47,7 +88,7 @@ Expected behavior:
 - Produces final narrative output in terminal.
 - Stores run artifacts under `output/runs/<run_id>/`.
 
-## Case Study 2: People + Organization Mapping
+### Case Study 2: People + Organization Mapping (Stable)
 
 Goal: Map relationships between people, companies, and events.
 
@@ -60,7 +101,7 @@ Expected behavior:
 - Produces structured notes and a summarized output.
 - Artifacts and logs are saved per run.
 
-## Case Study 3: Deal Advisory (Series A/B Screening)
+### Case Study 3: Deal Advisory (Series A/B Screening) (Beta)
 
 Goal: Find and screen prospects in a target sector.
 
@@ -73,7 +114,7 @@ Expected behavior:
 - Produces shortlist + reasoning in final output.
 - Writes intermediate outputs for traceability in the run folder.
 
-## Case Study 4: Research Proposal and Prior Art
+### Case Study 4: Research Proposal and Prior Art (Beta)
 
 Goal: Compare a research idea against literature and patents.
 
@@ -86,7 +127,7 @@ Expected behavior:
 - Generates evidence-oriented summary and novelty assessment.
 - Saves step-by-step artifacts in `output/runs/<run_id>/`.
 
-## Case Study 5: Defensive Security Review (Authorized Scope)
+### Case Study 5: Defensive Security Review (Authorized Scope) (Beta)
 
 Goal: Generate a defensive security findings summary.
 
@@ -104,7 +145,7 @@ Expected behavior:
 - Produces findings-focused output with recommendations.
 - Evidence artifacts are written to the run folder.
 
-## Case Study 6: Travel Planning Flow
+### Case Study 6: Travel Planning Flow (Beta)
 
 Goal: Build practical travel routing suggestions.
 
@@ -116,7 +157,7 @@ Expected behavior:
 - Travel agents are used only if required setup (including `SERP_API_KEY`) is configured.
 - If unavailable, runtime will fall back to other eligible agents.
 
-## Case Study 7: Authorized Deep Security Assessment
+### Case Study 7: Authorized Deep Security Assessment (Beta)
 
 Goal: Run an explicit, authorized, defensive security assessment with deeper scan coverage.
 
@@ -142,7 +183,7 @@ Optional: disable auto-install for this run
 superagent run --no-auto-install-security-tools --security-authorized --security-target-url https://example.com --security-authorization-note "SEC-123 approved by owner" --security-scan-profile deep "Perform authorized defensive assessment."
 ```
 
-## Case Study 8: Master Coding Agent (Detailed Long-Running Build)
+### Case Study 8: Master Coding Agent (Detailed Long-Running Build) (Experimental)
 
 Goal: Deliver a complete project blueprint and route implementation/setup work to the right specialist agents.
 
@@ -155,7 +196,7 @@ Expected behavior:
 - If dependencies/components are required, it delegates setup/install work to supporting agents (for example `os_agent`).
 - It then delegates concrete coding execution to `coding_agent` and keeps the workflow detailed and end-to-end.
 
-## Case Study 9: Very Long Exhaustive Document (50+ Pages)
+### Case Study 9: Very Long Exhaustive Document (50+ Pages) (Beta)
 
 Goal: Build a deeply researched, coherent long-form report through staged chapter generation and final merge.
 
@@ -181,7 +222,7 @@ Expected behavior:
 - Coherence is anchored through markdown memory files (`Agent.md`, `soul.md`, `memory.md`, `session.md`, `planning.md`) plus live bridge files (`long_document_coherence_*.md`).
 - Supports very long-running execution windows with explicit research wait configuration.
 
-## Case Study 10: superRAG Session Build + Chat
+### Case Study 10: superRAG Session Build + Chat (Stable)
 
 Goal: Build a persistent session-based RAG system from mixed sources, then chat over indexed knowledge.
 

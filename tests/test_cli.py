@@ -286,6 +286,84 @@ class CliSmokeTests(unittest.TestCase):
         self.assertTrue(payload.get("long_document_mode"))
         self.assertEqual(payload.get("long_document_pages"), 50)
 
+    def test_run_interactive_follow_up_resubmits_paused_session(self):
+        captured_payloads = []
+
+        class _FakeResponse:
+            def __init__(self, body: str):
+                self._body = body.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self._body
+
+        responses = iter(
+            [
+                {
+                    "run_id": "run_test_first",
+                    "final_output": "Please confirm the reporting period.",
+                    "last_agent": "planner_agent",
+                    "status": "awaiting_user_input",
+                    "awaiting_user_input": True,
+                    "pending_user_input_kind": "clarification",
+                    "pending_user_question": "Please confirm the reporting period.",
+                },
+                {
+                    "run_id": "run_test_second",
+                    "final_output": "analysis complete",
+                    "last_agent": "long_document_agent",
+                    "status": "completed",
+                    "awaiting_user_input": False,
+                },
+            ]
+        )
+
+        def _fake_urlopen(request, timeout=0):  # noqa: ARG001
+            body = request.data.decode("utf-8") if getattr(request, "data", None) else "{}"
+            captured_payloads.append(json.loads(body))
+            return _FakeResponse(json.dumps(next(responses)))
+
+        class _FakeStdin(io.StringIO):
+            def isatty(self):
+                return True
+
+        with (
+            patch("superagent.cli._gateway_ready", return_value=True),
+            patch("superagent.cli._configured_working_dir", return_value="/tmp/work"),
+            patch("superagent.cli._resolve_working_dir", return_value="/tmp/work"),
+            patch("superagent.cli._http_json_get", return_value=[]),
+            patch("superagent.cli._load_cli_session", return_value={}),
+            patch("superagent.cli._save_cli_session"),
+            patch("superagent.cli.urllib.request.urlopen", side_effect=_fake_urlopen),
+            patch("builtins.input", side_effect=["Last 3 fiscal years plus TTM"]),
+            patch.object(cli.sys, "stdin", _FakeStdin()),
+        ):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = main(
+                    [
+                        "run",
+                        "--quiet",
+                        "Prepare the investment memo",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(captured_payloads), 2)
+        self.assertEqual(captured_payloads[0]["text"], "Prepare the investment memo")
+        self.assertEqual(captured_payloads[1]["text"], "Last 3 fiscal years plus TTM")
+        self.assertEqual(captured_payloads[0]["channel"], captured_payloads[1]["channel"])
+        self.assertEqual(captured_payloads[0]["workspace_id"], captured_payloads[1]["workspace_id"])
+        self.assertEqual(captured_payloads[0]["chat_id"], captured_payloads[1]["chat_id"])
+        output = buffer.getvalue()
+        self.assertIn("Please confirm the reporting period.", output)
+        self.assertIn("analysis complete", output)
+
 
 if __name__ == "__main__":
     unittest.main()

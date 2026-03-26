@@ -1,8 +1,16 @@
-# Super Agent Research Stack
+# SuperAgent Core Intelligence Stack
 
-This project now includes a deeper research stack for investigating people, companies, organizations, groups, and related entities.
+SuperAgent is best understood today as a multi-agent intelligence workspace.
 
-## New Agents
+This document covers the core stack behind that positioning: evidence gathering, document ingestion, memory indexing, and report-ready synthesis across people, companies, organizations, groups, and related entities.
+
+## Current Product Focus
+
+- stable: research briefs, local-drive intelligence, `superRAG`, and report synthesis
+- beta: long-document generation plus setup-heavy domain workflows
+- experimental: generated agents, voice/audio, and future-facing social ecosystem analysis
+
+## Core Intelligence Agents
 
 - `access_control_agent`
 - `web_crawl_agent`
