@@ -421,7 +421,7 @@ class AgentRuntime:
             "completed_at": completed_at,
             "status": status,
             "active_agent": active_agent,
-            "step_count": len(state.get("agent_history", [])),
+            "step_count": int(state.get("effective_steps", 0)) or len(state.get("agent_history", [])),
             "summary": {
                 "objective": state.get("current_objective", ""),
                 "last_agent": state.get("last_agent", ""),
@@ -944,6 +944,7 @@ class AgentRuntime:
                 state = spec.handler(state)
             output_text = self._infer_agent_output(before_state, state)
             self._clear_agent_failures(state, agent_name)
+            state["effective_steps"] = int(state.get("effective_steps", 0)) + 1
             if active_task.get("status") == "pending":
                 state = complete_task(state, active_task["task_id"], "completed")
             skip_review = bool(state.pop("_skip_review_once", False))
@@ -990,17 +991,42 @@ class AgentRuntime:
     def orchestrator_agent(self, state: dict) -> dict:
         state["orchestrator_calls"] = state.get("orchestrator_calls", 0) + 1
         max_steps = state.get("max_steps", 20)
+        # effective_steps counts only successful agent completions (the real work budget).
+        # orchestrator_calls counts every orchestrator invocation including retries/failures.
+        # max_steps gates on effective_steps so retries don't eat the user's budget.
+        # A hard safety ceiling (3x max_steps) prevents infinite loops even if nothing succeeds.
+        effective_steps = int(state.get("effective_steps", 0))
+        hard_ceiling = max_steps * 3
         state = self.apply_runtime_setup(state)
         ensure_a2a_state(state, state.get("available_agent_cards") or self._agent_cards())
         current_objective = state.get("current_objective") or state.get("user_query", "")
 
-        if state["orchestrator_calls"] > max_steps:
+        if effective_steps > max_steps:
             state["next_agent"] = "__finish__"
             state["final_output"] = (
                 state.get("final_output")
                 or state.get("draft_response")
                 or state.get("last_agent_output")
                 or "Reached the orchestration step limit without a better final answer."
+            )
+            return state
+
+        if state["orchestrator_calls"] > hard_ceiling:
+            state["next_agent"] = "__finish__"
+            state["final_output"] = (
+                state.get("final_output")
+                or state.get("draft_response")
+                or state.get("last_agent_output")
+                or (
+                    f"Reached the hard safety ceiling ({hard_ceiling} total orchestrator calls) "
+                    f"with only {effective_steps} effective steps completed. "
+                    "This usually indicates persistent network or LLM provider failures. "
+                    "Check your connection and API keys, then retry."
+                )
+            )
+            log_task_update(
+                "Orchestrator",
+                f"Hard ceiling reached: {state['orchestrator_calls']} calls, {effective_steps} effective steps.",
             )
             return state
 
@@ -1996,6 +2022,7 @@ Return ONLY valid JSON in this exact schema:
             "revision_count": 0,
             "max_step_revisions": overrides.get("max_step_revisions", 3),
             "orchestrator_calls": 0,
+            "effective_steps": 0,
             "next_agent": "",
             "orchestrator_reason": "",
             "final_output": "",
