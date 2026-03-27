@@ -13,6 +13,27 @@ SuperAgent is a setup-aware orchestration runtime that combines specialized agen
 
 [Docs](docs/index.md) · [Quickstart](docs/quickstart.md) · [Install](docs/install.md) · [Architecture](docs/architecture.md) · [Agents](docs/agents.md) · [Integrations](docs/integrations.md) · [Security](docs/security.md) · [Examples](docs/examples.md)
 
+## What SuperAgent Is
+
+SuperAgent is a terminal-first, Python-native multi-agent runtime for high-context work that benefits from setup-aware routing, persistent artifacts, and reusable knowledge sessions.
+
+It is strongest when the job requires:
+
+- web and document evidence gathering
+- synthesis that stays tied to sources and artifacts
+- workflow orchestration across specialized agents
+- explicit setup and verification instead of hidden magic
+
+## What It Does Well
+
+The recommended entry points today are:
+
+- deep research
+- local-drive intelligence
+- `superRAG`
+- coding project delivery
+- local command execution
+
 ## Quickstart
 
 1. Install the repo locally.
@@ -38,6 +59,24 @@ superagent run --current-folder \
 ```
 
 The runtime may stop first on an approval-ready plan before executing the workflow. See [Quickstart](docs/quickstart.md) for the full walkthrough.
+
+## Install And Verify
+
+Linux or macOS:
+
+```bash
+./scripts/install.sh
+python scripts/verify.py
+```
+
+Windows PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+python .\scripts\verify.py
+```
+
+The default verifier runs `compile`, `unit`, `smoke`, and `docs`. See [Verification](docs/verification.md) for the exact buckets and current coverage.
 
 ## Primary Workflows
 
@@ -75,6 +114,8 @@ The runtime may stop first on an approval-ready plan before executing the workfl
   Workflow families, status labels, and the full built-in inventory.
 - [Integrations](docs/integrations.md)
   Providers, channels, OAuth-backed setup, plugin discovery, and MCP services.
+- [Plugin SDK](docs/plugin_sdk.md)
+  Versioned plugin contract, manifest expectations, and external contributor guidance.
 - [Integration Checklist](docs/integration_checklist.md)
   Contract for adding integrations without drifting setup, detection, routing, docs, and tests.
 - [Security](docs/security.md)
@@ -83,6 +124,22 @@ The runtime may stop first on an approval-ready plan before executing the workfl
   First-run issues, setup gating, optional tools, and verification caveats.
 - [Examples](docs/examples.md)
   Stable, beta, and experimental CLI examples.
+
+## Contribute Safely
+
+Use these repo-level guides:
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [CHANGELOG.md](CHANGELOG.md)
+- [RELEASING.md](RELEASING.md)
+- [SECURITY.md](SECURITY.md)
+
+Contribution baseline:
+
+- keep changes grounded in real code and verified workflows
+- preserve setup-aware gating and runtime behavior unless fixing a bug
+- update tests and docs with user-facing changes
+- run `python scripts/verify.py` before opening a PR
 
 ## Supporting References
 
@@ -137,6 +194,22 @@ Not fully verified:
 - full Docker runtime execution
 - MCP client interoperability
 - heavy-load vector indexing behavior
+
+## Public Repo Status
+
+What this repo now includes:
+
+- a structured docs landing page
+- a single install and verification path aligned with CI
+- plugin SDK guidance for external contributors
+- changelog, release checklist, and contribution guidance
+- GitHub issue and PR templates for clearer reporting
+
+Still recommended for future public polish:
+
+- real screenshots or short terminal demos captured from verified runs
+- a repository license, if maintainers decide one
+- a dedicated private security reporting channel documented in the repo
 
 ## Engineering Playbooks
 

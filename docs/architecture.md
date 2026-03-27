@@ -65,6 +65,8 @@ Default external plugin search paths:
 
 External plugins are simple Python modules that expose `register(registry)`.
 
+See [Plugin SDK](plugin_sdk.md) for the versioned external contract and what is stable versus internal.
+
 ## Setup-Aware Routing
 
 SuperAgent does not route against the full theoretical surface by default.

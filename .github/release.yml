@@ -1,0 +1,24 @@
+changelog:
+  categories:
+    - title: Core workflows
+      labels:
+        - workflow
+        - enhancement
+    - title: Integrations and plugins
+      labels:
+        - integration
+        - plugin
+    - title: Verification and CI
+      labels:
+        - ci
+        - testing
+    - title: Docs and repo hygiene
+      labels:
+        - documentation
+        - maintenance
+    - title: Fixes
+      labels:
+        - bug
+    - title: Other changes
+      labels:
+        - "*"

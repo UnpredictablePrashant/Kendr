@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible bug in a shipped workflow or repository surface.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please include concrete reproduction details. If this touches setup, routing, or verification, include the exact command you ran.
+  - type: input
+    id: workflow
+    attributes:
+      label: Workflow or surface
+      description: Which user path is affected?
+      placeholder: deep research, local-drive intelligence, superRAG, CLI, gateway, plugin SDK
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: List the exact commands or actions needed to reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, Python version, and any relevant setup details.
+      placeholder: Windows 11, Python 3.12, local install, Qdrant not running
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or artifacts
+      description: Paste short excerpts or point to run artifacts. Do not include secrets.

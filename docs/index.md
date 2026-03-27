@@ -2,7 +2,7 @@
 
 SuperAgent is a multi-agent intelligence workspace for evidence-driven research, document ingestion, and persistent knowledge workflows.
 
-Use this page as the starting point for the structured docs. The repository still contains deeper supporting docs and case studies, but the guides below are the main navigation path.
+This is the main public docs landing page. If you are new to the project, start with install, verification, and the five recommended workflow entry points before going deeper into architecture or internal surfaces.
 
 ## Start Here
 
@@ -17,10 +17,17 @@ Use this page as the starting point for the structured docs. The repository stil
 - [Examples](examples.md)
   Stable, beta, and experimental example workflows.
 
-## Understand The Product
+## Evaluate The Project
 
+- [README.md](../README.md)
+  Public project summary, workflow positioning, and verification status.
 - [Product Overview](product_overview.md)
   Current thesis, scope boundaries, and primary workflows.
+- [Core Workflows](core_workflows.md)
+  Short walkthrough for each recommended entry path.
+
+## Understand The Product
+
 - [Architecture](architecture.md)
   Runtime flow, discovery, setup-aware routing, persistence, and services.
 - [Agents](agents.md)
@@ -30,12 +37,25 @@ Use this page as the starting point for the structured docs. The repository stil
 
 - [Integrations](integrations.md)
   Providers, channels, OAuth-backed setup, plugin discovery, and MCP services.
+- [Plugin SDK](plugin_sdk.md)
+  Versioned external plugin contract, manifest guidance, and examples.
 - [Integration Checklist](integration_checklist.md)
   Contract for adding integrations without drifting declaration, setup, routing, docs, and tests.
 - [Security](security.md)
   Safety model, authorized security-assessment workflow, and privileged controls.
 - [Troubleshooting](troubleshooting.md)
   First-run issues, setup gating, optional tools, and verification caveats.
+
+## Contribute And Release
+
+- [CONTRIBUTING.md](../CONTRIBUTING.md)
+  Safe contribution expectations, local setup, and verification requirements.
+- [CHANGELOG.md](../CHANGELOG.md)
+  Release-facing change history.
+- [RELEASING.md](../RELEASING.md)
+  Public release checklist and note-prep flow.
+- [SECURITY.md](../SECURITY.md)
+  Security reporting guidance and links.
 
 ## Supporting Docs
 

@@ -166,6 +166,9 @@ Plugin files are simple Python modules that expose `register(registry)`.
 Example:
 
 - [`plugin_templates/echo_plugin.py`](../plugin_templates/echo_plugin.py)
+- [`plugin_templates/provider_plugin.py`](../plugin_templates/provider_plugin.py)
+
+See [Plugin SDK](plugin_sdk.md) for manifest expectations, compatibility notes, and testing guidance.
 
 ## MCP Servers
 

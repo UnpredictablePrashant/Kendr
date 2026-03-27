@@ -1,0 +1,42 @@
+name: Workflow gap
+description: Suggest a targeted improvement to one of the recommended SuperAgent workflows.
+title: "[Workflow]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this for focused product improvements, not broad platform rewrites.
+  - type: dropdown
+    id: workflow
+    attributes:
+      label: Workflow
+      options:
+        - Deep research
+        - Local-drive intelligence
+        - superRAG
+        - Coding project builder
+        - Local command execution
+        - Plugin SDK
+        - Verification / CI
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: What is missing or unreliable?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What would a strong outcome look like?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance signal
+      description: How should maintainers verify the improvement?
+      placeholder: smoke test, docs update, setup validation, artifact output

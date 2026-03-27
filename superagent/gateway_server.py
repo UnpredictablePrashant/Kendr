@@ -101,6 +101,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
                         "source": plugin.source,
                         "description": plugin.description,
                         "version": plugin.version,
+                        "sdk_version": plugin.sdk_version,
+                        "runtime_api": plugin.runtime_api,
                         "kind": plugin.kind,
                     }
                     for plugin in REGISTRY.plugins.values()

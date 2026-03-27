@@ -2239,6 +2239,8 @@ def _cmd_plugins(args: argparse.Namespace) -> int:
                 "source": plugin.source,
                 "description": plugin.description,
                 "version": plugin.version,
+                "sdk_version": plugin.sdk_version,
+                "runtime_api": plugin.runtime_api,
                 "kind": plugin.kind,
             }
             for plugin in registry.plugins.values()
@@ -2265,6 +2267,7 @@ def _cmd_plugins(args: argparse.Namespace) -> int:
                 item["name"],
                 str(item["kind"]),
                 str(item.get("version", "") or "-"),
+                str(item.get("sdk_version", "") or "-"),
                 _truncate(str(item["description"]), 80),
             ]
             for item in payload
@@ -2273,7 +2276,7 @@ def _cmd_plugins(args: argparse.Namespace) -> int:
             print(style.warn("No plugins matched the current filters."))
             return 0
         print(style.heading(f"Discovered plugins ({len(payload)}):"))
-        print(_render_table(["NAME", "KIND", "VERSION", "DESCRIPTION"], rows))
+        print(_render_table(["NAME", "KIND", "VERSION", "SDK", "DESCRIPTION"], rows))
     return 0
 
 

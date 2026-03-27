@@ -11,7 +11,7 @@ import tasks
 
 from .setup.catalog import channel_catalog, provider_catalog
 from .registry import Registry
-from .types import AgentDefinition, ChannelDefinition, PluginDefinition, ProviderDefinition
+from .types import AgentDefinition, ChannelDefinition, PluginDefinition, PluginManifest, ProviderDefinition
 
 
 IGNORE_TASK_MODULES = {
@@ -110,6 +110,15 @@ def _discover_builtin_task_agents(registry: Registry) -> None:
         _register_task_module_agents(registry, f"tasks.{name}")
 
 
+def _plugin_manifest_from_module(module, plugin_path: Path) -> PluginManifest:
+    plugin_meta = getattr(module, "PLUGIN", None)
+    if isinstance(plugin_meta, PluginManifest):
+        return plugin_meta
+    if isinstance(plugin_meta, dict):
+        return PluginManifest.from_mapping(plugin_meta, default_name=plugin_path.stem)
+    return PluginManifest.from_mapping({}, default_name=plugin_path.stem)
+
+
 def _load_external_plugin(registry: Registry, plugin_path: Path) -> None:
     module_name = f"external_plugin_{plugin_path.stem}_{abs(hash(str(plugin_path)))}"
     spec = importlib.util.spec_from_file_location(module_name, plugin_path)
@@ -117,20 +126,13 @@ def _load_external_plugin(registry: Registry, plugin_path: Path) -> None:
         raise RuntimeError(f"Unable to load plugin from {plugin_path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    register = getattr(module, "register", None)
+    manifest = _plugin_manifest_from_module(module, plugin_path)
+    register = getattr(module, manifest.entry_point, None)
     if not callable(register):
-        raise RuntimeError(f"Plugin {plugin_path} must define a callable register(registry) function.")
-    plugin_meta = getattr(module, "PLUGIN", {}) or {}
-    registry.register_plugin(
-        PluginDefinition(
-            name=plugin_meta.get("name", plugin_path.stem),
-            source=str(plugin_path),
-            description=plugin_meta.get("description", "External plugin."),
-            version=plugin_meta.get("version", "0.1.0"),
-            kind="external",
-            metadata=plugin_meta,
+        raise RuntimeError(
+            f"Plugin {plugin_path} must define a callable {manifest.entry_point}(registry) function."
         )
-    )
+    registry.register_plugin(manifest.to_plugin_definition(source=str(plugin_path), kind="external"))
     register(registry)
 
 

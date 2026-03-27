@@ -34,6 +34,7 @@ UNIT_TEST_MODULES = [
     "tests.test_setup_cli_config",
     "tests.test_setup_registry",
     "tests.test_superrag_store",
+    "tests.test_plugin_sdk",
 ]
 SMOKE_TEST_MODULES = [
     "tests.test_cli",
