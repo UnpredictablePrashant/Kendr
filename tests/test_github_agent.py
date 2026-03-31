@@ -437,7 +437,7 @@ class TestGitHubAgentMockedExecution(unittest.TestCase):
         from tasks.github_tasks import _canonical_pr_plan
         with patch("tasks.github_tasks._resolve_target_file", return_value=""):
             ops = _canonical_pr_plan("fix the test and open a pr", "acme", "api")
-        self.assertEqual(ops, [])
+        self.assertEqual(ops, [], "Empty list signals caller should fail fast with actionable error")
 
     def test_fallback_plan_conservative_no_pr_or_push(self):
         from tasks.github_tasks import _fallback_operations

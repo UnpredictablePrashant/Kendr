@@ -488,11 +488,12 @@ def github_agent(state):
                 log_task_update("GitHub Agent", f"Using canonical fix+PR plan ({len(canon)} ops).")
                 operations = canon
             else:
-                log_task_update(
-                    "GitHub Agent",
-                    "Could not identify target file for PR; using exploration fallback.",
+                raise ValueError(
+                    "github_agent: task requests a pull request but the target file to modify "
+                    f"could not be determined for repo '{resolved_owner}/{resolved_repo}'. "
+                    "Add 'github_task' to state with the specific file path, or rephrase "
+                    "the task to include the file to edit (e.g. 'fix src/utils.py and open a PR')."
                 )
-                operations = _fallback_operations(task)
         else:
             operations = _fallback_operations(task)
             log_task_update(
