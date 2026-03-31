@@ -533,6 +533,21 @@ def list_agent_executions_for_run(run_id: str, db_path: str = DB_PATH) -> list[d
     return [dict(row) for row in rows]
 
 
+def list_artifacts_for_run(run_id: str, db_path: str = DB_PATH) -> list[dict]:
+    initialize_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT artifact_id, run_id, timestamp, name, kind
+            FROM artifacts
+            WHERE run_id = ?
+            ORDER BY timestamp ASC
+            """,
+            (run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def list_recent_runs(limit: int = 20, db_path: str = DB_PATH) -> list[dict]:
     initialize_db(db_path)
     with _connect(db_path) as conn:

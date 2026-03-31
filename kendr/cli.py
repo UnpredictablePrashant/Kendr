@@ -2620,12 +2620,40 @@ def _emit_run_summary_table(run_id: str) -> None:
     if not str(run_id or "").strip():
         return
     try:
-        from kendr.persistence import list_agent_executions_for_run
+        import datetime as _dt
+        from kendr.persistence import list_agent_executions_for_run, list_artifacts_for_run
         from kendr import cli_output as out
 
         rows = list_agent_executions_for_run(run_id)
         if not rows:
             return
+
+        artifacts = list_artifacts_for_run(run_id)
+
+        def _ts_float(ts_str: str) -> float:
+            try:
+                return _dt.datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return 0.0
+
+        agent_intervals = []
+        for row in rows:
+            t0 = _ts_float(row.get("timestamp") or "")
+            t1 = _ts_float(row.get("completed_at") or "") or t0
+            agent_intervals.append((t0, t1, row.get("agent_name", "")))
+
+        artifact_by_agent: dict = {}
+        for art in artifacts:
+            art_ts = _ts_float(art.get("timestamp") or "")
+            best_agent = ""
+            for t0, t1, agent in agent_intervals:
+                if t0 <= art_ts <= t1 + 0.001:
+                    best_agent = agent
+                    break
+            if not best_agent and agent_intervals:
+                best_agent = agent_intervals[-1][2]
+            artifact_by_agent.setdefault(best_agent, []).append(art.get("name") or art.get("kind") or "artifact")
+
         steps = []
         for row in rows:
             started = row.get("timestamp") or ""
@@ -2633,17 +2661,17 @@ def _emit_run_summary_table(run_id: str) -> None:
             dur = None
             if started and completed:
                 try:
-                    import datetime as _dt
                     t0 = _dt.datetime.fromisoformat(started.replace("Z", "+00:00"))
                     t1 = _dt.datetime.fromisoformat(completed.replace("Z", "+00:00"))
                     dur = (t1 - t0).total_seconds()
                 except Exception:
                     pass
+            agent = row.get("agent_name", "")
             steps.append({
-                "agent": row.get("agent_name", ""),
+                "agent": agent,
                 "status": row.get("status", ""),
                 "duration": dur,
-                "artifacts": [],
+                "artifacts": artifact_by_agent.get(agent, []),
             })
         out.run_summary(steps)
     except ImportError:
@@ -3418,10 +3446,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 if is_blueprint_gate:
                     try:
                         from kendr import cli_output as _cout
-                        _cout._console.print()
-                        _cout._console.rule("[bold #FFB347]BLUEPRINT READY FOR REVIEW[/bold #FFB347]")
+                        _cout.print_text("")
+                        _cout.rule("BLUEPRINT READY FOR REVIEW", style="#FFB347")
                         if prompt:
-                            _cout._console.print(f"\n{prompt}\n", style="grey62")
+                            _cout.print_text(f"\n{prompt}\n", style="grey62")
                     except Exception:
                         print()
                         print("═" * 72)
@@ -3440,7 +3468,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     else:
                         try:
                             from kendr import cli_output as _cout
-                            _cout._console.print("\nGeneration cancelled at blueprint review.", style="#FF4757")
+                            _cout.print_text("\nGeneration cancelled at blueprint review.", style="#FF4757")
                         except Exception:
                             print("\nGeneration cancelled at blueprint review.")
                         return 0
@@ -3464,7 +3492,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
             else:
-                print(result.get("final_output", ""))
+                final_output = result.get("final_output", "")
+                try:
+                    from kendr import cli_output as _cout
+                    _cout.print_final_output(final_output)
+                except Exception:
+                    if final_output:
+                        print(final_output)
                 if not bool(getattr(args, "quiet", False)):
                     try:
                         _emit_run_summary_table(result.get("run_id", ""))
@@ -3986,12 +4020,12 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     apply_setup_env_defaults()
     action = args.setup_action
 
-    if action == "status" and not getattr(args, "json", False):
+    if not getattr(args, "json", False) and not getattr(args, "quiet", False):
         try:
-            from kendr import cli_output as _out
-            _out.startup_banner(
+            from kendr import cli_output as _setup_out
+            _setup_out.startup_banner(
                 version=_cli_version(),
-                tagline="Configuration & setup status",
+                tagline=f"setup {action}",
             )
         except Exception:
             pass

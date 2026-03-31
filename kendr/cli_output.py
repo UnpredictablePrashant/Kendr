@@ -277,6 +277,26 @@ def warn(message: str) -> None:
     _console.print(Text(f"  {message}", style=_AMBER))
 
 
+def rule(title: str = "", style: str = _AMBER) -> None:
+    _console.rule(f"[bold {style}]{title}[/bold {style}]" if title else "")
+
+
+def print_text(text: str, style: str = "default") -> None:
+    _console.print(text, style=style)
+
+
+def print_final_output(output: str) -> None:
+    if not str(output or "").strip():
+        return
+    _console.print()
+    _console.print(Panel(
+        Text(output.strip(), style="white"),
+        title="[bold #00C9A7]Run Output[/bold #00C9A7]",
+        border_style=_TEAL,
+        padding=(1, 2),
+    ))
+
+
 def make_spinner(description: str = "Working...") -> Progress:
     return Progress(
         SpinnerColumn(style=_TEAL),
