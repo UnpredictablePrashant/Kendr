@@ -1900,7 +1900,8 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         help=(
             "Optional tech stack template to use. "
             "Available: fastapi_postgres, fastapi_react_postgres, nextjs_prisma_postgres, "
-            "express_prisma_postgres, mern_microservices_mongodb, pern_postgres, nextjs_static_site. "
+            "express_prisma_postgres, mern_microservices_mongodb, pern_postgres, nextjs_static_site, "
+            "django_react_postgres, custom_freeform. "
             "Leave blank for LLM-driven stack selection."
         ),
     )
