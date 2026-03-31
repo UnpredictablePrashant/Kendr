@@ -30,6 +30,7 @@ UNIT_TEST_MODULES = [
     "tests.test_planning_tasks",
     "tests.test_privileged_control",
     "tests.test_recovery",
+    "tests.test_research_infra",
     "tests.test_security_policy",
     "tests.test_setup_cli_config",
     "tests.test_setup_registry",
