@@ -105,6 +105,11 @@ class AgentRuntime:
     _NON_REVIEW_AGENTS = {
         "channel_gateway_agent",
         "session_router_agent",
+        # Data-collection agents whose output feeds into a synthesis step.
+        # Adding them here prevents the reviewer from intercepting before synthesis.
+        "research_pipeline_agent",
+        "deep_research_agent",
+        "local_drive_agent",
     }
 
     def _is_agent_available(self, state: dict, agent_name: str) -> bool:
@@ -828,6 +833,78 @@ class AgentRuntime:
             "database url",
         )
         return any(marker in text for marker in markers)
+
+    # ------------------------------------------------------------------
+    # Research intent classification
+    # ------------------------------------------------------------------
+
+    _RESEARCH_INTENT_RE = re.compile(
+        r"(?:"
+        r"\bresearch\s+(about|on|into|the|for|around|regarding)\b"
+        r"|\bdo\s+(some\s+)?(research|investigation)\b"
+        r"|\binvestigate\b|\blook\s+into\b|\blook\s+up\b"
+        r"|\bfind\s+(out|information|data|details|facts)\s+(about|on|regarding)\b"
+        r"|\bstudy\s+(about|on|the|of)\b"
+        r"|\btell\s+me\s+(about|what|how|why|where|when)\b"
+        r"|\bwhat\s+(is|are|was|were|does|do)\b"
+        r"|\bhow\s+(does|do|did|to|can|should)\b"
+        r"|\bwhy\s+(does|do|did|is|are|was|were)\b"
+        r"|\bexplain\b"
+        r"|\bdescribe\b"
+        r"|\bsummarize\b|\bsummarise\b"
+        r"|\bgive\s+me\s+(a\s+)?(summary|overview|introduction|explanation|brief)\b"
+        r"|\boverview\s+of\b|\bintroduction\s+to\b|\bhistory\s+of\b"
+        r"|\bcompare\b|\bpros\s+and\s+cons\b"
+        r"|\badvantages?\s+(of|and)\b|\bdisadvantages?\s+(of|and)\b"
+        r"|\bstate\s+of\s+(the\s+)?art\b|\bbest\s+practices\s+(for|in|of)\b"
+        r"|\brecent\s+(news|developments|updates|advances|progress|research)\b"
+        r"|\binformation\s+(about|on|regarding)\b|\bfacts\s+(about|on|regarding)\b"
+        r"|\banalysis\s+(of|on)\b|\banalyze\b|\banalyse\b"
+        r"|\bcurrent\s+(state|status|landscape)\s+(of|in)\b"
+        r")",
+        re.IGNORECASE,
+    )
+
+    # Signals that strongly indicate coding / building / git / shell — NOT information lookup.
+    _ANTI_RESEARCH_RE = re.compile(
+        r"\b("
+        r"write\s+(code|a\s+(function|class|script|program|module|test|component|page|route|handler|service))"
+        r"|write\s+me\s+(a|an)\s+(function|class|script|program|module|test|app|api|server|bot)"
+        r"|implement\s+(a|an|the)?\s*(function|class|endpoint|feature|algorithm|interface|api|auth)"
+        r"|create\s+(a|an)\s+(function|class|app|application|project|system|api|server|bot|endpoint|route)"
+        r"|build\s+(a|an)\s+(app|application|project|system|api|server|bot|pipeline|workflow)"
+        r"|generate\s+(code|a\s+(function|class|test|schema|migration|api))"
+        r"|fix\s+(the\s+)?(bug|error|issue|crash|test|exception|failure)"
+        r"|debug\s+(this|the|my)|refactor\s+(this|the|my)"
+        r"|clone\s+(repo|repository|this|the\s+repo)|push\s+(to|the\s+repo)"
+        r"|merge\s+(the\s+)?PR|open\s+(a\s+)?(PR|pull\s+request)"
+        r"|run\s+(this\s+)?(command|script|test|pipeline)|execute\s+(this|the)"
+        r"|deploy\s+(to|the|this|my)\s*(app|server|cloud|production|env|environment)"
+        r"|install\s+(package|dependency|dependencies|module|library)"
+        r")\b",
+        re.IGNORECASE,
+    )
+
+    def _is_research_request(self, state: dict) -> bool:
+        """Return True when the query is a clear information/research request that should
+        bypass the planner and route directly to a research agent.
+
+        Deliberately conservative: only fires on strong positive research signals AND
+        absence of strong coding/build/git signals.
+        """
+        text = " ".join([
+            str(state.get("user_query", "") or ""),
+            str(state.get("current_objective", "") or ""),
+        ]).strip()
+        if not text or len(text.split()) < 3:
+            return False
+        if self._is_project_build_request(state):
+            return False
+        if self._is_github_request(state):
+            return False
+        if self._ANTI_RESEARCH_RE.search(text):
+            return False
+        return bool(self._RESEARCH_INTENT_RE.search(text))
 
     def _is_local_command_request(self, state: dict) -> bool:
         explicit_keys = ("os_command", "target_os", "shell", "os_working_directory", "os_timeout")
@@ -1713,7 +1790,78 @@ class AgentRuntime:
             )
             return state
 
-        if not state.get("plan_ready", False) and self._is_agent_available(state, "planner_agent"):
+        # --- Research fast-path: bypass planner for clear information / research requests ---
+        # Mirrors the pattern used by github_agent and os_agent — deterministic routing before
+        # the planner ensures research agents (with real internet access) are used instead of
+        # the generic worker_agent (LLM-only, no web search).
+        if (
+            not state.get("plan_steps")
+            and not state.get("research_pipeline_enabled")
+            and not state.get("research_synthesis_done")
+            and state.get("last_agent") not in {"research_pipeline_agent", "deep_research_agent"}
+            and self._is_research_request(state)
+        ):
+            research_query = str(state.get("current_objective") or state.get("user_query", "")).strip()
+            if self._is_deep_research_request(state) and self._is_agent_available(state, "deep_research_agent"):
+                reason = (
+                    "The request is a deep research task. Bypassing the planner and routing directly "
+                    "to deep_research_agent for OpenAI web-grounded deep research."
+                )
+                state["orchestrator_reason"] = reason
+                state["next_agent"] = "deep_research_agent"
+                state = append_task(
+                    state,
+                    make_task(
+                        sender="orchestrator_agent",
+                        recipient="deep_research_agent",
+                        intent="deep-research-dispatch",
+                        content=research_query,
+                        state_updates={"research_query": research_query},
+                    ),
+                )
+                log_task_update("Orchestrator", reason)
+                return state
+            elif self._is_agent_available(state, "research_pipeline_agent"):
+                reason = (
+                    "The request is a research / information task. Bypassing the planner and routing "
+                    "to research_pipeline_agent for multi-source web evidence collection."
+                )
+                sources = state.get("research_sources") or ["web"]
+                state["research_pipeline_enabled"] = True
+                state["research_pipeline_completed"] = False
+                state["orchestrator_reason"] = reason
+                state["next_agent"] = "research_pipeline_agent"
+                state = append_task(
+                    state,
+                    make_task(
+                        sender="orchestrator_agent",
+                        recipient="research_pipeline_agent",
+                        intent="research-pipeline-dispatch",
+                        content=research_query,
+                        state_updates={
+                            "research_sources": sources,
+                            "research_pipeline_enabled": True,
+                        },
+                    ),
+                )
+                log_task_update("Orchestrator", reason)
+                return state
+
+        # Guard: if a research agent just finished (synthesis pending) OR synthesis is already
+        # done (worker just wrote the report), skip the planner entirely so it does not
+        # interrupt the research → synthesis → review → finish pipeline.
+        _research_needs_synthesis = (
+            state.get("last_agent") in {"research_pipeline_agent", "deep_research_agent"}
+            and not state.get("research_synthesis_done")
+            and not state.get("plan_steps")
+        )
+        _research_synthesis_complete = bool(state.get("research_synthesis_done")) and not state.get("plan_steps")
+        if (
+            not state.get("plan_ready", False)
+            and self._is_agent_available(state, "planner_agent")
+            and not _research_needs_synthesis
+            and not _research_synthesis_complete
+        ):
             if state.get("last_agent") != "planner_agent":
                 reason = "Create a detailed step-by-step plan before execution."
                 state["orchestrator_reason"] = reason
@@ -2290,6 +2438,51 @@ class AgentRuntime:
                 ),
             )
             return state
+
+        # --- Research synthesis: after a research agent finishes (no plan_steps), route to
+        # worker_agent for a clean final write-up instead of dumping raw research output. ---
+        if (
+            not state.get("plan_steps")
+            and not state.get("research_synthesis_done")
+            and state.get("last_agent") in {"research_pipeline_agent", "deep_research_agent"}
+            and self._is_agent_available(state, "worker_agent")
+        ):
+            research_body = (
+                str(state.get("research_pipeline_report") or "").strip()
+                or str(state.get("research_pipeline_synthesis") or "").strip()
+                or str(state.get("research_result") or "").strip()
+                or str(state.get("draft_response") or "").strip()
+            )
+            if research_body:
+                original_query = str(state.get("user_query") or state.get("current_objective") or "").strip()
+                synthesis_objective = (
+                    f"You have been given the following research findings collected from the web. "
+                    f"Write a comprehensive, well-structured, and easy-to-read final report that "
+                    f"directly answers the user's query. Cite sources where available. Do not omit "
+                    f"important details.\n\n"
+                    f"User's original query: {original_query}\n\n"
+                    f"Research findings:\n{research_body[:12000]}"
+                )
+                state["research_synthesis_done"] = True
+                state["current_objective"] = synthesis_objective
+                reason = (
+                    "Research collection complete. Routing to worker_agent to synthesize "
+                    "the findings into a final structured report."
+                )
+                state["orchestrator_reason"] = reason
+                state["next_agent"] = "worker_agent"
+                state = append_task(
+                    state,
+                    make_task(
+                        sender="orchestrator_agent",
+                        recipient="worker_agent",
+                        intent="research-synthesis",
+                        content=synthesis_objective,
+                        state_updates={"current_objective": synthesis_objective},
+                    ),
+                )
+                log_task_update("Orchestrator", reason)
+                return state
 
         prompt = f"""
 You are the orchestration agent for a plugin-driven multi-agent AI system.
