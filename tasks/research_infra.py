@@ -841,16 +841,11 @@ def get_qdrant_client():
 
 
 def ensure_vector_collection(collection_name: str = DEFAULT_QDRANT_COLLECTION, vector_size: int = 1536):
-    from qdrant_client.models import Distance, VectorParams
+    from tasks.vector_backends import get_vector_backend
 
-    client = get_qdrant_client()
-    existing = [item.name for item in client.get_collections().collections]
-    if collection_name not in existing:
-        client.create_collection(
-            collection_name=collection_name,
-            vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
-        )
-    return client
+    backend = get_vector_backend()
+    backend.ensure_collection(collection_name, vector_size=vector_size)
+    return backend
 
 
 def embed_texts(texts: list[str], model: str = DEFAULT_EMBEDDING_MODEL) -> list[list[float]]:
@@ -862,45 +857,23 @@ def embed_texts(texts: list[str], model: str = DEFAULT_EMBEDDING_MODEL) -> list[
 
 
 def upsert_memory_records(records: list[dict], collection_name: str = DEFAULT_QDRANT_COLLECTION):
-    from qdrant_client.models import PointStruct
+    from tasks.vector_backends import get_vector_backend
 
     if not records:
         return {"indexed": 0, "collection": collection_name}
     vectors = embed_texts([record["text"] for record in records])
-    client = ensure_vector_collection(collection_name, vector_size=len(vectors[0]) if vectors else 1536)
-    points = []
-    for index, record in enumerate(records):
-        payload = dict(record.get("payload", {}))
-        payload["text"] = record["text"]
-        payload["source"] = record.get("source", "")
-        points.append(
-            PointStruct(
-                id=record.get("id") or abs(hash(f"{record.get('source', '')}:{index}:{record['text'][:64]}")),
-                vector=vectors[index],
-                payload=payload,
-            )
-        )
-    client.upsert(collection_name=collection_name, points=points)
-    return {"indexed": len(points), "collection": collection_name}
+    backend = get_vector_backend()
+    backend.ensure_collection(collection_name, vector_size=len(vectors[0]) if vectors else 1536)
+    return backend.upsert(collection_name, records, vectors)
 
 
 def search_memory(query: str, top_k: int = 5, collection_name: str = DEFAULT_QDRANT_COLLECTION) -> list[dict]:
-    client = ensure_vector_collection(collection_name)
+    from tasks.vector_backends import get_vector_backend
+
+    backend = get_vector_backend()
+    backend.ensure_collection(collection_name)
     query_vector = embed_texts([query])[0]
-    results = client.query_points(collection_name=collection_name, query=query_vector, limit=top_k)
-    points = getattr(results, "points", results)
-    matches = []
-    for item in points:
-        payload = getattr(item, "payload", {}) or {}
-        matches.append(
-            {
-                "score": getattr(item, "score", None),
-                "source": payload.get("source", ""),
-                "text": payload.get("text", ""),
-                "metadata": payload,
-            }
-        )
-    return matches
+    return backend.search(collection_name, query_vector, top_k=top_k)
 
 
 def build_evidence_bundle(state: dict) -> dict:

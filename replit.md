@@ -137,3 +137,32 @@ Flags:
 - `skip_test_agent: bool` and `skip_devops_agent: bool` added to `RuntimeState` in `kendr/orchestration/state.py`
 - New dev pipeline state keys: `dev_pipeline_mode`, `dev_pipeline_status`, `dev_pipeline_stages_completed`, `dev_pipeline_error`, `dev_pipeline_zip_path`, `dev_pipeline_max_fix_rounds`, `project_verifier_status`, `project_verifier_output`
 - Planner prompt updated to honor `skip_test_agent` and `skip_devops_agent` flags from planning context
+
+## Task #4: SuperRAG Zero-Config Knowledge Engine (Vector Backend Abstraction)
+
+### New file: `tasks/vector_backends.py`
+Pluggable vector store backend abstraction with zero-config local fallback:
+
+- **`VectorBackend`** — Abstract base class with `ensure_collection()`, `upsert()`, `search()` methods
+- **`ChromaBackend`** — Local persistent vector store using `chromadb.PersistentClient`; stores data in `$KENDR_WORKING_DIR/.chroma/` (fallback `./.chroma/`)
+- **`QdrantBackend`** — Wraps Qdrant with lazy client creation; connects to `QDRANT_URL`
+- **`get_vector_backend()`** — Auto-selects backend on first call; result is cached process-wide:
+  1. If `QDRANT_URL` is set and Qdrant health check passes → `QdrantBackend`
+  2. If default Qdrant URL (`localhost:6333`) is reachable → `QdrantBackend`
+  3. Otherwise → `ChromaBackend` (zero-config, no server required)
+  4. Prints `[vector] Using ChromaDB (local)` or `[vector] Using Qdrant at <url>` to stderr
+
+### Updated: `tasks/research_infra.py`
+- `ensure_vector_collection()` — now delegates to `get_vector_backend().ensure_collection()`
+- `upsert_memory_records()` — now delegates to `get_vector_backend().upsert()`
+- `search_memory()` — now delegates to `get_vector_backend().search()`
+- `embed_texts()` — unchanged; still uses OpenAI embeddings for both backends
+- `get_qdrant_client()` — kept for backwards compatibility but no longer used internally
+
+### Callers unchanged (no API changes)
+- `tasks/superrag_tasks.py` — imports `search_memory`, `upsert_memory_records` (unchanged)
+- `mcp_servers/vector_server.py` — imports `search_memory`, `upsert_memory_records`, `DEFAULT_QDRANT_COLLECTION` (unchanged)
+- `kendr/domain/local_drive.py` — calls via `intelligence_tasks` (unchanged)
+
+### Dependencies
+- Added `chromadb` to `pyproject.toml` dependencies
