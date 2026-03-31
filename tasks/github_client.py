@@ -20,6 +20,7 @@ Architecture — async-first with sync bridge:
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import subprocess
@@ -144,24 +145,28 @@ class AsyncGitHubClient:
         return result if isinstance(result, list) else []
 
     def _git_env(self) -> dict[str, str]:
-        """Return a subprocess environment with git auth configured via HTTP extra-header.
+        """Return a subprocess environment with git auth configured via HTTP Basic auth.
 
         The token is passed through git's environment-variable config mechanism
         (GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_*), which means it is
         never embedded in any remote URL, never written to .git/config, and is not
         visible in ``ps aux`` output (environment vars, not process args).
 
-        GitHub git transport over HTTPS accepts ``Authorization: token <PAT>`` as an
-        HTTP extra-header.  Both classic PATs (``ghp_…``) and fine-grained PATs work
-        with this scheme.  The GitHub REST API uses ``Bearer``; git transport uses
-        ``token`` — they are separate auth schemes for different protocols.
+        GitHub's recommended auth strategy for PATs and GitHub App tokens over HTTPS
+        is Basic auth with username ``x-access-token`` and the token as the password.
+        This is the approach recommended by GitHub docs for git credential helpers and
+        is supported by classic PATs (``ghp_…``), fine-grained PATs, and installation
+        tokens. The Authorization header is base64-encoded as per RFC 7617.
         """
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
         if self.token:
+            credentials = base64.b64encode(
+                f"x-access-token:{self.token}".encode()
+            ).decode()
             env["GIT_CONFIG_COUNT"] = "1"
             env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
-            env["GIT_CONFIG_VALUE_0"] = f"Authorization: token {self.token}"
+            env["GIT_CONFIG_VALUE_0"] = f"Authorization: Basic {credentials}"
         return env
 
     def _run_git(self, args: list[str], cwd: Path, timeout: int = 120) -> str:

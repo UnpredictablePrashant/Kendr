@@ -286,7 +286,6 @@ Enables `github_agent` to autonomously operate on GitHub repositories from a
 natural language task description.
 
 **Required env:** `GITHUB_TOKEN`
-**Optional env:** `GITHUB_API_URL` (default: `https://api.github.com` — override for GitHub Enterprise)
 
 ```bash
 kendr setup set github GITHUB_TOKEN ghp_...

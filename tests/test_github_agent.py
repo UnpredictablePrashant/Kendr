@@ -164,13 +164,25 @@ class TestAsyncBridge(unittest.TestCase):
         from tasks.github_client import AsyncGitHubClient, GitHubClient
         self.assertTrue(issubclass(GitHubClient, AsyncGitHubClient))
 
-    def test_git_env_uses_token_scheme_not_bearer(self):
+    def test_git_env_uses_basic_auth_not_bearer_or_token_scheme(self):
+        import base64
         from tasks.github_client import GitHubClient
         client = GitHubClient(token="ghp_testtoken")
         env = client._git_env()
         val = env.get("GIT_CONFIG_VALUE_0", "")
-        self.assertIn("Authorization: token ghp_testtoken", val)
+        expected_b64 = base64.b64encode(b"x-access-token:ghp_testtoken").decode()
+        self.assertIn("Authorization: Basic ", val)
+        self.assertIn(expected_b64, val)
         self.assertNotIn("Bearer", val)
+        self.assertNotIn("Authorization: token", val)
+
+    def test_is_branch_ahead_of_base_permissive_on_missing_repo(self):
+        from tasks.github_client import GitHubClient
+        import tempfile
+        client = GitHubClient(token="t")
+        nonexistent = Path(tempfile.mkdtemp()) / "no_such_repo"
+        result = client.is_branch_ahead_of_base(nonexistent, "feature", "main")
+        self.assertTrue(result, "Should return True (permissive) when repo dir does not exist")
 
     def test_git_env_token_not_in_remote_url(self):
         from tasks.github_client import GitHubClient

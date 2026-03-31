@@ -337,10 +337,10 @@ def _execute_operations(
                 head = str(params.get("head") or client.current_branch(repo_dir))
                 base = str(params.get("base") or "main")
                 if repo_dir.exists() and not client.is_branch_ahead_of_base(repo_dir, head, base):
-                    log_lines.append(
-                        f"create_pr: WARNING — branch '{head}' has no commits ahead of '{base}'. "
-                        "The PR API call will proceed but may be rejected by GitHub "
-                        "(\"no commits between base and head\")."
+                    raise RuntimeError(
+                        f"GitHub operation 'create_pr' aborted: branch '{head}' has no commits "
+                        f"ahead of '{base}'. Commit and push changes first, or verify the correct "
+                        "head/base branch names."
                     )
                 log_task_update("GitHub Agent", f"Opening PR: {title} …")
                 pr = client.create_pull_request(owner, repo, title, body, head, base)
@@ -391,7 +391,6 @@ def github_agent(state):
         raise ValueError("github_agent requires 'github_task' or 'user_query' in state.")
 
     token = state.get("github_token") or os.getenv("GITHUB_TOKEN") or ""
-    api_base = os.getenv("GITHUB_API_URL", "https://api.github.com")
 
     if not token:
         log_task_update(
@@ -400,7 +399,7 @@ def github_agent(state):
             "private repos will fail. Set GITHUB_TOKEN via `kendr setup set github`.",
         )
 
-    client = GitHubClient(token=token, api_base=api_base)
+    client = GitHubClient(token=token)
 
     owner = str(state.get("github_owner") or "").strip()
     repo = str(state.get("github_repo") or "").strip()
