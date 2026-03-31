@@ -70,6 +70,8 @@ _AVAILABLE_OPERATIONS = [
     "add_comment",
 ]
 
+_CRITICAL_OPS = frozenset({"clone_repo", "push", "commit", "create_pr", "merge_pr"})
+
 
 def _strip_fences(text: str) -> str:
     stripped = normalize_llm_text(text).strip()
@@ -190,7 +192,7 @@ def _execute_operations(
         op = str(entry.get("op", "")).strip()
         params: dict = entry.get("params", {}) or {}
 
-        try:
+        try:  # noqa: SIM105 — inner try/except distinguishes critical vs. best-effort
             if op == "clone_repo":
                 log_task_update("GitHub Agent", f"Cloning {owner}/{repo} …")
                 if repo_dir.exists() and (repo_dir / ".git").exists():
@@ -300,6 +302,8 @@ def _execute_operations(
                 log_lines.append(f"unknown op '{op}' — skipped")
 
         except Exception as exc:
+            if op in _CRITICAL_OPS:
+                raise RuntimeError(f"GitHub operation '{op}' failed: {exc}") from exc
             log_lines.append(f"{op}: ERROR — {exc}")
 
     return log_lines, pr_url, diff_text, issues

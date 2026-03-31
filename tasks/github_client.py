@@ -56,6 +56,20 @@ class GitHubClient:
     def get_repo(self, owner: str, repo: str) -> dict:
         return self._get(f"/repos/{owner}/{repo}")
 
+    def test_connection(self) -> dict:
+        """Test the stored token by calling GET /user.
+
+        Returns a dict with ``ok`` (bool) and ``login`` / ``error`` (str) fields.
+        """
+        if not self.token:
+            return {"ok": False, "error": "GITHUB_TOKEN is not configured."}
+        try:
+            user = self._get("/user")
+            login = str(user.get("login") or "")
+            return {"ok": True, "login": login, "detail": f"Authenticated as {login}"}
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc)}
+
     def list_issues(self, owner: str, repo: str, state: str = "open", per_page: int = 30) -> list[dict]:
         result = self._get(f"/repos/{owner}/{repo}/issues?state={state}&per_page={per_page}")
         return result if isinstance(result, list) else []
@@ -104,8 +118,24 @@ class GitHubClient:
         result = self._get(f"/repos/{owner}/{repo}/branches?per_page=50")
         return result if isinstance(result, list) else []
 
-    @staticmethod
-    def _run_git(args: list[str], cwd: Path, timeout: int = 120) -> str:
+    def _git_env(self) -> dict[str, str]:
+        """Return a subprocess environment with git auth configured via HTTP extra-header.
+
+        The token is passed through git's environment-variable config mechanism
+        (GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_*), which means it is
+        never embedded in any remote URL, never written to .git/config, and is not
+        visible in ``ps aux`` output (environment vars, not process args).
+        """
+        env = os.environ.copy()
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        if self.token:
+            env["GIT_CONFIG_COUNT"] = "1"
+            env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
+            env["GIT_CONFIG_VALUE_0"] = f"Authorization: Bearer {self.token}"
+        return env
+
+    def _run_git(self, args: list[str], cwd: Path, timeout: int = 120) -> str:
+        env = self._git_env()
         result = subprocess.run(
             ["git"] + args,
             cwd=str(cwd),
@@ -113,6 +143,7 @@ class GitHubClient:
             text=True,
             timeout=timeout,
             check=False,
+            env=env,
         )
         if result.returncode != 0:
             raise RuntimeError(
@@ -126,23 +157,26 @@ class GitHubClient:
         if depth:
             args += ["--depth", str(depth)]
         args += [clone_url, str(to_dir)]
+        env = self._git_env()
         result = subprocess.run(
             ["git"] + args,
             capture_output=True,
             text=True,
             timeout=300,
             check=False,
+            env=env,
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git clone failed")
         return to_dir
 
     def clone_repo_authenticated(self, owner: str, repo: str, to_dir: Path, depth: int = 0) -> Path:
-        """Clone via HTTPS with GITHUB_TOKEN embedded in the URL."""
-        if self.token:
-            clone_url = f"https://{self.token}@github.com/{owner}/{repo}.git"
-        else:
-            clone_url = f"https://github.com/{owner}/{repo}.git"
+        """Clone via HTTPS using the stored token injected as an HTTP Authorization header.
+
+        The token is passed through git's ``http.extraHeader`` config via environment
+        variables — it is never embedded in the remote URL and never stored in .git/config.
+        """
+        clone_url = f"https://github.com/{owner}/{repo}.git"
         return self.clone_repo(clone_url, to_dir, depth=depth)
 
     def pull(self, repo_dir: Path) -> str:
@@ -170,6 +204,7 @@ class GitHubClient:
             text=True,
             timeout=60,
             check=False,
+            env=self._git_env(),
         )
         combined = result.stdout.strip() + result.stderr.strip()
         if result.returncode != 0 and "nothing to commit" not in combined:

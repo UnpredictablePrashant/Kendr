@@ -355,6 +355,14 @@ Requirements:
 - Do not assign planner_agent as a step agent in steps or substeps. Planning happens before execution.
 - Do not start execution. Only plan.
 
+AGENT ROUTING HINTS — prefer these agents for the matching intent keywords:
+- github_agent: "github", "repository", "repo", "pull request", "PR", "commit", "push", "branch", "clone", "git", "issue", "open a PR", "merge", "code review", "fork"
+- coding_agent / master_coding_agent: "write code", "implement", "generate code", "create a function", "fix the bug", "refactor"
+- aws_automation_agent / aws_inventory_agent: "AWS", "EC2", "S3", "Lambda", "CloudFormation", "IAM"
+- security_scanner_agent: "security scan", "vulnerability", "CVE", "OWASP", "pen test"
+- devops_agent: "Dockerfile", "docker-compose", "CI/CD", "GitHub Actions", "deployment pipeline"
+Use these hints only when the query semantics clearly match; still defer to available_agents list for exact names.
+
 PROJECT BUILD MODE:
 If the planning context contains "project_build_mode": true and a non-empty "blueprint_json",
 this is a full project build. Use the following agent sequence for the plan steps:

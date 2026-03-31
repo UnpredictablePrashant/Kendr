@@ -872,8 +872,37 @@ function renderCardBody(body, snapshot, compId) {
   if (oauthPath) {
     actionsHtml += ' <a class="btn oauth" href="' + esc(oauthPath) + '" target="_blank" style="display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:8px;background:rgba(0,201,167,0.15);border:1px solid rgba(0,201,167,0.4);color:var(--teal);font-size:12px;font-weight:600;text-decoration:none;cursor:pointer">\u{1F517} OAuth Connect</a>';
   }
+  const testableComponents = ['github'];
+  if (testableComponents.includes(compId)) {
+    actionsHtml += ' <button class="btn" id="test-btn-' + esc(compId) + '" onclick="testConnection(\'' + esc(compId) + '\')" style="background:rgba(255,179,71,0.12);border:1px solid rgba(255,179,71,0.4);color:var(--amber)">Test connection</button>';
+  }
   actionsHtml += '<span class="save-msg" id="save-msg-' + esc(compId) + '" style="display:none"></span>';
   body.innerHTML = html + '<div class="card-actions">' + actionsHtml + '</div>';
+}
+
+async function testConnection(compId) {
+  const msg = document.getElementById('save-msg-' + compId);
+  const btn = document.getElementById('test-btn-' + compId);
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(API + '/api/setup/test-connection/' + compId);
+    const d = await r.json();
+    if (msg) {
+      msg.style.display = 'inline-flex';
+      if (d.ok) {
+        msg.className = 'save-msg ok';
+        msg.textContent = '\u2713 ' + (d.detail || d.login || 'Connected');
+      } else {
+        msg.className = 'save-msg err';
+        msg.textContent = '\u2717 ' + (d.error || 'Connection failed');
+      }
+      setTimeout(() => { msg.style.display = 'none'; }, 4000);
+    }
+  } catch(e) {
+    if (msg) { msg.style.display = 'inline-flex'; msg.className = 'save-msg err'; msg.textContent = '\u2717 ' + String(e); }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function saveComponent(compId) {
@@ -1167,6 +1196,10 @@ class KendrUIHandler(BaseHTTPRequestHandler):
                 lines = []
             self._json(200, {"lines": lines})
             return
+        if path.startswith("/api/setup/test-connection/"):
+            comp_id = path[len("/api/setup/test-connection/"):]
+            self._handle_test_connection(comp_id)
+            return
         if path.startswith("/api/oauth/") and path.endswith("/start"):
             provider = path[len("/api/oauth/"):-len("/start")]
             self._handle_oauth_start(provider)
@@ -1394,6 +1427,25 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             self._json(200, {"component_id": comp_id, "enabled": enabled})
         except Exception as exc:
             self._json(500, {"error": str(exc)})
+
+    def _handle_test_connection(self, comp_id: str) -> None:
+        comp_id = comp_id.strip().rstrip("/")
+        if comp_id == "github":
+            try:
+                from tasks.github_client import GitHubClient
+                from tasks.setup_config_store import get_component_values
+                stored = get_component_values("github", include_secrets=True)
+                kv = {item["config_key"]: item["config_value"] for item in stored}
+                token = str(kv.get("GITHUB_TOKEN") or "").strip()
+                if not token or token == "********":
+                    token = os.getenv("GITHUB_TOKEN", "")
+                client = GitHubClient(token=token)
+                result = client.test_connection()
+                self._json(200, result)
+            except Exception as exc:
+                self._json(200, {"ok": False, "error": str(exc)})
+        else:
+            self._json(200, {"ok": False, "error": f"No connection test available for '{comp_id}'."})
 
 
 def main() -> None:
