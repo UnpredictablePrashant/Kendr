@@ -30,7 +30,8 @@ KENDR_UI_HOST=0.0.0.0 KENDR_UI_PORT=5000 python3 -m kendr.cli ui
 |---|---|---|
 | `2151` | Kendr Web Chat + Config UI (default, self-hosted) | `kendr ui` |
 | `5000` | Kendr Web Chat + Config UI (Replit webview) | Workflow env `KENDR_UI_PORT=5000` |
-| `8000` | Gateway (agent ingest, Replit) | `kendr gateway start` |
+| `8790` | Gateway (agent ingest, default) | `kendr gateway start` |
+| `8000` | Gateway (agent ingest, Replit env override) | `GATEWAY_PORT=8000` |
 | `8787` | Setup/OAuth Console | `kendr setup ui` |
 
 ## Key Environment Variables
