@@ -150,13 +150,18 @@ class AsyncGitHubClient:
         (GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_*), which means it is
         never embedded in any remote URL, never written to .git/config, and is not
         visible in ``ps aux`` output (environment vars, not process args).
+
+        GitHub git transport over HTTPS accepts ``Authorization: token <PAT>`` as an
+        HTTP extra-header.  Both classic PATs (``ghp_…``) and fine-grained PATs work
+        with this scheme.  The GitHub REST API uses ``Bearer``; git transport uses
+        ``token`` — they are separate auth schemes for different protocols.
         """
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
         if self.token:
             env["GIT_CONFIG_COUNT"] = "1"
             env["GIT_CONFIG_KEY_0"] = "http.extraHeader"
-            env["GIT_CONFIG_VALUE_0"] = f"Authorization: Bearer {self.token}"
+            env["GIT_CONFIG_VALUE_0"] = f"Authorization: token {self.token}"
         return env
 
     def _run_git(self, args: list[str], cwd: Path, timeout: int = 120) -> str:

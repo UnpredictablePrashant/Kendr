@@ -239,7 +239,6 @@ def _execute_operations(
     diff_text = ""
     issues: list[dict] = []
     repo_dir = work_dir / repo if repo else work_dir
-    commit_made = False
 
     for entry in operations:
         op = str(entry.get("op", "")).strip()
@@ -305,23 +304,17 @@ def _execute_operations(
                     log_lines.append("commit: working tree is clean — no changes to commit; skipping")
                 else:
                     result = client.commit(repo_dir, message)
-                    commit_made = True
                     log_lines.append(f"commit: {result[:200] if result else 'committed'}")
 
             elif op == "push":
                 branch = str(params.get("branch") or client.current_branch(repo_dir))
-                if not commit_made:
-                    log_lines.append(
-                        "push: skipping — no commit was made in this run (nothing to push)"
-                    )
-                else:
-                    log_task_update("GitHub Agent", f"Pushing branch '{branch}' …")
-                    try:
-                        out = client.push_set_upstream(repo_dir, branch)
-                        log_lines.append(f"push: {out[:200] if out else 'pushed'}")
-                    except RuntimeError as exc:
-                        out = client.push(repo_dir, branch=branch)
-                        log_lines.append(f"push: {out[:200] if out else str(exc)[:200]}")
+                log_task_update("GitHub Agent", f"Pushing branch '{branch}' …")
+                try:
+                    out = client.push_set_upstream(repo_dir, branch)
+                    log_lines.append(f"push: {out[:200] if out else 'pushed'}")
+                except RuntimeError as exc:
+                    out = client.push(repo_dir, branch=branch)
+                    log_lines.append(f"push: {out[:200] if out else str(exc)[:200]}")
 
             elif op == "diff":
                 diff_text = client.diff(repo_dir)
@@ -339,12 +332,6 @@ def _execute_operations(
                 log_lines.append(f"get_issue #{number}: {issue.get('title', 'no title')}")
 
             elif op == "create_pr":
-                if not commit_made:
-                    raise RuntimeError(
-                        "create_pr aborted: no commit was made in this run. "
-                        "A pull request requires at least one new commit on the head branch. "
-                        "Ensure write_file + commit operations precede create_pr."
-                    )
                 title = str(params.get("title") or f"kendr: {task[:60]}")
                 body = str(params.get("body") or "Automated PR created by kendr's github_agent.")
                 head = str(params.get("head") or client.current_branch(repo_dir))
