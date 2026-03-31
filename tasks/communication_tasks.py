@@ -430,13 +430,29 @@ def whatsapp_list_messages_agent(state):
         "Content-Type": "application/json",
     }
     url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages?" + urlencode({"limit": max_messages})
-    try:
-        response_data = _http_json(url, headers=headers)
-    except Exception as exc:
-        response_data = {"error": str(exc), "messages": []}
+    response_data = _http_json(url, headers=headers)
+
+    api_error = response_data.get("error")
+    if api_error:
+        error_msg = f"WhatsApp API error: {api_error}"
+        payload = {
+            "phone_number_id": phone_number_id,
+            "status": "error",
+            "error": api_error,
+            "messages": [],
+        }
+        _write_outputs("whatsapp_list_messages_agent", call_number, error_msg, payload)
+        state["whatsapp_results"] = payload
+        state["draft_response"] = error_msg
+        raise RuntimeError(error_msg)
 
     messages = response_data.get("data", response_data.get("messages", []))
-    payload = {"phone_number_id": phone_number_id, "messages": messages, "raw": response_data}
+    payload = {
+        "phone_number_id": phone_number_id,
+        "status": "ok",
+        "messages": messages,
+        "count": len(messages),
+    }
 
     summary = llm_text(
         f"Summarize these WhatsApp Business messages and identify important conversations, action items, and follow-ups:\n\n{json.dumps(payload, indent=2, ensure_ascii=False)[:20000]}"
@@ -525,6 +541,60 @@ def whatsapp_send_message_agent(state):
     )
 
 
+def _parse_timestamp(value) -> float:
+    """Normalize a message timestamp to a UTC float (epoch seconds). Returns 0.0 on failure."""
+    if not value:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            parsed = dt.datetime.strptime(s[:31], fmt)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed.timestamp()
+        except ValueError:
+            continue
+    try:
+        import email.utils
+        tup = email.utils.parsedate_to_datetime(s)
+        return tup.timestamp()
+    except Exception:
+        pass
+    return 0.0
+
+
+def _normalize_message(channel: str, raw: dict) -> dict:
+    """Convert a channel-specific message dict into a common envelope for cross-channel sorting."""
+    subject = raw.get("subject", "")
+    sender = raw.get("from", "") or raw.get("user", "") or str(raw.get("sender_id", ""))
+    text = raw.get("snippet") or raw.get("preview") or raw.get("text") or raw.get("bodyPreview") or ""
+    ts_raw = (
+        raw.get("ts")
+        or raw.get("date")
+        or raw.get("receivedDateTime")
+        or raw.get("timestamp")
+        or 0
+    )
+    ts = _parse_timestamp(ts_raw)
+    return {
+        "channel": channel,
+        "subject": subject,
+        "sender": sender,
+        "preview": (text or "")[:300],
+        "timestamp": ts,
+        "timestamp_iso": dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).isoformat() if ts else "",
+        "_raw": raw,
+    }
+
+
 def communication_summary_agent(state):
     _, task_content, _ = begin_agent_session(state, "communication_summary_agent")
     _require_comm_authorization(state)
@@ -533,10 +603,10 @@ def communication_summary_agent(state):
 
     lookback_hours = int(state.get("communication_lookback_hours", 24))
     cutoff_ts = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=lookback_hours)
+    cutoff_epoch = cutoff_ts.timestamp()
 
-    configured_suites = state.get("communication_suites") or []
+    configured_suites = list(state.get("communication_suites") or [])
     if not configured_suites:
-        configured_suites = []
         if get_google_access_token():
             configured_suites.append("gmail")
         if get_slack_bot_token():
@@ -552,128 +622,154 @@ def communication_summary_agent(state):
         if os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip() and os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip():
             configured_suites.append("whatsapp")
 
-    channel_results: dict[str, dict] = {}
+    provider_status: dict[str, str] = {}
+    channel_results: dict[str, list[dict]] = {}
     errors: dict[str, str] = {}
 
     def _fetch_gmail():
         access_token = get_google_access_token()
         if not access_token:
-            return {}
+            return []
         headers = {"Authorization": f"Bearer {access_token}"}
-        try:
-            list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages?" + urlencode({
-                "q": f"in:inbox after:{int(cutoff_ts.timestamp())}",
-                "maxResults": 20,
-            })
-            listing = _http_json(list_url, headers=headers)
-            messages = []
-            for item in listing.get("messages", [])[:20]:
-                try:
-                    msg = _http_json(
-                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{item['id']}?format=metadata&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
-                        headers=headers,
-                    )
-                    hdrs = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
-                    messages.append({
-                        "subject": hdrs.get("subject", ""),
-                        "from": hdrs.get("from", ""),
-                        "date": hdrs.get("date", ""),
-                        "snippet": msg.get("snippet", ""),
-                    })
-                except Exception:
-                    pass
-            return {"messages": messages, "count": len(messages)}
-        except Exception as exc:
-            raise RuntimeError(f"gmail: {exc}") from exc
+        list_url = "https://gmail.googleapis.com/gmail/v1/users/me/messages?" + urlencode({
+            "q": f"in:inbox after:{int(cutoff_epoch)}",
+            "maxResults": 20,
+        })
+        listing = _http_json(list_url, headers=headers)
+        messages = []
+        for item in listing.get("messages", [])[:20]:
+            try:
+                msg = _http_json(
+                    f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{item['id']}?format=metadata"
+                    "&metadataHeaders=Subject&metadataHeaders=From&metadataHeaders=Date",
+                    headers=headers,
+                )
+                hdrs = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
+                messages.append({
+                    "subject": hdrs.get("subject", ""),
+                    "from": hdrs.get("from", ""),
+                    "date": hdrs.get("date", ""),
+                    "snippet": msg.get("snippet", ""),
+                })
+            except Exception:
+                pass
+        return messages
 
     def _fetch_slack():
         token = get_slack_bot_token()
         if not token:
-            return {}
+            return []
         headers = {"Authorization": f"Bearer {token}"}
-        try:
-            channels_payload = _http_json("https://slack.com/api/conversations.list?limit=10", headers=headers)
-            messages = []
-            oldest = str(cutoff_ts.timestamp())
-            for ch in channels_payload.get("channels", [])[:5]:
-                try:
-                    hist = _http_json(
-                        "https://slack.com/api/conversations.history?" + urlencode({"channel": ch["id"], "limit": 10, "oldest": oldest}),
-                        headers=headers,
-                    )
-                    for msg in hist.get("messages", []):
-                        messages.append({
-                            "channel": ch.get("name", ""),
-                            "user": msg.get("user", ""),
-                            "text": (msg.get("text") or "")[:500],
-                            "ts": msg.get("ts", ""),
-                        })
-                except Exception:
-                    pass
-            messages.sort(key=lambda m: m.get("ts", ""), reverse=True)
-            return {"messages": messages, "count": len(messages)}
-        except Exception as exc:
-            raise RuntimeError(f"slack: {exc}") from exc
+        channels_payload = _http_json("https://slack.com/api/conversations.list?limit=10", headers=headers)
+        messages = []
+        oldest = str(cutoff_epoch)
+        for ch in channels_payload.get("channels", [])[:5]:
+            try:
+                hist = _http_json(
+                    "https://slack.com/api/conversations.history?" + urlencode({"channel": ch["id"], "limit": 10, "oldest": oldest}),
+                    headers=headers,
+                )
+                for msg in hist.get("messages", []):
+                    messages.append({
+                        "from": msg.get("user", ""),
+                        "text": (msg.get("text") or "")[:500],
+                        "ts": msg.get("ts", ""),
+                        "channel_name": ch.get("name", ""),
+                    })
+            except Exception:
+                pass
+        return messages
 
     def _fetch_microsoft_graph():
         access_token = get_microsoft_graph_access_token()
         if not access_token:
-            return {}
+            return []
         headers = {"Authorization": f"Bearer {access_token}"}
-        try:
-            filter_str = f"receivedDateTime ge {cutoff_ts.strftime('%Y-%m-%dT%H:%M:%SZ')}"
-            url = f"https://graph.microsoft.com/v1.0/me/messages?$top=20&$select=subject,from,receivedDateTime,bodyPreview&$filter={quote(filter_str)}"
-            payload = _http_json(url, headers=headers)
-            messages = []
-            for item in payload.get("value", []):
-                messages.append({
-                    "subject": item.get("subject", ""),
-                    "from": (item.get("from") or {}).get("emailAddress", {}).get("address", ""),
-                    "receivedDateTime": item.get("receivedDateTime", ""),
-                    "preview": (item.get("bodyPreview") or "")[:300],
-                })
-            return {"messages": messages, "count": len(messages)}
-        except Exception as exc:
-            raise RuntimeError(f"microsoft_graph: {exc}") from exc
+        filter_str = f"receivedDateTime ge {cutoff_ts.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+        url = (
+            f"https://graph.microsoft.com/v1.0/me/messages"
+            f"?$top=20&$select=subject,from,receivedDateTime,bodyPreview&$filter={quote(filter_str)}"
+        )
+        payload = _http_json(url, headers=headers)
+        messages = []
+        for item in payload.get("value", []):
+            messages.append({
+                "subject": item.get("subject", ""),
+                "from": (item.get("from") or {}).get("emailAddress", {}).get("address", ""),
+                "date": item.get("receivedDateTime", ""),
+                "preview": (item.get("bodyPreview") or "")[:300],
+            })
+        return messages
 
     def _fetch_telegram():
+        session_string = os.getenv("TELEGRAM_SESSION_STRING", "").strip()
+        api_id = os.getenv("TELEGRAM_API_ID", "").strip()
+        api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
         bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        if not bot_token:
-            return {}
-        try:
+
+        if session_string and api_id and api_hash:
+            try:
+                from telethon import TelegramClient
+                from telethon.sessions import StringSession
+
+                async def _collect_telethon():
+                    messages = []
+                    async with TelegramClient(StringSession(session_string), int(api_id), api_hash) as client:
+                        async for dialog in client.iter_dialogs():
+                            async for message in client.iter_messages(dialog, limit=10):
+                                if not message.date:
+                                    continue
+                                msg_ts = message.date.timestamp()
+                                if msg_ts < cutoff_epoch:
+                                    break
+                                messages.append({
+                                    "from": str(getattr(message, "sender_id", "")),
+                                    "text": (message.message or "")[:500],
+                                    "date": msg_ts,
+                                    "dialog": dialog.name or "",
+                                })
+                            if len(messages) >= 40:
+                                break
+                    return messages
+
+                return _run_telethon_sync(_collect_telethon)
+            except Exception as exc:
+                if not bot_token:
+                    raise RuntimeError(f"telegram session: {exc}") from exc
+
+        if bot_token:
             updates = _http_json(f"https://api.telegram.org/bot{bot_token}/getUpdates")
             messages = []
             for item in updates.get("result", []):
                 message = item.get("message") or item.get("edited_message") or {}
-                ts = message.get("date", 0)
-                if ts and dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc) < cutoff_ts:
+                ts = float(message.get("date", 0) or 0)
+                if ts and ts < cutoff_epoch:
                     continue
                 messages.append({
-                    "chat_id": message.get("chat", {}).get("id"),
-                    "from": message.get("from", {}).get("username") or message.get("from", {}).get("id"),
-                    "date": ts,
+                    "from": message.get("from", {}).get("username") or str(message.get("from", {}).get("id", "")),
                     "text": (message.get("text") or "")[:500],
+                    "date": ts,
+                    "chat_id": message.get("chat", {}).get("id"),
                 })
-            return {"messages": messages, "count": len(messages)}
-        except Exception as exc:
-            raise RuntimeError(f"telegram: {exc}") from exc
+            return messages
+
+        return []
 
     def _fetch_whatsapp():
         access_token = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
         phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
         if not access_token or not phone_number_id:
-            return {}
+            return []
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
         }
-        try:
-            url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages?" + urlencode({"limit": 20})
-            response_data = _http_json(url, headers=headers)
-            messages = response_data.get("data", response_data.get("messages", []))
-            return {"messages": messages[:20], "count": len(messages)}
-        except Exception as exc:
-            raise RuntimeError(f"whatsapp: {exc}") from exc
+        url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages?" + urlencode({"limit": 20})
+        response_data = _http_json(url, headers=headers)
+        api_error = response_data.get("error")
+        if api_error:
+            raise RuntimeError(f"WhatsApp API error: {api_error}")
+        return list(response_data.get("data", response_data.get("messages", [])))[:20]
 
     fetcher_map = {
         "gmail": _fetch_gmail,
@@ -685,57 +781,84 @@ def communication_summary_agent(state):
 
     active_fetchers = {suite: fetcher_map[suite] for suite in configured_suites if suite in fetcher_map}
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(active_fetchers) or 1) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(active_fetchers))) as executor:
         future_map = {executor.submit(fn): suite for suite, fn in active_fetchers.items()}
         for future in concurrent.futures.as_completed(future_map):
             suite = future_map[future]
             try:
-                result = future.result()
-                if result:
-                    channel_results[suite] = result
+                raw_list = future.result()
+                if raw_list is not None:
+                    channel_results[suite] = [_normalize_message(suite, m) for m in raw_list]
+                    provider_status[suite] = "ok"
             except Exception as exc:
                 errors[suite] = str(exc)
+                provider_status[suite] = f"error: {exc}"
+
+    all_messages: list[dict] = []
+    for suite, msgs in channel_results.items():
+        all_messages.extend(msgs)
+
+    all_messages.sort(key=lambda m: m.get("timestamp", 0), reverse=True)
+
+    per_channel_section: dict[str, list[dict]] = {}
+    for msg in all_messages:
+        per_channel_section.setdefault(msg["channel"], []).append(msg)
 
     sections = []
     for suite in ["gmail", "slack", "microsoft_graph", "telegram", "whatsapp"]:
-        if suite not in channel_results:
+        if suite not in per_channel_section:
             continue
-        data = channel_results[suite]
-        count = data.get("count", 0)
-        msgs = data.get("messages", [])
-        section_lines = [f"\n### {suite.replace('_', ' ').title()} ({count} messages)"]
-        for msg in msgs[:10]:
-            line_parts = []
-            if msg.get("subject"):
-                line_parts.append(f"Subject: {msg['subject']}")
-            if msg.get("from"):
-                line_parts.append(f"From: {msg['from']}")
-            if msg.get("date") or msg.get("receivedDateTime") or msg.get("ts"):
-                date_val = msg.get("date") or msg.get("receivedDateTime") or msg.get("ts", "")
-                line_parts.append(f"Date: {date_val}")
-            snippet = msg.get("snippet") or msg.get("preview") or msg.get("text") or ""
-            if snippet:
-                line_parts.append(f"Snippet: {snippet[:200]}")
-            if line_parts:
-                section_lines.append("- " + " | ".join(line_parts))
+        msgs = per_channel_section[suite]
+        section_lines = [f"\n### {suite.replace('_', ' ').title()} ({len(msgs)} messages)"]
+        for m in msgs[:10]:
+            parts = []
+            if m.get("subject"):
+                parts.append(f"Subject: {m['subject']}")
+            if m.get("sender"):
+                parts.append(f"From: {m['sender']}")
+            if m.get("timestamp_iso"):
+                parts.append(f"At: {m['timestamp_iso']}")
+            if m.get("preview"):
+                parts.append(f"Preview: {m['preview'][:200]}")
+            section_lines.append("- " + " | ".join(parts))
         sections.append("\n".join(section_lines))
 
-    digest_input = f"Communication digest for the last {lookback_hours} hours across: {', '.join(configured_suites) or 'none configured'}."
+    global_timeline_preview = "\n\n### Unified Timeline (most recent first)\n"
+    for m in all_messages[:20]:
+        global_timeline_preview += (
+            f"- [{m['channel']}] {m.get('timestamp_iso', '')} | "
+            f"{m.get('sender', '')} | {m.get('preview', '')[:120]}\n"
+        )
+
+    digest_input = (
+        f"Communication digest for the last {lookback_hours} hours across: "
+        f"{', '.join(configured_suites) or 'none configured'}.\n"
+        f"Provider status: {json.dumps(provider_status, ensure_ascii=False)}\n"
+    )
     if sections:
-        digest_input += "\n\n" + "\n".join(sections)
+        digest_input += "\n" + "\n".join(sections)
+    digest_input += global_timeline_preview
     if errors:
-        digest_input += f"\n\nErrors: {json.dumps(errors, ensure_ascii=False)}"
+        digest_input += f"\n\nProvider errors: {json.dumps(errors, ensure_ascii=False)}"
 
     summary = llm_text(
-        f"You are a personal communications assistant. Produce a concise morning briefing digest from the following channel data. "
-        f"Group by channel, highlight action items, urgent messages, and key topics. Be clear and scannable.\n\n{digest_input}"
+        "You are a personal communications assistant. Produce a concise morning briefing digest "
+        "from the following multi-channel data. Show a unified timeline of the most recent messages "
+        "first, then per-channel highlights, action items, and urgent topics. Be clear and scannable.\n\n"
+        + digest_input
     )
 
     payload = {
         "lookback_hours": lookback_hours,
         "configured_suites": configured_suites,
-        "channel_results": channel_results,
+        "provider_status": provider_status,
+        "total_messages": len(all_messages),
+        "per_channel_counts": {ch: len(msgs) for ch, msgs in per_channel_section.items()},
         "errors": errors,
+        "unified_timeline": [
+            {k: v for k, v in m.items() if k != "_raw"}
+            for m in all_messages[:50]
+        ],
     }
     _write_outputs("communication_summary_agent", call_number, summary, payload)
     state["communication_summary_report"] = payload

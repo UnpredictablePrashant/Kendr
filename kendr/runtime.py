@@ -837,6 +837,43 @@ class AgentRuntime:
         )
         return any(marker in text for marker in markers)
 
+    def _is_communication_summary_request(self, state: dict) -> bool:
+        if bool(state.get("communication_authorized", False)) and not state.get("communication_summary_report"):
+            return True
+
+        text = " ".join(
+            [
+                str(state.get("user_query", "")),
+                str(state.get("current_objective", "")),
+            ]
+        ).lower()
+        if not text.strip():
+            return False
+
+        markers = (
+            "communication digest",
+            "communication summary",
+            "summarize my communications",
+            "summarize my messages",
+            "summarize my emails",
+            "what did i miss",
+            "what have i missed",
+            "morning briefing",
+            "message digest",
+            "inbox digest",
+            "check my messages",
+            "check my emails",
+            "check my slack",
+            "check my gmail",
+            "check my whatsapp",
+            "check my telegram",
+            "fetch my messages",
+            "my unread messages",
+            "across all channels",
+            "all communication channels",
+        )
+        return any(marker in text for marker in markers)
+
     def _is_long_document_request(self, state: dict) -> bool:
         if bool(state.get("long_document_mode", False)):
             return True
@@ -1355,6 +1392,29 @@ class AgentRuntime:
                     sender="orchestrator_agent",
                     recipient="os_agent",
                     intent="local-command-dispatch",
+                    content=objective,
+                    state_updates={"current_objective": objective},
+                ),
+            )
+            return state
+
+        if (
+            not state.get("plan_steps")
+            and state.get("last_agent") != "communication_summary_agent"
+            and self._is_agent_available(state, "communication_summary_agent")
+            and self._is_communication_summary_request(state)
+            and not self._is_project_build_request(state)
+        ):
+            reason = "The request is a communication digest/summary workflow. Route to communication_summary_agent."
+            objective = state.get("current_objective") or state.get("user_query", "")
+            state["orchestrator_reason"] = reason
+            state["next_agent"] = "communication_summary_agent"
+            state = append_task(
+                state,
+                make_task(
+                    sender="orchestrator_agent",
+                    recipient="communication_summary_agent",
+                    intent="communication-digest",
                     content=objective,
                     state_updates={"current_objective": objective},
                 ),
