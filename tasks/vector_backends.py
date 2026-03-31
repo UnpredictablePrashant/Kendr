@@ -96,10 +96,13 @@ class ChromaBackend(VectorBackend):
 class QdrantBackend(VectorBackend):
     def __init__(self, url: str) -> None:
         self._url = url
+        self._client_cache = None
 
     def _client(self):
-        from qdrant_client import QdrantClient
-        return QdrantClient(url=self._url)
+        if self._client_cache is None:
+            from qdrant_client import QdrantClient
+            self._client_cache = QdrantClient(url=self._url)
+        return self._client_cache
 
     def ensure_collection(self, collection_name: str, vector_size: int = 1536):
         from qdrant_client.models import Distance, VectorParams
@@ -166,13 +169,6 @@ def get_vector_backend() -> VectorBackend:
         _BACKEND_CACHE = QdrantBackend(url=qdrant_url)
         return _BACKEND_CACHE
 
-    if not qdrant_url:
-        default_url = DEFAULT_QDRANT_URL
-        if _qdrant_reachable(default_url):
-            print(f"[vector] Using Qdrant at {default_url}", file=sys.stderr)
-            _BACKEND_CACHE = QdrantBackend(url=default_url)
-            return _BACKEND_CACHE
-
     try:
         print("[vector] Using ChromaDB (local)", file=sys.stderr)
         _BACKEND_CACHE = ChromaBackend()
@@ -184,6 +180,6 @@ def get_vector_backend() -> VectorBackend:
         print(f"[vector] Falling back to Qdrant at {qdrant_url} (chromadb not installed)", file=sys.stderr)
         _BACKEND_CACHE = QdrantBackend(url=qdrant_url)
     else:
-        print(f"[vector] Falling back to Qdrant at {DEFAULT_QDRANT_URL} (chromadb not installed)", file=sys.stderr)
+        print("[vector] Falling back to Qdrant at default URL (chromadb not installed, QDRANT_URL not set)", file=sys.stderr)
         _BACKEND_CACHE = QdrantBackend(url=DEFAULT_QDRANT_URL)
     return _BACKEND_CACHE
