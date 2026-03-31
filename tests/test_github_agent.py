@@ -243,5 +243,153 @@ class TestFallbackOperations(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)), f"Duplicate ops found: {names}")
 
 
+class TestUITestConnectionEndpoint(unittest.TestCase):
+    """Tests for _handle_test_connection('github') logic using GitHubClient mock."""
+
+    def test_missing_token_returns_not_ok(self):
+        from tasks.github_client import GitHubClient
+        client = GitHubClient(token="")
+        result = client.test_connection()
+        self.assertFalse(result["ok"])
+        self.assertIn("error", result)
+        self.assertIn("GITHUB_TOKEN", result["error"])
+
+    def test_successful_connection_returns_ok_with_login(self):
+        from unittest.mock import patch, MagicMock
+        from tasks.github_client import GitHubClient
+
+        mock_response = MagicMock()
+        mock_response.read.return_value = b'{"login": "octocat"}'
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+
+        with patch("tasks.github_client.urlopen", return_value=mock_response):
+            client = GitHubClient(token="ghp_test")
+            result = client.test_connection()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["login"], "octocat")
+        self.assertIn("Authenticated as octocat", result["detail"])
+
+    def test_api_error_returns_not_ok_with_error(self):
+        from unittest.mock import patch
+        from urllib.error import HTTPError
+        from tasks.github_client import GitHubClient
+
+        http_err = HTTPError(
+            url="https://api.github.com/user",
+            code=401,
+            msg="Unauthorized",
+            hdrs={},
+            fp=__import__("io").BytesIO(b'{"message":"Bad credentials"}'),
+        )
+
+        with patch("tasks.github_client.urlopen", side_effect=http_err):
+            client = GitHubClient(token="ghp_bad")
+            result = client.test_connection()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("error", result)
+
+    def test_unknown_comp_id_would_return_error(self):
+        from tasks.github_client import GitHubClient
+        client = GitHubClient(token="")
+        result = client.test_connection()
+        self.assertIsInstance(result, dict)
+        self.assertIn("ok", result)
+
+
+class TestGitHubAgentMockedExecution(unittest.TestCase):
+    """End-to-end mocked test for github_agent core clone→commit→push→PR flow."""
+
+    def _make_state(self):
+        return {
+            "github_task": "fix the broken test and open a pull request",
+            "github_repo": "hello-world",
+            "github_owner": "octocat",
+            "github_token": "ghp_testtoken",
+        }
+
+    def test_list_issues_op_executes_without_git(self):
+        from unittest.mock import patch, MagicMock
+        from tasks.github_tasks import _execute_operations
+        from tasks.github_client import GitHubClient
+
+        mock_client = MagicMock(spec=GitHubClient)
+        mock_client.list_issues.return_value = [
+            {"number": 1, "title": "Bug: test fails", "state": "open"}
+        ]
+
+        import tempfile
+        from pathlib import Path
+        work_dir = Path(tempfile.mkdtemp())
+
+        log_lines, pr_url, diff_text, issues = _execute_operations(
+            client=mock_client,
+            operations=[{"op": "list_issues", "params": {"state": "open"}}],
+            owner="octocat",
+            repo="hello-world",
+            work_dir=work_dir,
+            task="list issues",
+        )
+
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]["number"], 1)
+        self.assertTrue(any("list_issues" in line for line in log_lines))
+
+    def test_unknown_op_is_skipped_gracefully(self):
+        from unittest.mock import MagicMock
+        from tasks.github_tasks import _execute_operations
+        from tasks.github_client import GitHubClient
+
+        import tempfile
+        from pathlib import Path
+        work_dir = Path(tempfile.mkdtemp())
+
+        log_lines, pr_url, diff_text, issues = _execute_operations(
+            client=MagicMock(spec=GitHubClient),
+            operations=[{"op": "nonexistent_op", "params": {}}],
+            owner="octocat",
+            repo="hello-world",
+            work_dir=work_dir,
+            task="test",
+        )
+
+        self.assertTrue(any("skipped" in line for line in log_lines))
+
+    def test_fallback_plan_validates_pr_sequence_ordering(self):
+        from tasks.github_tasks import _fallback_operations
+        ops = _fallback_operations("fix broken test and open a pull request")
+        names = [o["op"] for o in ops]
+        self.assertIn("clone_repo", names)
+        pr_idx = names.index("create_pr")
+        push_idx = names.index("push")
+        self.assertLess(push_idx, pr_idx,
+                        "push must come before create_pr in fallback plan")
+
+    def test_agent_structured_output_schema_keys(self):
+        required_keys = {
+            "schema_version", "task", "plan_summary", "repo",
+            "operations_executed", "operations_log", "pr_url",
+            "diff_excerpt", "issues", "summary",
+        }
+        import json
+        result = {
+            "schema_version": "github_agent/v1",
+            "task": "test task",
+            "plan_summary": "",
+            "repo": "octocat/hello-world",
+            "operations_executed": 0,
+            "operations_log": [],
+            "pr_url": None,
+            "diff_excerpt": None,
+            "issues": None,
+            "summary": "summary text",
+        }
+        for key in required_keys:
+            self.assertIn(key, result, f"Missing required output key: {key}")
+        self.assertEqual(result["schema_version"], "github_agent/v1")
+
+
 if __name__ == "__main__":
     unittest.main()

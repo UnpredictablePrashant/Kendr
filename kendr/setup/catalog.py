@@ -438,6 +438,24 @@ REQUIREMENT_RULES: dict[str, RequirementRule] = {
 
 
 def _legacy_requirements() -> dict[str, list[str]]:
+    """Build the legacy agent-to-integrations requirement map.
+
+    SOURCE-OF-TRUTH NOTE:
+    ``AGENT_METADATA["<agent>"]["requirements"]`` (defined in each agent's task
+    module) is the authoritative requirement list used at routing time.  It only
+    lists *integration-specific* dependencies (e.g. ``["github"]``) because
+    ``openai`` is a universal runtime dependency present for every agent.
+
+    This legacy mapping is used as a *fallback* by ``setup_registry.py`` when an
+    older agent card does not carry embedded requirements.  It intentionally lists
+    ``openai`` explicitly alongside integration-specific dependencies so that the
+    fallback path remains complete.  Do not derive routing logic from this mapping
+    directly — always prefer ``AGENT_METADATA`` requirements.
+
+    Dual-declaration example — github_agent:
+        AGENT_METADATA: requirements = ["github"]          (authoritative)
+        LEGACY:         requirements = ["openai", "github"] (fallback, exhaustive)
+    """
     mapping: dict[str, list[str]] = {}
 
     def assign(requirements: list[str], *agent_names: str) -> None:
