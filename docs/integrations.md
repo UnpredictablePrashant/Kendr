@@ -1,6 +1,6 @@
 # Integrations
 
-Kendr routes against configured integrations, not against the full theoretical ecosystem.
+Kendr routes against configured integrations, not against the full theoretical ecosystem. If an integration is missing or disabled, setup-aware routing removes dependent agents from `available_agents`.
 
 The integration lifecycle is standardized across:
 
@@ -10,13 +10,11 @@ The integration lifecycle is standardized across:
 - routing eligibility through agent `requirements`
 - docs and tests
 
-If an integration is missing or disabled, setup-aware routing removes dependent agents from `available_agents`.
-
 Future integrations should follow [Integration Checklist](integration_checklist.md).
 
-## Lifecycle
+---
 
-Each integration should provide one contract:
+## Lifecycle
 
 | Stage | Source Of Truth |
 | --- | --- |
@@ -27,131 +25,340 @@ Each integration should provide one contract:
 | concrete setup examples | `.env.example`, `README.md`, `SampleTasks.md` |
 | regression coverage | `tests/test_setup_registry.py` and related routing tests |
 
+---
+
 ## Built-In Providers
 
-These providers are registered from the shared integration catalog.
-
-| Provider | Purpose | Typical Configuration |
+| Provider | Purpose | Key Variables |
 | --- | --- | --- |
-| `openai` | orchestration, reasoning, OCR, embeddings, deep research | `OPENAI_API_KEY`, `OPENAI_MODEL_GENERAL`, `OPENAI_MODEL_CODING` |
-| `elevenlabs` | speech and voice workflows | `ELEVENLABS_API_KEY` |
-| `serpapi` | web, travel, scholarly, and patent search | `SERP_API_KEY` |
+| `openai` | Orchestration, reasoning, OCR, embeddings, deep research | `OPENAI_API_KEY`, `OPENAI_MODEL_GENERAL`, `OPENAI_MODEL_CODING` |
+| `serpapi` | Web, travel, scholarly, and patent search | `SERP_API_KEY` |
+| `elevenlabs` | Speech synthesis and transcription | `ELEVENLABS_API_KEY` |
 | `google_workspace` | Gmail and Google Drive | `GOOGLE_ACCESS_TOKEN` or OAuth client fields |
-| `telegram` | Telegram bot or session access | `TELEGRAM_BOT_TOKEN` or `TELEGRAM_SESSION_STRING` + API fields |
-| `slack` | Slack workspace access | `SLACK_BOT_TOKEN` or OAuth client fields |
 | `microsoft_graph` | Outlook, Teams, OneDrive | `MICROSOFT_GRAPH_ACCESS_TOKEN` or OAuth client fields |
-| `aws` | AWS cloud workflows | `AWS_*` |
-| `qdrant` | vector memory | `QDRANT_URL`, `QDRANT_COLLECTION` |
-| `whatsapp` | WhatsApp Cloud API | `WHATSAPP_*` |
-| `playwright` | browser automation and screenshots | Playwright package or CLI |
-| `nmap` | local network scanning | local `nmap` binary |
+| `slack` | Slack workspace bot | `SLACK_BOT_TOKEN` or OAuth client fields |
+| `telegram` | Telegram bot or user-session | `TELEGRAM_BOT_TOKEN` or `TELEGRAM_SESSION_STRING` + API fields |
+| `whatsapp` | WhatsApp Cloud API (Meta) | `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID` |
+| `aws` | AWS cloud workflows | `AWS_*` environment variables |
+| `qdrant` | Vector memory (opt-in) | `QDRANT_URL`, `QDRANT_COLLECTION` |
+| `playwright` | Browser automation and screenshots | Playwright package or CLI |
+| `nmap` | Authorized host scanning | Local `nmap` binary |
 | `zap` | OWASP ZAP baseline scanning | `zap-baseline.py` or `owasp-zap` on PATH |
 | `cve_database` | CVE and NVD lookup | `CVE_API_BASE_URL`, optional `NVD_API_KEY` |
 
+---
+
 ## Built-In Channels
 
-The runtime currently registers these channels:
+| Channel | Status |
+| --- | --- |
+| `webchat` | Available via gateway |
+| `telegram` | Stable |
+| `slack` | Stable |
+| `whatsapp` | Beta |
+| `teams` | Beta |
+| `discord` | Registered (connector pending) |
+| `matrix` | Registered (connector pending) |
+| `signal` | Registered (connector pending) |
 
-- `webchat`
-- `telegram`
-- `slack`
-- `whatsapp`
-- `teams`
-- `discord`
-- `matrix`
-- `signal`
+---
 
-## Setup UI And OAuth
+## Vector Backend: ChromaDB vs Qdrant
 
-The CLI exposes a web-based setup UI:
+### ChromaDB (default — zero setup required)
 
-```bash
-kendr setup ui
-```
+ChromaDB is the default vector backend. It runs in-process with no configuration, no external service, and no environment variables required. It is selected automatically when `QDRANT_URL` is not set or Qdrant is unreachable.
 
-OAuth-backed flows currently documented in the repo:
+ChromaDB is suitable for:
+- Single-user local deployments
+- Getting started quickly
+- Runs where persistence is local and not shared across machines
 
-- Google Workspace
-- Microsoft Graph
-- Slack
+Data is stored under `KENDR_WORKING_DIR/chroma_db/` by default.
 
-Manual or direct-token integrations:
+### Qdrant (opt-in — persistent, scalable)
 
-- Telegram bot token or Telethon session
-- WhatsApp Cloud API
-- AWS credentials
-
-Useful setup commands:
+To use Qdrant, set `QDRANT_URL` to a reachable Qdrant endpoint. Kendr performs a health check before using Qdrant; if the endpoint is unreachable, it falls back to ChromaDB.
 
 ```bash
-kendr setup status
-kendr setup components
-kendr setup show core_runtime --json
-kendr setup show openai --json
-kendr setup export-env
-kendr setup install --yes
+# .env
+QDRANT_URL="http://127.0.0.1:6333"
+QDRANT_API_KEY=""                    # optional, for authenticated Qdrant
+QDRANT_COLLECTION="research_memory"  # default collection name
 ```
 
-Concrete first-run baseline:
+Start Qdrant with Docker:
 
 ```bash
-kendr setup set core_runtime KENDR_WORKING_DIR /absolute/path/to/workdir
-kendr setup set openai OPENAI_API_KEY sk-...
-kendr setup status
+docker run -p 6333:6333 qdrant/qdrant
 ```
 
-## Health And Routing
+Or via the included Compose stack:
 
-`build_setup_snapshot()` reports each integration with:
+```bash
+docker compose up qdrant
+```
 
-- `configured`
-- `enabled`
-- `status`
-- `health.detail`
-- `setup_hint`
-- `docs_path`
+Qdrant is suitable for:
+- Team or multi-user deployments
+- Persistent superRAG knowledge sessions shared across machines
+- High-volume vector indexing
 
-Routing uses those results to populate:
-
-- `available_agents`
-- `disabled_agents`
-- `setup_actions`
-
-An agent should depend on integrations only through declared `requirements`. Missing integrations should never leave those agents eligible for routing.
+---
 
 ## Specific Integrations
 
 ### OpenAI
 
-- Required for the core runtime.
-- Minimum concrete setup:
-  - `OPENAI_API_KEY`
-  - `KENDR_WORKING_DIR`
+Required for the core runtime. All agents depend on `openai` or the local `codex_cli` alternative.
+
+```bash
+kendr setup set openai OPENAI_API_KEY sk-...
+kendr setup set openai OPENAI_MODEL_GENERAL gpt-4o
+```
+
+The minimum concrete setup is just `OPENAI_API_KEY`. The model defaults to `gpt-4o-mini`.
+
+### SerpAPI
+
+Required for structured web search, travel, patent, and scholarly search.
+
+```bash
+kendr setup set serpapi SERP_API_KEY your-serp-api-key
+```
+
+Get your key at [serpapi.com](https://serpapi.com). Without this, search-backed agents are filtered from routing.
 
 ### Google Workspace
 
-- Configure either a direct `GOOGLE_ACCESS_TOKEN` or OAuth client credentials.
-- If OAuth client credentials exist but no token has been acquired yet, setup status will show the integration as OAuth-ready but not configured.
+Configure **either** a direct access token **or** OAuth client credentials.
 
-### Microsoft Graph
+**Direct token (quick start):**
 
-- Configure either `MICROSOFT_GRAPH_ACCESS_TOKEN` or the OAuth client fields.
-- OneDrive/Outlook/Teams dependent agents stay disabled until a usable token exists.
+```bash
+GOOGLE_ACCESS_TOKEN="ya29.a0..."
+```
+
+**OAuth flow (recommended for longevity):**
+
+```bash
+GOOGLE_CLIENT_ID="123456-abc.apps.googleusercontent.com"
+GOOGLE_CLIENT_SECRET="GOCSPX-..."
+GOOGLE_REDIRECT_URI="http://127.0.0.1:8787/oauth/google/callback"
+```
+
+Then complete the OAuth flow:
+
+```bash
+kendr setup ui         # opens http://127.0.0.1:8787
+# OR
+kendr setup oauth google
+```
+
+If client credentials exist but no token has been acquired, setup reports the integration as OAuth-ready but not configured.
+
+### Microsoft Graph (Outlook + Teams + OneDrive)
+
+Configure **either** a direct access token **or** OAuth client credentials.
+
+**Direct token:**
+
+```bash
+MICROSOFT_GRAPH_ACCESS_TOKEN="eyJ0eXAi..."
+```
+
+**OAuth flow:**
+
+```bash
+MICROSOFT_CLIENT_ID="11112222-3333-4444-5555-666677778888"
+MICROSOFT_CLIENT_SECRET="aBcDeFgHiJkL..."
+MICROSOFT_TENANT_ID="common"          # or your specific tenant ID
+MICROSOFT_REDIRECT_URI="http://127.0.0.1:8787/oauth/microsoft/callback"
+```
+
+Then run:
+
+```bash
+kendr setup oauth microsoft
+```
+
+OneDrive, Outlook, and Teams agents stay disabled until a usable token exists.
 
 ### Slack
 
-- Configure either `SLACK_BOT_TOKEN` or OAuth client fields plus app installation.
-- Communication and notification surfaces remain filtered out without a usable token.
+Configure **either** a bot token **or** OAuth app credentials.
+
+**Bot token (quick start):**
+
+```bash
+SLACK_BOT_TOKEN="xoxb-..."
+```
+
+**OAuth app:**
+
+```bash
+SLACK_CLIENT_ID="123456789012.1234567890"
+SLACK_CLIENT_SECRET="abc123..."
+```
+
+Then install the app:
+
+```bash
+kendr setup oauth slack
+```
+
+### Telegram
+
+Telegram supports two modes:
+
+**Bot mode** — easier setup, requires the bot to be a member of the target channel/group:
+
+```bash
+TELEGRAM_BOT_TOKEN="1234567890:ABCDEFghijklmnop..."
+```
+
+Get your bot token from [@BotFather](https://t.me/BotFather) on Telegram.
+
+**User-session mode** — uses your personal account via Telethon; can read any channel/group you have access to:
+
+```bash
+TELEGRAM_API_ID="12345678"
+TELEGRAM_API_HASH="abcdef1234567890abcdef1234567890"
+TELEGRAM_SESSION_STRING="..."         # generated once, see below
+```
+
+To get `TELEGRAM_API_ID` and `TELEGRAM_API_HASH`: log in at [my.telegram.org](https://my.telegram.org/apps) and create an application.
+
+To generate a `TELEGRAM_SESSION_STRING` (run once):
+
+```bash
+pip install telethon
+python3 -c "
+from telethon.sync import TelegramClient
+import os
+c = TelegramClient('session', int(os.environ['TELEGRAM_API_ID']), os.environ['TELEGRAM_API_HASH'])
+c.start()
+print(c.session.save())
+"
+```
+
+Copy the printed string into `TELEGRAM_SESSION_STRING`.
+
+### WhatsApp
+
+Kendr integrates with the **Meta WhatsApp Cloud API**. You need a Meta Business account and a registered WhatsApp Business phone number.
+
+```bash
+WHATSAPP_ACCESS_TOKEN="EAAGm0PX4ZC..."       # Meta Graph API access token
+WHATSAPP_PHONE_NUMBER_ID="109876543210"      # phone number ID (NOT the number itself)
+```
+
+**Where to get these:**
+
+1. Go to [developers.facebook.com](https://developers.facebook.com/apps) and create an app.
+2. Add the **WhatsApp** product to your app.
+3. In WhatsApp > API Setup, find your Phone Number ID.
+4. Generate a permanent token in System Users under Business Settings.
+
+**Send a WhatsApp message:**
+
+```bash
+kendr run \
+  --communication-authorized \
+  --whatsapp-to "+15551234567" \
+  --whatsapp-message "Hello from Kendr." \
+  "Send a WhatsApp message."
+```
+
+**Use a message template:**
+
+```bash
+kendr run \
+  --communication-authorized \
+  --whatsapp-to "+15551234567" \
+  --whatsapp-template "hello_world" \
+  "Send a WhatsApp template message."
+```
+
+### AWS
+
+AWS credentials are resolved through the standard boto3 credential chain: env vars, `~/.aws/credentials` profile, or instance role. No configuration is strictly required if an instance profile is active.
+
+Explicit static credentials:
+
+```bash
+AWS_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/..."
+AWS_DEFAULT_REGION="us-east-1"
+```
 
 ### Security Tools
 
-- `nmap`, `zap`, and `dependency-check` are local dependencies, not remote APIs.
-- Security agents stay hidden when their required tools are missing.
+`nmap`, `zap`, and `dependency-check` are local binary dependencies, not remote APIs. Security agents stay hidden when their required tools are missing.
 
-### Qdrant
+Install them:
 
-- A `QDRANT_URL` alone is not enough.
-- `kendr setup status` checks reachability and keeps vector-dependent agents disabled until the service responds.
+```bash
+kendr setup install --yes
+```
+
+Or install manually:
+
+```bash
+# Ubuntu / Debian
+sudo apt-get install nmap
+
+# macOS
+brew install nmap
+
+# OWASP ZAP (all platforms)
+# Download from https://www.zaproxy.org/download/
+```
+
+The CVE database uses the public NVD API endpoint by default. Set `NVD_API_KEY` for higher rate limits:
+
+```bash
+NVD_API_KEY="nvd-api-key-here"
+```
+
+---
+
+## Setup UI and OAuth
+
+The CLI exposes a local web UI for OAuth-backed flows:
+
+```bash
+kendr setup ui
+```
+
+The setup UI runs at `http://127.0.0.1:8787` by default. It supports OAuth flows for Google, Microsoft, and Slack.
+
+Useful setup commands:
+
+```bash
+kendr setup status                          # show all integration health
+kendr setup components                      # list all configurable components
+kendr setup show openai --json              # show one component
+kendr setup export-env                      # export config as dotenv lines
+kendr setup install --yes                   # install local tools
+```
+
+---
+
+## Health and Routing
+
+`build_setup_snapshot()` reports each integration with:
+
+- `configured` — required variables are present
+- `enabled` — not manually disabled
+- `status` — health check result
+- `health.detail` — human-readable health explanation
+- `setup_hint` — what to do if not configured
+- `docs_path` — link to docs section
+
+Routing uses those results to populate `available_agents`, `disabled_agents`, and `setup_actions`. An agent that depends on an unconfigured integration is never routed to.
+
+---
 
 ## Plugin Discovery
 
@@ -163,36 +370,42 @@ External plugins are loaded from:
 
 Plugin files are simple Python modules that expose `register(registry)`.
 
-Example:
+Example templates:
 
 - [`plugin_templates/echo_plugin.py`](../plugin_templates/echo_plugin.py)
 - [`plugin_templates/provider_plugin.py`](../plugin_templates/provider_plugin.py)
 
 See [Plugin SDK](plugin_sdk.md) for manifest expectations, compatibility notes, and testing guidance.
 
-## MCP Servers
+---
 
-The repo includes these MCP surfaces:
+## MCP Servers
 
 | Service | Purpose | Entry Script |
 | --- | --- | --- |
-| Research MCP | web search, crawl, document parsing, OCR, entity brief | [`mcp_servers/research_server.py`](../mcp_servers/research_server.py) |
-| Vector MCP | text indexing and semantic search | [`mcp_servers/vector_server.py`](../mcp_servers/vector_server.py) |
-| Nmap MCP | safe host discovery and service scans | [`mcp_servers/nmap_server.py`](../mcp_servers/nmap_server.py) |
-| ZAP MCP | baseline web scan summaries | [`mcp_servers/zap_server.py`](../mcp_servers/zap_server.py) |
-| Screenshot MCP | browser screenshots and scripted capture | [`mcp_servers/screenshot_server.py`](../mcp_servers/screenshot_server.py) |
-| HTTP Surface MCP | safe HTTP surface probing | [`mcp_servers/http_fuzzing_server.py`](../mcp_servers/http_fuzzing_server.py) |
+| Research MCP | Web search, crawl, document parsing, OCR, entity brief | [`mcp_servers/research_server.py`](../mcp_servers/research_server.py) |
+| Vector MCP | Text indexing and semantic search | [`mcp_servers/vector_server.py`](../mcp_servers/vector_server.py) |
+| Nmap MCP | Safe host discovery and service scans | [`mcp_servers/nmap_server.py`](../mcp_servers/nmap_server.py) |
+| ZAP MCP | Baseline web scan summaries | [`mcp_servers/zap_server.py`](../mcp_servers/zap_server.py) |
+| Screenshot MCP | Browser screenshots and scripted capture | [`mcp_servers/screenshot_server.py`](../mcp_servers/screenshot_server.py) |
+| HTTP Surface MCP | Safe HTTP surface probing | [`mcp_servers/http_fuzzing_server.py`](../mcp_servers/http_fuzzing_server.py) |
 | CVE MCP | CVE and OSV lookup | [`mcp_servers/cve_server.py`](../mcp_servers/cve_server.py) |
+
+---
 
 ## Dockerized Service Surface
 
-The Compose stack currently includes:
+The Compose stack includes:
 
-- `qdrant`
-- `app`
-- `daemon`
-- `gateway`
-- `setup-ui`
+- `qdrant` — vector store
+- `app` — main Kendr runtime
+- `daemon` — monitor and heartbeat
+- `gateway` — HTTP gateway server
+- `setup-ui` — OAuth and setup UI
 - all current MCP services
 
-See [Install](install.md) for the `docker compose up --build` path.
+```bash
+docker compose up --build
+```
+
+See [Install](install.md) for the full Docker path.

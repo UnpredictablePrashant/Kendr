@@ -1,21 +1,29 @@
 # Quickstart
 
-This guide gets you from a fresh checkout to your first successful Kendr run.
+This guide gets you from a fresh checkout to a successful first run in under 5 minutes. You need two things: an `OPENAI_API_KEY` and a directory where Kendr can write outputs.
 
-## Prerequisites
+---
 
-- Python 3.10 or newer
-- an `OPENAI_API_KEY`
-- a working directory where Kendr can write run artifacts
+## What you'll do
 
-Recommended for the best first experience:
+1. Install Kendr
+2. Set your API key and working directory
+3. Run a health check
+4. Run your first research query
 
-- `SERP_API_KEY` for search-backed research workflows
-- Docker if you want the full Qdrant and MCP stack
+---
 
-## 1. Install Kendr
+## Step 1 — Install
 
-Linux or macOS:
+Clone the repo and install:
+
+```bash
+git clone https://github.com/your-org/kendr.git
+cd kendr
+pip install -e .
+```
+
+Or with the install script (Linux / macOS):
 
 ```bash
 ./scripts/install.sh
@@ -27,176 +35,168 @@ Windows PowerShell:
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
-Manual install on any OS:
+---
+
+## Step 2 — Set the two required variables
+
+Create a `.env` file in the repo root (copy `.env.example` as your starting point):
 
 ```bash
-python3 -m pip install -e ".[dev]"
-python3 scripts/bootstrap_local_state.py
+cp .env.example .env
 ```
 
-## 2. Configure Environment
+Open `.env` and set:
 
-The install/bootstrap scripts create a local `.env` for you. If you are configuring manually, use `.env.example` as the baseline.
+```bash
+OPENAI_API_KEY="sk-..."                  # your OpenAI API key
+KENDR_WORKING_DIR="/home/user/kendr-out" # where outputs are written (absolute path)
+```
 
-Set at least:
+Or use the CLI to set them in the local config database:
 
-- `OPENAI_API_KEY`
-- `SERP_API_KEY` for search-heavy workflows
+```bash
+kendr setup set openai OPENAI_API_KEY sk-...
+kendr setup set core_runtime KENDR_WORKING_DIR /home/user/kendr-out
+```
 
-You can also inspect setup from the CLI:
+That is the minimum. Everything else is optional.
+
+---
+
+## Step 3 — Health check
+
+Confirm everything is wired up:
 
 ```bash
 kendr setup status
-kendr setup components
 ```
 
-If you prefer a local UI for OAuth-backed providers:
+You should see `openai` marked as **configured** and `core_runtime` showing the working directory you set. If `openai` shows as unconfigured, check that your `.env` file is being loaded (it must be in the current directory or on the `PYTHONPATH`).
+
+Optional quick verification:
 
 ```bash
-kendr setup ui
-```
-
-The setup UI runs on `http://127.0.0.1:8787` by default.
-
-## 3. Choose A Working Directory
-
-Kendr needs a working directory for artifacts and intermediate outputs.
-
-Use the current folder:
-
-```bash
-kendr workdir here
-```
-
-Or pass it per run:
-
-```bash
-kendr run --current-folder "Create a short research brief on OpenAI."
-```
-
-## 4. Sanity Check
-
-```bash
-kendr --help
+kendr --version
 kendr agents list
-kendr plugins list
-kendr setup status
-python scripts/verify.py smoke
 ```
 
-## 5. First Run
+---
 
-Use the actual CLI entrypoint:
+## Step 4 — Your first run
+
+Run a research brief:
 
 ```bash
 kendr run --current-folder \
   "Create an intelligence brief on Stripe: business model, products, competitors, recent strategy moves, and top risks."
 ```
 
-What to expect:
+`--current-folder` tells Kendr to write outputs to your current terminal directory (no need to configure `KENDR_WORKING_DIR` separately for this run).
 
-- the runtime ensures the gateway path is available
-- the run may stop first on an approval-ready plan
-- after approval, Kendr executes the workflow and writes artifacts under `output/runs/<run_id>/`
+**What to expect:**
 
-## 6. Recommended Next Runs
+- The startup banner shows the model and working directory.
+- Kendr routes the query and selects the appropriate agents.
+- You see step-by-step progress: each agent start, its duration, and whether it succeeded.
+- The run may pause at a blueprint approval gate. Type `y` to approve and continue.
+- When done, the final output appears in a panel. Artifacts are written under `output/runs/<run_id>/`.
+- A run summary table shows each agent, its duration, and output files.
 
-Deep research:
+---
+
+## What if I see "gateway not running"?
+
+Some workflows require the HTTP gateway. If you see a message saying the gateway is not running, start it:
+
+```bash
+kendr gateway start
+```
+
+Then re-run your query. For basic research workflows the gateway is not needed.
+
+---
+
+## Step 5 — Try more workflows
+
+### Deep research with source selection
 
 ```bash
 kendr run --current-folder \
-  --research-model o4-mini-deep-research \
-  --research-instructions "Cite concrete sources and call out uncertainty." \
-  "Do deep research on battery recycling market structure, current leaders, and investment risks."
+  --sources arxiv,web \
+  "Survey of large language model safety research in 2024"
 ```
 
-Local-drive intelligence:
+### Local file intelligence
 
 ```bash
-kendr run \
-  --drive="D:/xyz/folder" \
-  "Review this folder, summarize the important files, and produce an executive-ready intelligence brief."
+kendr run --drive ./my-documents \
+  "Summarize the key risks across these documents and produce an executive brief."
 ```
 
-`superRAG` build:
+### superRAG: build a knowledge base
 
 ```bash
 kendr run \
   --superrag-mode build \
   --superrag-new-session \
-  --superrag-session-title "product_ops_kb" \
+  --superrag-session-title "product_docs" \
   --superrag-path ./docs \
-  --superrag-url https://example.com/help-center \
-  "Create a reusable product operations knowledge session."
+  "Build a searchable knowledge base from our product documentation."
 ```
 
-`superRAG` chat:
+### superRAG: chat with the knowledge base
 
 ```bash
 kendr run \
   --superrag-mode chat \
-  --superrag-session product_ops_kb \
-  --superrag-chat "What are the main operating risks and where are they sourced from?"
+  --superrag-session product_docs \
+  --superrag-chat "What are the installation requirements?"
 ```
 
-Coding project builder:
+### Generate a software project
 
 ```bash
-kendr run --current-folder \
-  --max-steps 30 \
-  --coding-context-file README.md \
-  --coding-instructions "Prefer FastAPI, pytest, docs, and CI verification commands." \
-  "Use master_coding_agent to design and deliver a production-ready internal tools API with tests, docs, CI, and deployment files."
+kendr generate --stack fastapi_postgres \
+  "A task management REST API with user authentication, tests, and Docker deployment."
 ```
 
-Local command execution:
+### Research pipeline with document output
 
 ```bash
-kendr run --current-folder \
-  --os-command "Get-ChildItem" \
-  --os-shell powershell \
-  --target-os windows \
-  --privileged-approved \
-  --privileged-approval-note "OPS-123 approved repo inspection" \
-  "List the project root."
+kendr research --sources arxiv,web --pages 10 \
+  "Battery recycling market: key players, investment trends, and technology outlook"
 ```
 
-## 7. Resume An Interrupted Run
+---
 
-Every run now writes resumable state into its run folder under `output/runs/<run_id>/`.
+## Step 6 — Resume a paused or interrupted run
 
-Inspect the latest saved run in a working directory:
+Every run writes resumable state to its output folder.
+
+Inspect the most recent run:
 
 ```bash
 kendr resume --working-directory . --latest --inspect
 ```
 
-Resume directly from a run folder:
+Resume a specific run:
 
 ```bash
-kendr resume --output-folder ./output/runs/run_cli_123
+kendr resume --output-folder ./output/runs/run_cli_abc123
 ```
 
-Resume a paused approval step with an explicit reply:
+Reply to a paused approval step:
 
 ```bash
-kendr resume \
-  --output-folder ./output/runs/run_cli_123 \
-  --reply approve
+kendr resume --output-folder ./output/runs/run_cli_abc123 --reply approve
 ```
 
-Start a new child run from a completed session's saved context:
+---
 
-```bash
-kendr resume \
-  --output-folder ./output/runs/run_cli_123 \
-  --branch \
-  "Expand the report into an investor-facing memo."
-```
+## Next steps
 
-## Where To Go Next
-
-- [Install](install.md) for the full setup surface
-- [Core Workflows](core_workflows.md) for the recommended product entry points
-- [Examples](examples.md) for more workflows
-- [Troubleshooting](troubleshooting.md) if the first run does not behave as expected
+- [Configuration Reference](configuration.md) — every env var with default values and examples
+- [CLI Reference](cli.md) — every subcommand and flag
+- [Integrations](integrations.md) — setting up search, communication providers, and vector backends
+- [SampleTasks.md](../SampleTasks.md) — copy-paste examples for every workflow
+- [Troubleshooting](troubleshooting.md) — common first-run issues and how to fix them
