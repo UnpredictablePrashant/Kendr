@@ -1377,7 +1377,9 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         try:
             result = save_component_values(comp_id, values)
             apply_setup_env_defaults()
-            self._json(200, {"saved": True, "snapshot": result})
+            safe_result = dict(result)
+            safe_result.pop("raw_values", None)
+            self._json(200, {"saved": True, "snapshot": safe_result})
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 

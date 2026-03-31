@@ -207,6 +207,50 @@ class TestUIServerRawValuesStripped(unittest.TestCase):
                             "Plaintext secret must not appear in response")
 
 
+class TestSetupSaveRawValuesStripped(unittest.TestCase):
+    def test_save_endpoint_does_not_return_raw_values(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        save_result = {
+            "component": {"id": "core_runtime", "fields": [{"key": "API_KEY", "secret": True}]},
+            "enabled": True,
+            "notes": "",
+            "updated_at": "",
+            "values": {"API_KEY": "********"},
+            "raw_values": {"API_KEY": "sk-real-secret"},
+            "filled_fields": 1,
+            "total_fields": 1,
+        }
+
+        with (
+            patch("kendr.ui_server.save_component_values", return_value=save_result),
+            patch("kendr.ui_server.apply_setup_env_defaults"),
+        ):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+            _, port = srv.server_address
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=3)
+                payload = json.dumps({"component_id": "core_runtime", "values": {"API_KEY": "sk-new"}}).encode()
+                conn.request("POST", "/api/setup/save", body=payload,
+                             headers={"Content-Type": "application/json", "Content-Length": str(len(payload))})
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+            finally:
+                srv.server_close()
+                t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(body.get("saved"))
+        snapshot = body.get("snapshot", {})
+        self.assertNotIn("raw_values", snapshot, "raw_values must be stripped from /api/setup/save response")
+        self.assertNotEqual(snapshot.get("values", {}).get("API_KEY"), "sk-real-secret",
+                            "Plaintext secret must not appear in save response")
+
+
 class TestHealthEndpoint(unittest.TestCase):
     def test_health_returns_kendr_ui_service(self):
         from kendr.ui_server import KendrUIHandler
