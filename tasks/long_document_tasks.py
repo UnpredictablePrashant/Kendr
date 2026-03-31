@@ -1477,7 +1477,7 @@ def long_document_agent(state):
     poll_interval_seconds = _safe_int(state.get("research_poll_interval_seconds"), 5, 1, 60)
     max_wait_seconds = _safe_int(state.get("research_max_wait_seconds"), 3600, 60, 86400)
     heartbeat_seconds = _safe_int(state.get("research_heartbeat_seconds"), 120, 30, 3600)
-    words_per_page = _safe_int(state.get("long_document_words_per_page"), 420, 250, 700)
+    words_per_page = _safe_int(state.get("long_document_words_per_page"), 250, 150, 700)
     disable_visuals = bool(state.get("long_document_disable_visuals", False))
     include_section_references = bool(state.get("long_document_section_references", False))
     section_search_flag = state.get("long_document_section_search")

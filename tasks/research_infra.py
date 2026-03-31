@@ -315,9 +315,10 @@ def arxiv_search(query: str, max_results: int = 10, sort_by: str = "relevance") 
             if link.attrib.get("type") == "application/pdf" or link.attrib.get("title") == "pdf":
                 pdf_url = link.attrib.get("href", "")
                 break
-        if not pdf_url and arxiv_url:
-            # Derive PDF URL from abstract URL: abs/ → pdf/
-            pdf_url = arxiv_url.replace("/abs/", "/pdf/").rstrip("v0123456789") if "/abs/" in arxiv_url else ""
+        if not pdf_url and arxiv_url and "/abs/" in arxiv_url:
+            # Derive PDF URL safely: http://arxiv.org/abs/2301.00001v1 → http://arxiv.org/pdf/2301.00001v1
+            # Simply swap /abs/ for /pdf/ — do NOT strip version suffix (v1, v2, etc.)
+            pdf_url = arxiv_url.replace("/abs/", "/pdf/", 1)
         entries.append(
             {
                 "title": title,

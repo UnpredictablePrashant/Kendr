@@ -106,6 +106,8 @@ class RuntimeState(TypedDict, total=False):
     research_heartbeat_seconds: int
     research_sources: list[str]
     research_pipeline_enabled: bool
+    research_pipeline_completed: bool
+    pipeline_skip_synthesis: bool
     user_cancelled: bool
 
 

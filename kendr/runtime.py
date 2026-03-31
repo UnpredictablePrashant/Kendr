@@ -1821,6 +1821,7 @@ class AgentRuntime:
 
         if (
             bool(state.get("research_pipeline_enabled", False))
+            and not bool(state.get("research_pipeline_completed", False))
             and not state.get("plan_steps")
             and state.get("last_agent") != "research_pipeline_agent"
             and self._is_agent_available(state, "research_pipeline_agent")

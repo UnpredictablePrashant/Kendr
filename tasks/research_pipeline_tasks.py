@@ -539,6 +539,9 @@ def research_pipeline_agent(state: dict) -> dict:
         report_md[:500],
     )
 
+    # Mark pipeline as completed so the orchestrator does not re-route to this agent
+    state["research_pipeline_completed"] = True
+
     state = publish_agent_output(
         state,
         "research_pipeline_agent",
