@@ -166,3 +166,56 @@ Pluggable vector store backend abstraction with zero-config local fallback:
 
 ### Dependencies
 - Added `chromadb` to `pyproject.toml` dependencies
+
+## Task #5: Unified Communication Suite
+
+### Updated file: `tasks/communication_tasks.py`
+Fully rewritten for robustness. All agents require `state["communication_authorized"] = True`.
+
+#### New agents:
+- **`whatsapp_list_messages_agent`** — Lists recent WhatsApp Business inbox messages via Meta Graph API v18+. Requires `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID`.
+- **`whatsapp_send_message_agent`** — Sends a plain-text or template message via Meta Graph API v18+. Requires `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, and `state["whatsapp_to"]`.
+- **`communication_summary_agent`** — Concurrent multi-provider digest agent. Fetches from all configured channels (Gmail, Slack, Microsoft Graph, Telegram, WhatsApp) using `ThreadPoolExecutor`. Filters by `communication_lookback_hours` (default 24h). Writes digest to output folder.
+
+#### Telegram async fix (`telegram_agent`):
+- `_run_telethon_sync(coro_factory)` — runs Telethon coroutines in a dedicated thread with `asyncio.new_event_loop()`. Prevents event loop conflicts with the LangGraph sync executor.
+
+#### AGENT_METADATA:
+Registered for `whatsapp_send_message_agent`, `whatsapp_list_messages_agent`, `communication_summary_agent` with description, skills, input/output keys, and requirements.
+
+#### New CLI flags:
+- `--communication-authorized` — sets `communication_authorized=True` in the ingest payload
+- `--communication-lookback-hours N` — sets `communication_lookback_hours`
+- `--whatsapp-to NUMBER` — sets `whatsapp_to` (E.164 format)
+- `--whatsapp-message TEXT` — sets `whatsapp_message`
+- `--whatsapp-template NAME` — sets `whatsapp_template_name`
+- `--whatsapp-template-language CODE` — sets `whatsapp_template_language` (default: en_US)
+
+#### SampleTasks.md additions:
+- Case Study 11: Unified Communication Digest — concurrent multi-provider fetch + digest
+- Case Study 12: WhatsApp Message Send — plain-text and template send
+
+## Task #6: Futuristic CLI Personality + On-Demand Gateway
+
+### CLI taglines expanded (`kendr/cli.py`):
+`_cli_tagline()` now rotates through 12 options (was 4). New additions include:
+- "Research, build, communicate, and know — all from one command."
+- "Your agents are waiting. Give them a mission."
+- "Multi-source intelligence in a single invocation."
+- "From raw query to polished report, without leaving the terminal."
+- "Deploy a fleet of agents with one line."
+- "The intelligence layer your workflow was missing."
+- "Ship faster. Think deeper. Automate further."
+- "Knowledge at the speed of the command line."
+
+### New command: `kendr hello`
+- Shows ASCII art logo + version
+- Lists all 5 core capabilities with copy-ready example commands
+- Prints a 5-step setup guide
+- Includes links to SampleTasks.md and help references
+- `--json` flag emits all content as structured JSON (useful for tooling integration)
+
+### On-demand gateway (pre-existing, documented):
+`kendr gateway start/stop/status/restart` — fully functional on-demand gateway control.
+Gateway auto-starts on first `kendr run` if not already running.
+Explicit management: `kendr gateway start` (pre-launch) / `kendr gateway stop` (clean shutdown).

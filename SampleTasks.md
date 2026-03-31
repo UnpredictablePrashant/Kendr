@@ -410,6 +410,69 @@ Expected behavior:
 - Database builds include schema knowledge base artifacts (tables, columns, keys, sampled rows).
 - Session data is persisted and can be reused across runs (`build`, `chat`, `switch`, `status`, `list`).
 
+### Case Study 11: Unified Communication Digest (Beta)
+
+Goal: Fetch and summarize messages from all configured communication channels in a single morning briefing.
+
+Prerequisites:
+- `OPENAI_API_KEY`
+- One or more communication credentials: `GOOGLE_ACCESS_TOKEN` (Gmail), `SLACK_BOT_TOKEN`, `MICROSOFT_GRAPH_ACCESS_TOKEN`, `TELEGRAM_BOT_TOKEN`, `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID`
+
+```bash
+kendr run \
+  --communication-authorized \
+  "Summarize my communications across all channels from the last 24 hours"
+```
+
+With a custom lookback window:
+
+```bash
+kendr run \
+  --communication-authorized \
+  "What did I miss on Slack and Gmail in the last 4 hours?"
+```
+
+Expected behavior:
+- Routes to `communication_summary_agent` via communication-intent detection.
+- Fetches from all configured providers concurrently (Gmail, Slack, Microsoft Graph, Telegram, WhatsApp).
+- Produces a per-channel digest sorted by recency with action items highlighted.
+- Writes `communication_summary_agent_<n>.txt` and `.json` to the run output folder.
+
+Acceptance:
+- `communication_summary_agent_<n>.txt` exists in `output/runs/<run_id>/`
+- Output includes at least one channel section for each configured provider
+
+### Case Study 12: WhatsApp Message Send (Beta)
+
+Goal: Send a WhatsApp message via the Meta Graph API.
+
+Prerequisites:
+- `OPENAI_API_KEY`
+- `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_PHONE_NUMBER_ID`
+
+```bash
+kendr run \
+  --communication-authorized \
+  --whatsapp-to "+15551234567" \
+  --whatsapp-message "Hello from kendr — your briefing is ready." \
+  "Send a WhatsApp message to my contact."
+```
+
+Send using a pre-approved template:
+
+```bash
+kendr run \
+  --communication-authorized \
+  --whatsapp-to "+15551234567" \
+  --whatsapp-template "hello_world" \
+  "Send a WhatsApp template message."
+```
+
+Expected behavior:
+- Routes to `whatsapp_send_message_agent`.
+- Posts to Meta Graph API v18+ `/messages` endpoint.
+- Writes send result and summary to run artifacts.
+
 ## Useful Companion Commands
 
 Inspect one agent:

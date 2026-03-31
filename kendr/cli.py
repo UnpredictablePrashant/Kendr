@@ -112,6 +112,14 @@ def _cli_tagline() -> str:
         "Structured automation for serious workflows.",
         "Reliable multi-agent execution from one command surface.",
         "If it scales, it belongs in your CLI.",
+        "Research, build, communicate, and know — all from one command.",
+        "Your agents are waiting. Give them a mission.",
+        "Multi-source intelligence in a single invocation.",
+        "From raw query to polished report, without leaving the terminal.",
+        "Deploy a fleet of agents with one line.",
+        "The intelligence layer your workflow was missing.",
+        "Ship faster. Think deeper. Automate further.",
+        "Knowledge at the speed of the command line.",
     ]
     day_index = dt.date.today().toordinal() % len(options)
     return options[day_index]
@@ -1668,6 +1676,37 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         help="Disable automatic installation of missing security tools for security workflows.",
     )
     run_parser.add_argument(
+        "--communication-authorized",
+        action="store_true",
+        help="Confirm you are authorized to access the communication channels for this run.",
+    )
+    run_parser.add_argument(
+        "--communication-lookback-hours",
+        type=int,
+        default=0,
+        help="Lookback window in hours for the communication summary digest (default: 24).",
+    )
+    run_parser.add_argument(
+        "--whatsapp-to",
+        default="",
+        help="Recipient phone number in E.164 format for whatsapp_send_message_agent.",
+    )
+    run_parser.add_argument(
+        "--whatsapp-message",
+        default="",
+        help="Plain text message body for whatsapp_send_message_agent.",
+    )
+    run_parser.add_argument(
+        "--whatsapp-template",
+        default="",
+        help="WhatsApp template name for whatsapp_send_message_agent.",
+    )
+    run_parser.add_argument(
+        "--whatsapp-template-language",
+        default="",
+        help="Language code for the WhatsApp template (default: en_US).",
+    )
+    run_parser.add_argument(
         "--working-directory",
         default="",
         help="Working folder for task outputs and intermediate artifacts.",
@@ -1861,6 +1900,9 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         help="Also save this path as KENDR_WORKING_DIR.",
     )
     workdir_sub.add_parser("clear", help="Clear configured KENDR_WORKING_DIR.")
+    hello_parser = subparsers.add_parser("hello", help="Quick-start welcome screen with setup guidance and example commands.")
+    command_parsers["hello"] = hello_parser
+    hello_parser.add_argument("--json", action="store_true", help="Emit quick-start info as JSON.")
     help_parser = subparsers.add_parser("help", help="Show help for one command.")
     command_parsers["help"] = help_parser
     help_parser.add_argument("topic", nargs="?")
@@ -2794,6 +2836,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
         base_ingest_payload["security_authorization_note"] = security_authorization_note
     if security_scan_profile:
         base_ingest_payload["security_scan_profile"] = security_scan_profile
+    if bool(getattr(args, "communication_authorized", False)):
+        base_ingest_payload["communication_authorized"] = True
+    _comm_lookback = int(getattr(args, "communication_lookback_hours", 0) or 0)
+    if _comm_lookback > 0:
+        base_ingest_payload["communication_lookback_hours"] = _comm_lookback
+    if str(getattr(args, "whatsapp_to", "") or "").strip():
+        base_ingest_payload["whatsapp_to"] = str(args.whatsapp_to).strip()
+    if str(getattr(args, "whatsapp_message", "") or "").strip():
+        base_ingest_payload["whatsapp_message"] = str(args.whatsapp_message).strip()
+    if str(getattr(args, "whatsapp_template", "") or "").strip():
+        base_ingest_payload["whatsapp_template_name"] = str(args.whatsapp_template).strip()
+    if str(getattr(args, "whatsapp_template_language", "") or "").strip():
+        base_ingest_payload["whatsapp_template_language"] = str(args.whatsapp_template_language).strip()
     if bool(args.privileged_mode):
         base_ingest_payload["privileged_mode"] = True
     if bool(args.privileged_approved):
@@ -3499,6 +3554,93 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
     raise SystemExit(f"Unknown gateway action: {action}")
 
 
+def _cmd_hello(args: argparse.Namespace) -> int:
+    style = _style_from_args(args)
+    version = _cli_version()
+
+    quickstart = {
+        "version": version,
+        "capabilities": [
+            {
+                "name": "Deep Research",
+                "command": 'kendr research "topic you want to investigate" --sources web,arxiv --pages 10',
+                "description": "Multi-source research pipeline with document output (PDF/DOCX/Markdown).",
+            },
+            {
+                "name": "Code Project Generation",
+                "command": 'kendr generate "a FastAPI REST API with PostgreSQL and JWT auth" --auto-approve',
+                "description": "Generate a complete production-ready software project end-to-end.",
+            },
+            {
+                "name": "SuperRAG Knowledge Engine",
+                "command": 'kendr run --superrag-mode build --superrag-new-session --superrag-session-title "my_kb" --superrag-path ./docs "Build my knowledge base."',
+                "description": "Zero-config local-first RAG: ingest docs, URLs, DBs, and OneDrive. Chat over the indexed knowledge.",
+            },
+            {
+                "name": "Local Command Execution",
+                "command": 'kendr run --current-folder --privileged-approved --privileged-approval-note "manual review" "List the project files."',
+                "description": "Controlled shell command execution with audit log and auto-install support.",
+            },
+            {
+                "name": "Communication Suite",
+                "command": 'kendr run --communication-authorized "Summarize my communications from the last 24 hours."',
+                "description": "Unified digest across Gmail, Slack, Telegram, WhatsApp, and Microsoft 365.",
+            },
+        ],
+        "setup_steps": [
+            "1. Run `kendr setup set openai OPENAI_API_KEY sk-...` to configure your LLM provider.",
+            "2. Run `kendr setup components` to see all integrations and required variables.",
+            "3. Run `kendr status` to verify your configuration and routing eligibility.",
+            "4. Run `kendr gateway start` to pre-launch the gateway (optional — auto-starts on first run).",
+            "5. Run `kendr agents list` to see all available agents.",
+        ],
+        "docs": [
+            "SampleTasks.md — full example library with expected outputs",
+            "kendr --help — complete flag reference",
+            "kendr help <command> — per-command help (e.g. `kendr help run`)",
+        ],
+    }
+
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(quickstart, indent=2, ensure_ascii=False))
+        return 0
+
+    lines = [
+        "",
+        style.title("  ██╗  ██╗███████╗███╗   ██╗██████╗ ██████╗ "),
+        style.title("  ██║ ██╔╝██╔════╝████╗  ██║██╔══██╗██╔══██╗"),
+        style.title("  █████╔╝ █████╗  ██╔██╗ ██║██║  ██║██████╔╝"),
+        style.title("  ██╔═██╗ ██╔══╝  ██║╚██╗██║██║  ██║██╔══██╗"),
+        style.title("  ██║  ██╗███████╗██║ ╚████║██████╔╝██║  ██║"),
+        style.title("  ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚═════╝ ╚═╝  ╚═╝"),
+        "",
+        f"  {style.muted('v' + version + '  ·  Multi-agent intelligence runtime')}",
+        "",
+        style.heading("  Five core capabilities:"),
+        "",
+    ]
+    for cap in quickstart["capabilities"]:
+        lines.append(f"  {style.ok('▸')} {cap['name']}")
+        lines.append(f"    {style.muted(cap['description'])}")
+        lines.append(f"    {cap['command']}")
+        lines.append("")
+
+    lines.append(style.heading("  Getting started:"))
+    lines.append("")
+    for step in quickstart["setup_steps"]:
+        lines.append(f"  {step}")
+    lines.append("")
+
+    lines.append(style.heading("  Learn more:"))
+    lines.append("")
+    for doc in quickstart["docs"]:
+        lines.append(f"  · {doc}")
+    lines.append("")
+
+    print("\n".join(lines))
+    return 0
+
+
 def _cmd_workdir(args: argparse.Namespace) -> int:
     style = _style_from_args(args)
     action = args.workdir_action
@@ -4072,6 +4214,8 @@ def main(argv: list[str] | None = None) -> int:
         target_parser.print_help()
         return 0
 
+    if args.command == "hello":
+        return _cmd_hello(args)
     if args.command == "run":
         return _cmd_run(args)
     if args.command == "generate":
