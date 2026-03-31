@@ -108,6 +108,8 @@ class RuntimeState(TypedDict, total=False):
     research_pipeline_enabled: bool
     research_pipeline_completed: bool
     pipeline_skip_synthesis: bool
+    skip_test_agent: bool
+    skip_devops_agent: bool
     user_cancelled: bool
 
 

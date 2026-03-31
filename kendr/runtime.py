@@ -355,6 +355,8 @@ class AgentRuntime:
         }
 
     def _is_project_build_request(self, state: dict) -> bool:
+        if bool(state.get("project_build_mode", False)):
+            return True
         text = " ".join([
             str(state.get("user_query", "")),
             str(state.get("current_objective", "")),

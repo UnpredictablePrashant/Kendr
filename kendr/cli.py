@@ -1289,6 +1289,8 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         epilog=(
             f"{style.heading('Examples')}\n"
             "  kendr run \"Summarize this repository\" --max-steps 12\n"
+            "  kendr generate \"a FastAPI todo API with PostgreSQL\" --auto-approve\n"
+            "  kendr research \"transformer architectures 2024\" --sources arxiv,openalex --pages 20\n"
             "  kendr agents list\n"
             "  kendr gateway start\n"
             "  kendr status\n"
@@ -1851,7 +1853,503 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     resume_parser.add_argument("--reply", default="", help="Explicit reply text for paused runs awaiting user input.")
     resume_parser.add_argument("--force", action="store_true", help="Take over a running or stale run.")
     resume_parser.add_argument("--json", action="store_true", help="Emit resume candidate or result as JSON.")
+
+    generate_parser = subparsers.add_parser(
+        "generate",
+        help="Generate a complete multi-agent software project from a description.",
+    )
+    command_parsers["generate"] = generate_parser
+    generate_parser.add_argument(
+        "description",
+        nargs="*",
+        help="Natural language description of the project to generate.",
+    )
+    generate_parser.add_argument(
+        "--name",
+        default="",
+        help="Project name (kebab-case). Auto-derived from description if omitted.",
+    )
+    generate_parser.add_argument(
+        "--stack",
+        default="",
+        help=(
+            "Optional tech stack template to use. "
+            "Available: fastapi_postgres, fastapi_react_postgres, nextjs_prisma_postgres, "
+            "express_prisma_postgres, mern_microservices_mongodb, pern_postgres, nextjs_static_site. "
+            "Leave blank for LLM-driven stack selection."
+        ),
+    )
+    generate_parser.add_argument(
+        "--output",
+        default="",
+        help="Output directory root for the generated project. Defaults to the configured working directory.",
+    )
+    generate_parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="Auto-approve blueprint and plan gates without interactive prompts.",
+    )
+    generate_parser.add_argument(
+        "--skip-tests",
+        action="store_true",
+        help="Skip test generation and execution steps.",
+    )
+    generate_parser.add_argument(
+        "--skip-devops",
+        action="store_true",
+        help="Skip Dockerfile, docker-compose, and CI/CD generation steps.",
+    )
+    generate_parser.add_argument(
+        "--skip-reviews",
+        action="store_true",
+        help="Skip reviewer agent checks between build steps.",
+    )
+    generate_parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=40,
+        help="Maximum orchestration steps for the build (default 40).",
+    )
+    generate_parser.add_argument(
+        "--working-directory",
+        default="",
+        help="Working directory for task outputs and build artifacts.",
+    )
+    generate_parser.add_argument(
+        "--current-folder",
+        action="store_true",
+        help="Use current terminal folder as working directory.",
+    )
+    generate_parser.add_argument("--json", action="store_true", help="Emit final state as JSON.")
+    generate_parser.add_argument("--quiet", action="store_true", help="Suppress live progress messages.")
+
+    research_parser = subparsers.add_parser(
+        "research",
+        help="Run a multi-source research pipeline and generate a document.",
+    )
+    command_parsers["research"] = research_parser
+    research_parser.add_argument(
+        "query",
+        nargs="*",
+        help="Research query or topic.",
+    )
+    research_parser.add_argument(
+        "--sources",
+        default="",
+        help=(
+            "Comma-separated research sources. "
+            "Options: web, arxiv (alias: papers), reddit, scholar, patents, openalex, local. "
+            "Example: --sources arxiv,reddit,openalex"
+        ),
+    )
+    research_parser.add_argument(
+        "--pages",
+        type=int,
+        default=0,
+        help="Target page count for the generated document (implies --long-document mode).",
+    )
+    research_parser.add_argument(
+        "--title",
+        default="",
+        help="Optional report title override.",
+    )
+    research_parser.add_argument(
+        "--drive",
+        action="append",
+        default=[],
+        help="Local folder or file path to include as a research source. Repeat for multiple paths.",
+    )
+    research_parser.add_argument(
+        "--research-model",
+        default="",
+        help="Override the deep-research model for this run.",
+    )
+    research_parser.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="Auto-approve plan gates.",
+    )
+    research_parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=20,
+        help="Maximum orchestration steps (default 20).",
+    )
+    research_parser.add_argument(
+        "--working-directory",
+        default="",
+        help="Working directory for task outputs.",
+    )
+    research_parser.add_argument(
+        "--current-folder",
+        action="store_true",
+        help="Use current terminal folder as working directory.",
+    )
+    research_parser.add_argument("--json", action="store_true", help="Emit final state as JSON.")
+    research_parser.add_argument("--quiet", action="store_true", help="Suppress live progress messages.")
+
     return parser, command_parsers
+
+
+def _cmd_generate(args: argparse.Namespace) -> int:
+    description = " ".join(args.description).strip()
+    if not description:
+        if sys.stdin.isatty():
+            description = input("Describe the project to generate: ").strip()
+        if not description:
+            raise SystemExit("A project description is required. Example: kendr generate 'a FastAPI todo API with PostgreSQL'")
+
+    style = _cli_style(None)
+    project_name = str(args.name or "").strip()
+    project_stack = str(args.stack or "").strip()
+
+    if bool(args.current_folder):
+        configured_working_dir = str(Path.cwd())
+    else:
+        configured_working_dir = str(args.working_directory or _configured_working_dir()).strip()
+    if not configured_working_dir:
+        configured_working_dir = input("Set a working folder for generated project output (required): ").strip()
+        if not configured_working_dir:
+            raise SystemExit("Working folder is required. Configure KENDR_WORKING_DIR in setup or pass --working-directory.")
+        save_component_values("core_runtime", {"KENDR_WORKING_DIR": configured_working_dir})
+        os.environ["KENDR_WORKING_DIR"] = configured_working_dir
+    resolved_working_dir = _resolve_working_dir(configured_working_dir)
+
+    output_root = str(args.output or "").strip()
+    if output_root:
+        output_root = str(_resolve_working_dir(output_root))
+
+    project_root = output_root or resolved_working_dir
+
+    _emit_status(args, f"[generate] project root: {project_root}")
+    if project_name:
+        _emit_status(args, f"[generate] project name: {project_name}")
+    if project_stack:
+        _emit_status(args, f"[generate] stack template: {project_stack}")
+
+    query = description
+    base_ingest_payload: dict = {
+        "max_steps": args.max_steps,
+        "working_directory": resolved_working_dir,
+        "project_build_mode": True,
+        "project_root": project_root,
+    }
+    if project_name:
+        base_ingest_payload["project_name"] = project_name
+    if project_stack:
+        base_ingest_payload["project_stack"] = project_stack
+    if bool(args.auto_approve):
+        base_ingest_payload["auto_approve"] = True
+        base_ingest_payload["auto_approve_plan"] = True
+    if bool(args.skip_reviews):
+        base_ingest_payload["skip_reviews"] = True
+    if bool(args.skip_tests):
+        base_ingest_payload["skip_test_agent"] = True
+    if bool(args.skip_devops):
+        base_ingest_payload["skip_devops_agent"] = True
+
+    gateway_base = _gateway_base_url()
+    selected_session = _load_cli_session()
+    channel = str(selected_session.get("channel", "webchat") or "webchat").strip()
+    workspace_id = str(selected_session.get("workspace_id", "default") or "default").strip()
+    sender_id = str(selected_session.get("sender_id", "cli_user") or "cli_user").strip()
+    chat_id = str(selected_session.get("chat_id", sender_id) or sender_id).strip()
+    base_ingest_payload["channel"] = channel
+    base_ingest_payload["workspace_id"] = workspace_id
+    base_ingest_payload["sender_id"] = sender_id
+    base_ingest_payload["chat_id"] = chat_id
+    base_ingest_payload["is_group"] = False
+
+    if not _gateway_ready():
+        _emit_status(args, f"[gateway] not running at {gateway_base}; starting gateway...")
+        _start_gateway_process()
+        _emit_status(args, f"[gateway] ready at {gateway_base}")
+
+    client_run_id = f"run_cli_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    ingest_payload = dict(base_ingest_payload)
+    ingest_payload["run_id"] = client_run_id
+    ingest_payload["text"] = query
+    ingest_payload["new_session"] = True
+
+    _emit_status(args, f"[generate] launching project generation run_id={client_run_id}")
+    _emit_status(args, style.muted(f"  query: {query[:120]}"))
+
+    log_offsets: dict[str, int] = {}
+    run_dir_cache: dict[str, str] = {}
+
+    def _tail_file(path: Path, key: str) -> None:
+        try:
+            size = path.stat().st_size
+        except Exception:
+            return
+        if key not in log_offsets:
+            log_offsets[key] = max(0, size - 4096)
+        if size < log_offsets[key]:
+            log_offsets[key] = 0
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                handle.seek(log_offsets[key])
+                chunk = handle.read()
+                log_offsets[key] = handle.tell()
+        except Exception:
+            return
+        for line in chunk.splitlines():
+            if line.strip():
+                _emit_status(args, f"[log] {line}")
+
+    def _tail_run_logs(run_id: str) -> None:
+        runs_root = Path(resolved_working_dir) / "runs"
+        if not runs_root.exists():
+            return
+        matches = [item for item in runs_root.glob(f"{run_id}*") if item.is_dir()]
+        if not matches:
+            cached = run_dir_cache.get(run_id)
+            if cached and Path(cached).exists():
+                matches = [Path(cached)]
+        if not matches:
+            return
+        run_path = max(matches, key=lambda p: p.stat().st_mtime)
+        run_dir_cache[run_id] = str(run_path)
+        for filename in ("execution.log", "agent_work_notes.txt"):
+            log_path = run_path / filename
+            if log_path.exists():
+                _tail_file(log_path, f"{run_path}:{filename}")
+
+    last_progress = ""
+
+    def _poll_progress(run_id: str, prev: str) -> str:
+        try:
+            sessions = _http_json_get(f"{gateway_base}/task-sessions", timeout_seconds=1.2)
+            if isinstance(sessions, list):
+                match = next((s for s in sessions if str(s.get("run_id", "")) == run_id), None)
+                if isinstance(match, dict):
+                    msg = _build_run_progress_message(match)
+                    if msg != prev:
+                        _emit_status(args, _colorize_run_progress_message(msg, style))
+                        return msg
+        except Exception:
+            pass
+        return prev
+
+    holder: dict = {"result": None, "error": None}
+
+    def _submit() -> None:
+        try:
+            request = urllib.request.Request(
+                f"{gateway_base}/ingest",
+                data=json.dumps(ingest_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=600) as response:
+                holder["result"] = json.loads(response.read().decode("utf-8"))
+        except BaseException as exc:  # noqa: BLE001
+            holder["error"] = exc
+
+    worker = threading.Thread(target=_submit, daemon=True)
+    worker.start()
+
+    while worker.is_alive():
+        worker.join(timeout=1.0)
+        last_progress = _poll_progress(client_run_id, last_progress)
+        _tail_run_logs(client_run_id)
+
+    if holder["error"]:
+        raise SystemExit(f"[generate] failed: {holder['error']}")
+
+    result = holder["result"] or {}
+    if bool(args.json):
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+
+    final = str(result.get("final_output") or result.get("draft_response") or "").strip()
+    pending = str(result.get("pending_user_question") or "").strip()
+    built_root = str(result.get("project_root") or "").strip()
+
+    if final:
+        print(final)
+    if pending and pending != final:
+        print(pending)
+    if built_root:
+        _emit_status(args, style.ok(f"[generate] project output: {built_root}"))
+
+    return 0
+
+
+def _cmd_research(args: argparse.Namespace) -> int:
+    query = " ".join(args.query).strip()
+    if not query:
+        if sys.stdin.isatty():
+            query = input("Enter your research query: ").strip()
+        if not query:
+            raise SystemExit("A research query is required. Example: kendr research 'transformer architectures 2024'")
+
+    if bool(args.current_folder):
+        configured_working_dir = str(Path.cwd())
+    else:
+        configured_working_dir = str(args.working_directory or _configured_working_dir()).strip()
+    if not configured_working_dir:
+        configured_working_dir = input("Set a working folder for research output (required): ").strip()
+        if not configured_working_dir:
+            raise SystemExit("Working folder is required. Configure KENDR_WORKING_DIR in setup or pass --working-directory.")
+        save_component_values("core_runtime", {"KENDR_WORKING_DIR": configured_working_dir})
+        os.environ["KENDR_WORKING_DIR"] = configured_working_dir
+    resolved_working_dir = _resolve_working_dir(configured_working_dir)
+
+    base_ingest_payload: dict = {
+        "max_steps": args.max_steps,
+        "working_directory": resolved_working_dir,
+    }
+
+    raw_sources = str(args.sources or "").strip()
+    if raw_sources:
+        parsed_sources = [s.strip().lower() for s in raw_sources.split(",") if s.strip()]
+        if parsed_sources:
+            base_ingest_payload["research_sources"] = parsed_sources
+            base_ingest_payload["research_pipeline_enabled"] = True
+            base_ingest_payload["research_pipeline_completed"] = False
+    else:
+        base_ingest_payload["research_pipeline_enabled"] = True
+        base_ingest_payload["research_pipeline_completed"] = False
+
+    if int(args.pages or 0) > 0:
+        base_ingest_payload["long_document_mode"] = True
+        base_ingest_payload["long_document_pages"] = int(args.pages)
+        base_ingest_payload["long_document_collect_sources_first"] = True
+    else:
+        base_ingest_payload["long_document_mode"] = True
+        base_ingest_payload["long_document_collect_sources_first"] = True
+
+    if str(args.title or "").strip():
+        base_ingest_payload["long_document_title"] = str(args.title).strip()
+    if str(args.research_model or "").strip():
+        base_ingest_payload["research_model"] = str(args.research_model).strip()
+    if bool(args.auto_approve):
+        base_ingest_payload["auto_approve"] = True
+
+    drive_paths = _normalize_drive_paths(args.drive)
+    if drive_paths:
+        base_ingest_payload["local_drive_paths"] = drive_paths
+        base_ingest_payload["local_drive_recursive"] = True
+        base_ingest_payload["local_drive_working_directory"] = resolved_working_dir
+        if not raw_sources:
+            base_ingest_payload.setdefault("research_sources", ["local"])
+
+    gateway_base = _gateway_base_url()
+    selected_session = _load_cli_session()
+    channel = str(selected_session.get("channel", "webchat") or "webchat").strip()
+    workspace_id = str(selected_session.get("workspace_id", "default") or "default").strip()
+    sender_id = str(selected_session.get("sender_id", "cli_user") or "cli_user").strip()
+    chat_id = str(selected_session.get("chat_id", sender_id) or sender_id).strip()
+    base_ingest_payload["channel"] = channel
+    base_ingest_payload["workspace_id"] = workspace_id
+    base_ingest_payload["sender_id"] = sender_id
+    base_ingest_payload["chat_id"] = chat_id
+    base_ingest_payload["is_group"] = False
+
+    if not _gateway_ready():
+        _emit_status(args, f"[gateway] not running at {gateway_base}; starting gateway...")
+        _start_gateway_process()
+        _emit_status(args, f"[gateway] ready at {gateway_base}")
+
+    client_run_id = f"run_cli_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    ingest_payload = dict(base_ingest_payload)
+    ingest_payload["run_id"] = client_run_id
+    ingest_payload["text"] = query
+    ingest_payload["new_session"] = True
+
+    _emit_status(args, f"[research] starting research run_id={client_run_id}")
+
+    holder: dict = {"result": None, "error": None}
+
+    def _submit() -> None:
+        try:
+            request = urllib.request.Request(
+                f"{gateway_base}/ingest",
+                data=json.dumps(ingest_payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=600) as response:
+                holder["result"] = json.loads(response.read().decode("utf-8"))
+        except BaseException as exc:  # noqa: BLE001
+            holder["error"] = exc
+
+    log_offsets: dict[str, int] = {}
+
+    def _tail_file(path: Path, key: str) -> None:
+        try:
+            size = path.stat().st_size
+        except Exception:
+            return
+        if key not in log_offsets:
+            log_offsets[key] = max(0, size - 4096)
+        if size < log_offsets[key]:
+            log_offsets[key] = 0
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                handle.seek(log_offsets[key])
+                chunk = handle.read()
+                log_offsets[key] = handle.tell()
+        except Exception:
+            return
+        for line in chunk.splitlines():
+            if line.strip():
+                _emit_status(args, f"[log] {line}")
+
+    def _tail_run_logs(run_id: str) -> None:
+        runs_root = Path(resolved_working_dir) / "runs"
+        if not runs_root.exists():
+            return
+        matches = [item for item in runs_root.glob(f"{run_id}*") if item.is_dir()]
+        if not matches:
+            return
+        run_path = max(matches, key=lambda p: p.stat().st_mtime)
+        for filename in ("execution.log", "agent_work_notes.txt"):
+            log_path = run_path / filename
+            if log_path.exists():
+                _tail_file(log_path, f"{run_path}:{filename}")
+
+    style = _cli_style(None)
+    last_progress = ""
+
+    worker = threading.Thread(target=_submit, daemon=True)
+    worker.start()
+    while worker.is_alive():
+        worker.join(timeout=1.0)
+        try:
+            sessions = _http_json_get(f"{gateway_base}/task-sessions", timeout_seconds=1.2)
+            if isinstance(sessions, list):
+                match = next((s for s in sessions if str(s.get("run_id", "")) == client_run_id), None)
+                if isinstance(match, dict):
+                    msg = _build_run_progress_message(match)
+                    if msg != last_progress:
+                        _emit_status(args, _colorize_run_progress_message(msg, style))
+                        last_progress = msg
+        except Exception:
+            pass
+        _tail_run_logs(client_run_id)
+
+    if holder["error"]:
+        raise SystemExit(f"[research] failed: {holder['error']}")
+
+    result = holder["result"] or {}
+    if bool(args.json):
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0
+
+    final = str(result.get("final_output") or result.get("draft_response") or "").strip()
+    pending = str(result.get("pending_user_question") or "").strip()
+    compiled = str(result.get("long_document_compiled_path") or "").strip()
+
+    if final:
+        print(final)
+    if pending and pending != final:
+        print(pending)
+    if compiled:
+        _emit_status(args, style.ok(f"[research] document saved to: {compiled}"))
+
+    return 0
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -3375,6 +3873,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return _cmd_run(args)
+    if args.command == "generate":
+        return _cmd_generate(args)
+    if args.command == "research":
+        return _cmd_research(args)
     if args.command == "agents":
         return _cmd_agents(args)
     if args.command == "plugins":

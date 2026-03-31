@@ -72,3 +72,52 @@ New capabilities added:
 ### MCP server updates in `mcp_servers/research_server.py`
 - New `arxiv_papers` tool — fetches arXiv papers via MCP
 - New `reddit_posts` tool — fetches Reddit posts via MCP
+
+## Task #3: Multi-Agent Dev Project Generation
+
+New `kendr generate` and `kendr research` subcommands added to `kendr/cli.py`.
+
+### `kendr generate` command
+Generates a complete multi-agent software project from a natural language description.
+
+```
+kendr generate "a FastAPI todo API with PostgreSQL" --auto-approve
+kendr generate "a Next.js SaaS dashboard" --stack nextjs_prisma_postgres --name my-saas --output ~/projects
+kendr generate "an Express REST API with MongoDB" --skip-tests --skip-devops
+```
+
+Flags:
+- `description` — Natural language description of the project (positional)
+- `--name NAME` — Project name in kebab-case; auto-derived if omitted
+- `--stack STACK` — Stack template (fastapi_postgres, fastapi_react_postgres, nextjs_prisma_postgres, express_prisma_postgres, mern_microservices_mongodb, pern_postgres, nextjs_static_site)
+- `--output PATH` — Output directory root (defaults to working directory)
+- `--auto-approve` — Skip interactive blueprint/plan approval prompts
+- `--skip-tests` — Omit test_agent from the build plan
+- `--skip-devops` — Omit devops_agent (Dockerfile/CI/CD) from the build plan
+- `--skip-reviews` — Skip reviewer agent between steps
+- `--max-steps N` — Max orchestration steps (default 40)
+
+Sets `project_build_mode=True` in state so the orchestrator directly routes to `project_blueprint_agent` without NLP detection.
+
+### `kendr research` command
+Runs a multi-source research pipeline and optionally generates a long-form document.
+
+```
+kendr research "transformer architectures 2024" --sources arxiv,openalex --pages 20
+kendr research "AI in healthcare" --sources web,scholar,reddit --title "AI Healthcare Report"
+kendr research "my local notes" --drive ~/documents --sources local
+```
+
+Flags:
+- `query` — Research query or topic (positional)
+- `--sources SOURCES` — Comma-separated sources (web, arxiv, reddit, scholar, patents, openalex, local)
+- `--pages N` — Target page count; implies long-form document mode
+- `--title TITLE` — Optional document title
+- `--drive PATH` — Local folder/file path (repeatable)
+- `--research-model MODEL` — Override deep-research model
+- `--auto-approve` — Auto-approve plan gates
+
+### Runtime changes
+- `_is_project_build_request()` in `kendr/runtime.py` — now returns `True` immediately when `project_build_mode` is already set in state (avoids requiring NLP marker detection for `generate` command)
+- `skip_test_agent: bool` and `skip_devops_agent: bool` added to `RuntimeState` in `kendr/orchestration/state.py`
+- Planner prompt updated to honor `skip_test_agent` and `skip_devops_agent` flags from planning context

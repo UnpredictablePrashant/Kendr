@@ -326,6 +326,8 @@ def _planning_context(state: dict, objective: str) -> str:
         "project_root": state.get("project_root", ""),
         "project_stack": state.get("project_stack", ""),
         "blueprint_json": state.get("blueprint_json", {}),
+        "skip_test_agent": bool(state.get("skip_test_agent", False)),
+        "skip_devops_agent": bool(state.get("skip_devops_agent", False)),
     }
     return json.dumps(context, indent=2, ensure_ascii=False)
 
@@ -362,13 +364,14 @@ this is a full project build. Use the following agent sequence for the plan step
   4. backend_builder_agent -- Implement API routes, services, middleware
   5. frontend_builder_agent -- Implement pages, components, API client, styling (skip if no frontend in blueprint)
   6. dependency_manager_agent -- Install all packages and validate lockfiles (scan all package.json / requirements)
-  7. test_agent -- Generate and run tests (retry on failure)
+  7. test_agent -- Generate and run tests (retry on failure) -- SKIP if "skip_test_agent": true in context
   8. security_scanner_agent -- Run npm audit / pip check or equivalent scans
-  9. devops_agent -- Generate production Dockerfile, docker-compose, CI/CD, nginx config
+  9. devops_agent -- Generate production Dockerfile, docker-compose, CI/CD, nginx config -- SKIP if "skip_devops_agent": true in context
  10. project_verifier_agent -- Run linters, type checks, build, and dev server health check
  11. post_setup_agent -- Run safe post-setup commands (e.g., docker compose up)
 Each step's task field should reference the specific section of the blueprint it implements.
 The blueprint_json in the context contains the full technical architecture.
+Honor the "skip_test_agent" and "skip_devops_agent" flags in the planning context to omit those steps.
 
 Planning context:
 {_planning_context(state, user_query)}
