@@ -790,7 +790,7 @@ def _start_gateway_process() -> None:
     log_path = _gateway_log_path()
     with log_path.open("a", encoding="utf-8") as gateway_log:
         gateway_log.write(
-            f"\n[{dt.datetime.now(dt.UTC).isoformat()}] launching gateway via {sys.executable}\n"
+            f"\n[{dt.datetime.now(dt.timezone.utc).isoformat()}] launching gateway via {sys.executable}\n"
         )
         gateway_log.flush()
         process = subprocess.Popen(
@@ -1925,7 +1925,8 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     ui_parser = subparsers.add_parser("ui", help="Launch the Kendr Web Chat & Config UI on port 2151.")
     command_parsers["ui"] = ui_parser
     ui_parser.add_argument("--port", type=int, default=0, help="Override port (default: KENDR_UI_PORT or 2151).")
-    ui_parser.add_argument("--host", default="", help="Override bind host (default: KENDR_UI_HOST or 0.0.0.0).")
+    ui_parser.add_argument("--host", default="", help="Override bind host (default: KENDR_UI_HOST or localhost).")
+    ui_parser.add_argument("--no-browser", action="store_true", help="Do not open a browser tab automatically.")
     status_parser = subparsers.add_parser("status", help="Show runtime status snapshot.")
     command_parsers["status"] = status_parser
     status_parser.add_argument("--json", action="store_true", help="Emit status as JSON.")
@@ -3841,10 +3842,30 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
 def _cmd_ui(args: argparse.Namespace) -> int:
     port_override = int(getattr(args, "port", 0) or 0)
     host_override = str(getattr(args, "host", "") or "").strip()
+    no_browser = bool(getattr(args, "no_browser", False))
     if port_override:
         os.environ["KENDR_UI_PORT"] = str(port_override)
     if host_override:
         os.environ["KENDR_UI_HOST"] = host_override
+
+    ui_port = int(os.getenv("KENDR_UI_PORT", "2151"))
+    ui_url = f"http://localhost:{ui_port}"
+
+    if not _gateway_ready(timeout_seconds=0.8):
+        print(f"[ui] Gateway not running — starting it in background...")
+        try:
+            _start_gateway_process()
+        except SystemExit:
+            print("[ui] Warning: gateway did not start. Chat will require 'kendr gateway start'.")
+
+    if not no_browser:
+        def _open_browser() -> None:
+            time.sleep(0.8)
+            import webbrowser
+            webbrowser.open(ui_url)
+
+        threading.Thread(target=_open_browser, daemon=True).start()
+
     from .ui_server import main as ui_main
 
     ui_main()
