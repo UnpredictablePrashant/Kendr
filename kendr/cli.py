@@ -683,11 +683,25 @@ def _gateway_owner_marker_path() -> Path:
     return home / "gateway.owner"
 
 
+def _proc_start_jiffies(pid: int) -> str:
+    try:
+        proc_stat = f"/proc/{pid}/stat"
+        if os.path.exists(proc_stat):
+            with open(proc_stat) as f:
+                fields = f.read().split()
+            return fields[21]
+    except Exception:
+        pass
+    return ""
+
+
 def _write_gateway_pid(pid: int) -> None:
     try:
         _gateway_pid_path().write_text(str(pid), encoding="utf-8")
         _gateway_start_time_path().write_text(str(time.time()), encoding="utf-8")
-        _gateway_owner_marker_path().write_text(_GATEWAY_OWNER_MARKER, encoding="utf-8")
+        start_jiffies = _proc_start_jiffies(pid)
+        marker_content = f"{_GATEWAY_OWNER_MARKER}\n{start_jiffies}"
+        _gateway_owner_marker_path().write_text(marker_content, encoding="utf-8")
     except Exception:
         pass
 
@@ -729,11 +743,19 @@ def _pid_is_alive(pid: int) -> bool:
 
 def _pid_is_gateway_owned(pid: int) -> bool:
     try:
-        marker = _gateway_owner_marker_path().read_text(encoding="utf-8").strip()
-        if marker != _GATEWAY_OWNER_MARKER:
-            return False
+        raw = _gateway_owner_marker_path().read_text(encoding="utf-8")
     except Exception:
         return False
+    lines = raw.strip().splitlines()
+    if not lines or lines[0].strip() != _GATEWAY_OWNER_MARKER:
+        return False
+    stored_jiffies = lines[1].strip() if len(lines) > 1 else ""
+    if stored_jiffies:
+        current_jiffies = _proc_start_jiffies(pid)
+        if current_jiffies:
+            if current_jiffies != stored_jiffies:
+                return False
+            return True
     cmdline_path = f"/proc/{pid}/cmdline"
     if os.path.exists(cmdline_path):
         try:
@@ -743,15 +765,7 @@ def _pid_is_gateway_owned(pid: int) -> bool:
             return any(kw in cmdline for kw in gateway_keywords)
         except Exception:
             return False
-    try:
-        import psutil
-        proc = psutil.Process(pid)
-        cmdline_list = proc.cmdline()
-        cmdline = " ".join(cmdline_list)
-        gateway_keywords = ("kendr", "gateway", "serve", "uvicorn", "setup_ui")
-        return any(kw in cmdline for kw in gateway_keywords)
-    except Exception:
-        return False
+    return False
 
 
 def _wait_for_listener_shutdown(port: int, timeout_seconds: float = 5.0) -> bool:
@@ -2777,7 +2791,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     "Security workflow requested but --security-authorized was not provided in non-interactive mode.\n"
                     + authorization_process_text(security_target_url)
                 )
-            print(authorization_process_text(security_target_url))
+            try:
+                from kendr import cli_output as _cout
+                _cout.print_text(authorization_process_text(security_target_url), style="grey62")
+            except Exception:
+                sys.stdout.write(authorization_process_text(security_target_url) + "\n")
+                sys.stdout.flush()
             confirm = input("Type YES to confirm you have explicit written authorization for this target: ").strip()
             if confirm != "YES":
                 raise SystemExit("Security workflow canceled. Authorization was not confirmed.")
@@ -3495,12 +3514,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
                         if prompt:
                             _cout.print_text(f"\n{prompt}\n", style="grey62")
                     except Exception:
-                        print()
-                        print("═" * 72)
-                        print("  BLUEPRINT READY FOR REVIEW")
-                        print("═" * 72)
+                        sys.stdout.write("\n" + "═" * 72 + "\n  BLUEPRINT READY FOR REVIEW\n" + "═" * 72 + "\n")
                         if prompt:
-                            print(f"\n{prompt}\n")
+                            sys.stdout.write(f"\n{prompt}\n")
+                        sys.stdout.flush()
                     sys.stdout.write("Proceed with this blueprint? [y/n]: ")
                     sys.stdout.flush()
                     try:
@@ -3514,11 +3531,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
                             from kendr import cli_output as _cout
                             _cout.print_text("\nGeneration cancelled at blueprint review.", style="#FF4757")
                         except Exception:
-                            print("\nGeneration cancelled at blueprint review.")
+                            sys.stdout.write("\nGeneration cancelled at blueprint review.\n")
+                            sys.stdout.flush()
                         return 0
                 else:
                     if prompt:
-                        print(prompt)
+                        try:
+                            from kendr import cli_output as _cout
+                            _cout.print_text(prompt, style="grey62")
+                        except Exception:
+                            sys.stdout.write(prompt + "\n")
+                            sys.stdout.flush()
                     while True:
                         try:
                             current_query = input("Reply: ").strip()
@@ -3542,7 +3565,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     _cout.print_final_output(final_output)
                 except Exception:
                     if final_output:
-                        print(final_output)
+                        sys.stdout.write(final_output + "\n")
+                        sys.stdout.flush()
                 if not bool(getattr(args, "quiet", False)):
                     try:
                         _emit_run_summary_table(result.get("run_id", ""))
