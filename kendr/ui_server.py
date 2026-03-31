@@ -878,7 +878,7 @@ async function saveComponent(compId) {
   const d = await r.json();
   const fields = (d.component || {}).fields || [];
   const values = {};
-  fields.forEach(f => { const el = document.getElementById('fld-' + compId + '-' + f.key); if (el) values[f.key] = el.value; });
+  fields.forEach(f => { const el = document.getElementById('fld-' + compId + '-' + f.key); if (el && !(f.secret && el.value === '********')) values[f.key] = el.value; });
   const msg = document.getElementById('save-msg-' + compId);
   try {
     const resp = await fetch(API + '/api/setup/save', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ component_id: compId, values }) });

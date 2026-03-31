@@ -68,6 +68,8 @@ def save_component_values(component_id: str, values: dict[str, str]) -> dict:
         if raw.strip() == "":
             delete_setup_config_value(component_id, key)
             continue
+        if secrets.get(key, False) and raw == "********":
+            continue
         upsert_setup_config_value(
             component_id,
             key,
