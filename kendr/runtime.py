@@ -927,6 +927,18 @@ class AgentRuntime:
             "open github issue",
             "fork the repo",
             "fork repo",
+            "create a branch",
+            "create branch",
+            "switch branch",
+            "checkout branch",
+            "git commit",
+            "commit the changes",
+            "commit and push",
+            "git diff",
+            "show diff",
+            "git push",
+            "in the repo",
+            "in the repository",
         )
         if any(m in text for m in strong_markers):
             return True

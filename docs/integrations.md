@@ -280,6 +280,46 @@ kendr run \
   "Send a WhatsApp template message."
 ```
 
+### GitHub
+
+Enables `github_agent` to autonomously operate on GitHub repositories from a
+natural language task description.
+
+**Required env:** `GITHUB_TOKEN`
+**Optional env:** `GITHUB_API_URL` (default: `https://api.github.com` — override for GitHub Enterprise)
+
+```bash
+kendr setup set github GITHUB_TOKEN ghp_...
+```
+
+**Supported operations:** clone repo, pull, create/switch branch, read/write file,
+commit, push, diff, list/get issues, add comment, create PR, merge PR.
+
+**Token scopes required:**
+- Public repos: `public_repo`
+- Private repos: `repo`
+- PR merge with workflow changes: `repo` + `workflow`
+
+**Security model:**
+The PAT is never embedded in the git remote URL. Authentication is injected via
+`http.extraHeader` through git's `GIT_CONFIG_COUNT / GIT_CONFIG_KEY_* / GIT_CONFIG_VALUE_*`
+environment variables — not visible in `ps aux` or stored in `.git/config`.
+All file read/write ops enforce path-traversal protection.
+
+**Example task:**
+
+```bash
+kendr run "Fix the failing test in acme-corp/my-service and open a PR with the fix."
+```
+
+**Test the connection:**
+```bash
+kendr setup show github
+# Or from the Setup UI: open the GitHub card → Test connection
+```
+
+---
+
 ### AWS
 
 AWS credentials are resolved through the standard boto3 credential chain: env vars, `~/.aws/credentials` profile, or instance role. No configuration is strictly required if an instance profile is active.
