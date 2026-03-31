@@ -184,6 +184,46 @@ class TestAsyncBridge(unittest.TestCase):
         result = client.is_branch_ahead_of_base(nonexistent, "feature", "main")
         self.assertTrue(result, "Should return True (permissive) when repo dir does not exist")
 
+    def test_git_env_sets_author_identity_for_fresh_environments(self):
+        from tasks.github_client import GitHubClient
+        import os
+        env_backup = {k: os.environ.pop(k, None) for k in [
+            "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL",
+            "KENDR_GIT_AUTHOR_NAME", "KENDR_GIT_AUTHOR_EMAIL",
+        ]}
+        try:
+            client = GitHubClient(token="ghp_test")
+            env = client._git_env()
+            self.assertIn("GIT_AUTHOR_NAME", env)
+            self.assertIn("GIT_AUTHOR_EMAIL", env)
+            self.assertIn("GIT_COMMITTER_NAME", env)
+            self.assertIn("GIT_COMMITTER_EMAIL", env)
+            self.assertTrue(env["GIT_AUTHOR_NAME"])
+            self.assertTrue(env["GIT_AUTHOR_EMAIL"])
+        finally:
+            for k, v in env_backup.items():
+                if v is not None:
+                    os.environ[k] = v
+
+    def test_commit_succeeds_without_global_git_config(self):
+        """Integration: commit via GitHubClient must work on fresh envs (no global user.name)."""
+        import subprocess
+        from tasks.github_client import GitHubClient
+
+        repo_dir = Path(tempfile.mkdtemp())
+        subprocess.run(["git", "init", str(repo_dir)], check=True, capture_output=True)
+        test_file = repo_dir / "hello.txt"
+        test_file.write_text("hello world\n")
+
+        client = GitHubClient(token="")
+        result = client.commit(repo_dir, "test commit from kendr-agent", add_all=True)
+        self.assertIsInstance(result, str)
+        log = subprocess.run(
+            ["git", "log", "--oneline"], cwd=str(repo_dir), capture_output=True, text=True
+        )
+        self.assertIn("test commit from kendr-agent", log.stdout)
+
     def test_git_env_token_not_in_remote_url(self):
         from tasks.github_client import GitHubClient
         client = GitHubClient(token="ghp_secret")

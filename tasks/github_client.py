@@ -160,6 +160,12 @@ class AsyncGitHubClient:
         """
         env = os.environ.copy()
         env["GIT_TERMINAL_PROMPT"] = "0"
+
+        env.setdefault("GIT_AUTHOR_NAME", os.getenv("KENDR_GIT_AUTHOR_NAME", "kendr-agent"))
+        env.setdefault("GIT_AUTHOR_EMAIL", os.getenv("KENDR_GIT_AUTHOR_EMAIL", "kendr-agent@kendr.local"))
+        env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+        env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+
         if self.token:
             credentials = base64.b64encode(
                 f"x-access-token:{self.token}".encode()
