@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import uuid
 from collections.abc import Mapping
@@ -889,6 +890,93 @@ class AgentRuntime:
         )
         return any(marker in text for marker in markers)
 
+    # ------------------------------------------------------------------
+    # Conversational shortcut — intent classification
+    # ------------------------------------------------------------------
+
+    _GREETING_RE = re.compile(
+        r"^(hi(\s+there)?|hello(\s+there)?|hey(\s+there)?|howdy|hiya|sup|yo|greetings|salut|aloha"
+        r"|good\s+(morning|afternoon|evening|night|day)"
+        r"|how([\s']*are[\s']*you(\s+doing)?|[\s']*r[\s']*u)?[\s!?]*"
+        r"|what['\s]*s[\s]*(up|good|new)[\s!?]*"
+        r"|how['\s]*s[\s]*(it\s+going|everything|things)[\s!?]*)[\s!?.]*$",
+        re.IGNORECASE,
+    )
+    _FAREWELL_RE = re.compile(
+        r"^(bye|goodbye|good[\s-]?bye|see\s+you|see\s+ya|later|cya|ta[\s-]?ta"
+        r"|take\s+care|have\s+a\s+(good|great|nice)\s+(day|one)|cheers|until\s+next\s+time)[\s!.]*$",
+        re.IGNORECASE,
+    )
+    _THANKS_RE = re.compile(
+        r"^(thank(s|\s+you)(\s+so\s+much|\s+a\s+lot|\s+very\s+much)?|thx|ty|thnx|np|no\s+problem"
+        r"|you['\s]*re\s+welcome|no\s+worries|not\s+at\s+all|anytime)[\s!.]*$",
+        re.IGNORECASE,
+    )
+    _ACK_RE = re.compile(
+        r"^(ok|okay|k|alright|sure|yep|yup|yeah|yes|noted|got\s+it|understood|roger"
+        r"|makes\s+sense|sounds\s+good|great|perfect|nice|cool|good|awesome"
+        r"|i\s+see|i\s+understand|fair\s+enough)[\s!.]*$",
+        re.IGNORECASE,
+    )
+    _CAPABILITY_RE = re.compile(
+        r"(what\s+can\s+you\s+do|what\s+are\s+(you|your\s+capabilities)|what\s+do\s+you\s+do"
+        r"|tell\s+me\s+about\s+yourself|who\s+are\s+you|what\s+is\s+kendr|what['\s]*s\s+kendr"
+        r"|^help[\s!?.]*$|how\s+can\s+you\s+help|what\s+features|what\s+(else\s+)?can\s+you\s+help)",
+        re.IGNORECASE,
+    )
+
+    _KENDR_CAPABILITIES = (
+        "Here's what I can help you with:\n\n"
+        "- **Software development** — create projects, write and review code, fix bugs\n"
+        "- **GitHub** — clone repos, create branches, commit, push, open pull requests\n"
+        "- **Research** — web search, document analysis, summarisation\n"
+        "- **File management** — read, write, organise files in your working directory\n"
+        "- **Terminal commands** — run shell commands safely\n"
+        "- **Data analysis** — process spreadsheets, CSVs, and structured data\n"
+        "- **Email & calendar** — draft and send via Gmail, Outlook, or Slack\n"
+        "- **System setup** — configure integrations and API connections\n\n"
+        "Just describe what you want and I'll figure out the best way to help."
+    )
+
+    def _direct_response_if_conversational(
+        self, text: str, state: dict
+    ) -> str | None:
+        """Return a direct plain-text reply when *text* is a simple social or
+        meta message that does not require the planner or any agent.
+
+        Returns ``None`` to let the orchestrator proceed normally.
+
+        Safety guards — returns None when:
+        - The message is longer than 120 characters (likely a real task)
+        - There are active plan steps (mid-task context)
+        - A pending user-input question is waiting for a reply
+        """
+        text = (text or "").strip()
+        if not text or len(text) > 120:
+            return None
+        if state.get("plan_steps") or state.get("plan_needs_clarification"):
+            return None
+        if str(state.get("pending_user_input_kind", "")).strip():
+            return None
+
+        if self._GREETING_RE.match(text):
+            return (
+                "Hi! I'm kendr, your multi-agent assistant. "
+                "I can help you with software development, research, GitHub, "
+                "file management, data analysis, and more.\n\n"
+                "What would you like to work on?"
+            )
+        if self._FAREWELL_RE.match(text):
+            return "Goodbye! Feel free to come back whenever you need help."
+        if self._THANKS_RE.match(text):
+            return "You're welcome! Let me know if there's anything else I can help with."
+        if self._ACK_RE.match(text):
+            return "Got it! Let me know whenever you're ready to continue."
+        if self._CAPABILITY_RE.search(text):
+            return self._KENDR_CAPABILITIES
+
+        return None
+
     def _is_github_request(self, state: dict) -> bool:
         """Return True when the query is a clear GitHub / git repository intent.
 
@@ -1410,6 +1498,27 @@ class AgentRuntime:
                 ),
             )
             return state
+
+        # --- Conversational shortcut: bypass planner for simple social/meta messages ---
+        # Only fires in the actual task-execution phase:
+        #   - Direct/CLI invocations (no channel routing needed), OR
+        #   - Web UI after channel_gateway_agent + session_router_agent have run
+        # Short-circuits to a direct answer without touching the LLM planner or any agent.
+        in_task_phase = (
+            not state.get("incoming_payload")
+            or (state.get("gateway_message") and state.get("channel_session"))
+        )
+        if in_task_phase and state["orchestrator_calls"] <= 5:
+            direct = self._direct_response_if_conversational(current_objective, state)
+            if direct:
+                state["next_agent"] = "__finish__"
+                state["final_output"] = direct
+                state = append_message(
+                    state,
+                    make_message("orchestrator_agent", "user", "final", direct),
+                )
+                log_task_update("Orchestrator", "Conversational shortcut — skipping planner.")
+                return state
 
         # --- Dev pipeline: finalization — terminate when pipeline is done ---
         dev_pipeline_status = str(state.get("dev_pipeline_status", "")).strip().lower()
