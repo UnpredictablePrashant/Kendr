@@ -3883,7 +3883,12 @@ def _cmd_ui(args: argparse.Namespace) -> int:
 
     from .ui_server import main as ui_main
 
-    ui_main()
+    try:
+        ui_main()
+    except OSError as _bind_err:
+        print(f"[ui] Cannot bind port {ui_port}: {_bind_err}")
+        print(f"[ui] If UI is already running, visit {ui_url}")
+        return 1
     return 0
 
 

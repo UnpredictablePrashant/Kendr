@@ -1370,8 +1370,9 @@ def main() -> None:
     host = os.getenv("KENDR_UI_HOST", _UI_HOST)
     port = int(os.getenv("KENDR_UI_PORT", str(_UI_PORT)))
     server = ThreadingHTTPServer((host, port), KendrUIHandler)
-    display_url = f"http://localhost:{port}"
-    print(f"Kendr UI running at {display_url}")
+    _display_host = "localhost" if host in ("0.0.0.0", "") else host
+    display_url = f"http://{_display_host}:{port}"
+    print(f"Kendr UI running at {display_url}  (bound to {host}:{port})")
     print(f"  Chat:   {display_url}/")
     print(f"  Setup:  {display_url}/setup")
     print(f"  Runs:   {display_url}/runs")
