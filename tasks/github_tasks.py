@@ -96,6 +96,63 @@ def _parse_repo_slug(text: str) -> tuple[str, str] | None:
     return None
 
 
+def _resolve_target_file(task: str) -> str:
+    """Ask the LLM to identify the single most relevant file path to modify for *task*.
+
+    Returns a relative file path string (e.g. "src/utils.py") or "" if the LLM
+    cannot determine one.  Used by the canonical PR planner to build a deterministic
+    write_file operation without requiring the full operation planner.
+    """
+    prompt = f"""Given this GitHub task, identify the single most relevant file to modify.
+Return ONLY the relative file path (e.g. 'src/utils.py' or 'tests/test_api.py').
+If you cannot determine a specific file from the task description, return an empty string.
+
+Task: {task}
+
+File path:"""
+    try:
+        response = llm.invoke(prompt)
+        raw = response.content if hasattr(response, "content") else str(response)
+        path = normalize_llm_text(raw).strip().strip('"\'`').strip()
+        if "\n" in path or len(path) > 200 or not path:
+            return ""
+        return path
+    except Exception:
+        return ""
+
+
+_PR_INTENT_MARKERS = frozenset({"pr", "pull request", "open a pr", "submit a pr", "create a pr"})
+
+
+def _wants_pr(task: str) -> bool:
+    """Return True when the task text explicitly requests a pull request."""
+    lower = task.lower()
+    return any(m in lower for m in _PR_INTENT_MARKERS)
+
+
+def _canonical_pr_plan(task: str, owner: str, repo: str) -> list[dict]:
+    """Return a deterministic operation sequence for tasks that request a PR.
+
+    Sequence: clone_repo -> create_branch -> write_file (LLM-identified path) ->
+    commit -> push -> create_pr.
+
+    If no target file can be determined, returns an empty list so the caller
+    falls back to the LLM-planned or exploration paths.
+    """
+    target_file = _resolve_target_file(task)
+    if not target_file:
+        return []
+    branch = f"kendr/fix-{int(__import__('time').time())}"
+    return [
+        {"op": "clone_repo", "params": {}},
+        {"op": "create_branch", "params": {"branch": branch}},
+        {"op": "write_file", "params": {"file_path": target_file}},
+        {"op": "commit", "params": {"message": f"kendr: {task[:72]}"}},
+        {"op": "push", "params": {}},
+        {"op": "create_pr", "params": {"title": f"kendr: {task[:60]}", "head": branch, "base": "main"}},
+    ]
+
+
 def _plan_operations(task: str) -> dict:
     """Ask the LLM to decompose *task* into a sequence of GitHub operations."""
     prompt = f"""
@@ -185,22 +242,10 @@ Instructions:
 def _fallback_operations(task: str) -> list[dict]:
     """Return a minimal deterministic operation sequence based on task keywords.
 
-    Used only when the LLM plan produces zero operations so the agent always
-    returns something meaningful rather than an empty success.
-
-    Design constraint — NO commit/push/create_pr in fallback:
-        Push and PR operations require prior file modifications.  The fallback
-        has no mechanism to guarantee files were edited, so including those ops
-        would reliably fail at the `is_branch_ahead_of_base` guard.  When the
-        task genuinely requires a PR, the LLM planner (``_plan_operations``)
-        is responsible for emitting a write_file → commit → push → create_pr
-        sequence.  The fallback is a diagnostic/exploration safety net only.
-
-    Note on test-run loops:
-        Autonomous test discovery, execution, and iterative fix loops are
-        handled by the Testing Agent (Task #11), which is a separate kendr
-        component.  github_agent's role is repository operations only; it does
-        not shell-run test suites.
+    Used only when the LLM plan produces zero operations.  commit/push/create_pr
+    are intentionally absent: they require prior file modifications that this
+    path cannot guarantee.  PR flows are handled by the LLM planner or the
+    canonical deterministic planner (_canonical_pr_plan).
     """
     lower = task.lower()
     ops: list[dict] = []
@@ -432,17 +477,27 @@ def github_agent(state):
         operations = []
 
     if not operations:
-        if resolved_owner and resolved_repo:
-            fallback_ops = _fallback_operations(task)
-            log_task_update(
-                "GitHub Agent",
-                f"LLM plan produced no operations; using keyword-based fallback ({len(fallback_ops)} op(s)).",
-            )
-            operations = fallback_ops
-        else:
+        if not (resolved_owner and resolved_repo):
             raise ValueError(
                 "github_agent: LLM plan produced no operations and no owner/repo could be identified. "
                 "Provide 'github_owner'/'github_repo' in state or include 'owner/repo' in the task."
+            )
+        if _wants_pr(task):
+            canon = _canonical_pr_plan(task, resolved_owner, resolved_repo)
+            if canon:
+                log_task_update("GitHub Agent", f"Using canonical fix+PR plan ({len(canon)} ops).")
+                operations = canon
+            else:
+                log_task_update(
+                    "GitHub Agent",
+                    "Could not identify target file for PR; using exploration fallback.",
+                )
+                operations = _fallback_operations(task)
+        else:
+            operations = _fallback_operations(task)
+            log_task_update(
+                "GitHub Agent",
+                f"LLM plan empty; using exploration fallback ({len(operations)} op(s)).",
             )
 
     log_task_update(
@@ -458,6 +513,17 @@ def github_agent(state):
         work_dir=work_dir,
         task=task,
     )
+
+    if _wants_pr(task) and not pr_url:
+        planned_has_pr = any(
+            str(entry.get("op", "")) == "create_pr" for entry in operations
+        )
+        if planned_has_pr:
+            raise RuntimeError(
+                "github_agent: task requested a pull request but no PR URL was produced. "
+                "Check operation log for failures (e.g. 'no commits ahead of base', auth errors, "
+                "or network issues). Operations attempted: " + "; ".join(log_lines[:10])
+            )
 
     ops_log = "\n".join(log_lines)
     issues_text = json.dumps(issues, indent=2, ensure_ascii=False) if issues else ""

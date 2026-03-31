@@ -388,6 +388,36 @@ class TestGitHubAgentMockedExecution(unittest.TestCase):
 
         self.assertTrue(any("skipped" in line for line in log_lines))
 
+    def test_wants_pr_detects_pr_intent(self):
+        from tasks.github_tasks import _wants_pr
+        self.assertTrue(_wants_pr("fix the test and open a pull request"))
+        self.assertTrue(_wants_pr("create a pr to fix the bug"))
+        self.assertTrue(_wants_pr("fix and open a pr"))
+        self.assertFalse(_wants_pr("list all issues"))
+        self.assertFalse(_wants_pr("clone the repo and show the diff"))
+
+    def test_canonical_pr_plan_returns_full_sequence_when_file_resolved(self):
+        from unittest.mock import patch
+        from tasks.github_tasks import _canonical_pr_plan
+        with patch("tasks.github_tasks._resolve_target_file", return_value="src/utils.py"):
+            ops = _canonical_pr_plan("fix the test and open a pr", "acme", "api")
+        names = [o["op"] for o in ops]
+        self.assertEqual(names[0], "clone_repo")
+        self.assertIn("create_branch", names)
+        self.assertIn("write_file", names)
+        self.assertIn("commit", names)
+        self.assertIn("push", names)
+        self.assertIn("create_pr", names)
+        write_op = next(o for o in ops if o["op"] == "write_file")
+        self.assertEqual(write_op["params"]["file_path"], "src/utils.py")
+
+    def test_canonical_pr_plan_returns_empty_when_file_not_resolved(self):
+        from unittest.mock import patch
+        from tasks.github_tasks import _canonical_pr_plan
+        with patch("tasks.github_tasks._resolve_target_file", return_value=""):
+            ops = _canonical_pr_plan("fix the test and open a pr", "acme", "api")
+        self.assertEqual(ops, [])
+
     def test_fallback_plan_conservative_no_pr_or_push(self):
         from tasks.github_tasks import _fallback_operations
         ops = _fallback_operations("fix broken test and open a pull request")
