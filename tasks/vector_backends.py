@@ -177,9 +177,11 @@ def get_vector_backend() -> VectorBackend:
         pass
 
     if qdrant_url:
-        print(f"[vector] Falling back to Qdrant at {qdrant_url} (chromadb not installed)", file=sys.stderr)
+        print(f"[vector] chromadb not installed; falling back to Qdrant at {qdrant_url}", file=sys.stderr)
         _BACKEND_CACHE = QdrantBackend(url=qdrant_url)
-    else:
-        print("[vector] Falling back to Qdrant at default URL (chromadb not installed, QDRANT_URL not set)", file=sys.stderr)
-        _BACKEND_CACHE = QdrantBackend(url=DEFAULT_QDRANT_URL)
-    return _BACKEND_CACHE
+        return _BACKEND_CACHE
+
+    raise RuntimeError(
+        "[vector] No vector backend available: chromadb is not installed and QDRANT_URL is not set. "
+        "Install chromadb (`pip install chromadb`) or set the QDRANT_URL environment variable."
+    )
