@@ -1068,7 +1068,7 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query or "")
             run_id = (params.get("run_id") or [""])[0]
             name = (params.get("name") or [""])[0]
-            if not run_id or not name or "/" in name or name.startswith("."):
+            if not run_id or not name or "/" in name or "\\" in name or name.startswith("."):
                 self._json(400, {"error": "invalid_request"})
                 return
             try:
