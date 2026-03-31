@@ -111,6 +111,15 @@ class RuntimeState(TypedDict, total=False):
     skip_test_agent: bool
     skip_devops_agent: bool
     user_cancelled: bool
+    # Dev pipeline state
+    dev_pipeline_mode: bool
+    dev_pipeline_status: str
+    dev_pipeline_stages_completed: list[str]
+    dev_pipeline_error: str
+    dev_pipeline_zip_path: str
+    dev_pipeline_max_fix_rounds: int
+    project_verifier_status: str
+    project_verifier_output: str
 
 
 class ResumeCandidate(TypedDict, total=False):

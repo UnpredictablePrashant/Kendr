@@ -1264,6 +1264,27 @@ class AgentRuntime:
             )
             return state
 
+        # --- Dev pipeline: full end-to-end orchestration (blueprint → build → verify → zip) ---
+        if (
+            bool(state.get("dev_pipeline_mode", False))
+            and not str(state.get("dev_pipeline_status", "")).strip()
+            and state.get("last_agent") != "dev_pipeline_agent"
+            and self._is_agent_available(state, "dev_pipeline_agent")
+        ):
+            state["project_build_mode"] = True
+            reason = (
+                "dev_pipeline_mode is set. Routing to dev_pipeline_agent for end-to-end "
+                "project generation: blueprint → scaffold → build → test → verify → zip."
+            )
+            state["orchestrator_reason"] = reason
+            state["next_agent"] = "dev_pipeline_agent"
+            state = append_task(state, make_task(
+                sender="orchestrator_agent", recipient="dev_pipeline_agent",
+                intent="dev-pipeline-dispatch", content=current_objective,
+                state_updates={"dev_pipeline_mode": True, "project_build_mode": True},
+            ))
+            return state
+
         # --- Project builder: blueprint before planning ---
         if (
             not state.get("plan_steps")
@@ -1271,6 +1292,7 @@ class AgentRuntime:
             and not state.get("blueprint_json")
             and self._is_agent_available(state, "project_blueprint_agent")
             and self._is_project_build_request(state)
+            and not bool(state.get("dev_pipeline_mode", False))
         ):
             state["project_build_mode"] = True
             reason = "Build request detected. Route to project_blueprint_agent for technical architecture."

@@ -1702,6 +1702,31 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
             "Implies --long-document mode. Example: --pages 50"
         ),
     )
+    run_parser.add_argument(
+        "--dev",
+        action="store_true",
+        help=(
+            "Activate the end-to-end dev pipeline mode: blueprint → scaffold → "
+            "build → test → verify (with auto-fix) → zip export. "
+            "Equivalent to 'kendr generate' with full pipeline orchestration."
+        ),
+    )
+    run_parser.add_argument(
+        "--dev-skip-tests",
+        action="store_true",
+        help="Skip test generation/execution in dev pipeline mode (--dev).",
+    )
+    run_parser.add_argument(
+        "--dev-skip-devops",
+        action="store_true",
+        help="Skip Dockerfile/CI/CD generation in dev pipeline mode (--dev).",
+    )
+    run_parser.add_argument(
+        "--dev-max-fix-rounds",
+        type=int,
+        default=3,
+        help="Max auto-fix rounds when verifier fails in dev pipeline mode (default 3).",
+    )
 
     agent_list = subparsers.add_parser("agents", help="List or inspect discovered agents.")
     command_parsers["agents"] = agent_list
@@ -2032,6 +2057,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         "max_steps": args.max_steps,
         "working_directory": resolved_working_dir,
         "project_build_mode": True,
+        "dev_pipeline_mode": True,
         "project_root": project_root,
     }
     if project_name:
@@ -2604,6 +2630,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         base_ingest_payload["skip_reviews"] = True
     if int(args.max_step_revisions or 0) > 0:
         base_ingest_payload["max_step_revisions"] = int(args.max_step_revisions)
+    if bool(getattr(args, "dev", False)):
+        base_ingest_payload["dev_pipeline_mode"] = True
+        base_ingest_payload["project_build_mode"] = True
+        base_ingest_payload["project_root"] = resolved_working_dir
+        if bool(getattr(args, "dev_skip_tests", False)):
+            base_ingest_payload["skip_test_agent"] = True
+        if bool(getattr(args, "dev_skip_devops", False)):
+            base_ingest_payload["skip_devops_agent"] = True
+        max_fix = int(getattr(args, "dev_max_fix_rounds", 3) or 3)
+        if max_fix != 3:
+            base_ingest_payload["dev_pipeline_max_fix_rounds"] = max_fix
 
     _ = _validate_run_workflows(args, query, resolved_working_dir, drive_paths, superrag_paths)
     workflow_status = _workflow_status_message(args, query, base_ingest_payload)

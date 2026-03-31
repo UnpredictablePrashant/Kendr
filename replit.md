@@ -117,7 +117,23 @@ Flags:
 - `--research-model MODEL` — Override deep-research model
 - `--auto-approve` — Auto-approve plan gates
 
+### New file: `tasks/dev_pipeline_tasks.py`
+- `dev_pipeline_agent(state)` — end-to-end synchronous pipeline orchestrator
+- Stages: blueprint → blueprint approval gate → scaffold → db → auth → backend → frontend → deps → tests → security scan → devops → verify → auto-fix loop → post-setup → zip export
+- **Blueprint approval gate**: Interactive y/n prompt (skipped when `auto_approve=True`)
+- **Auto-fix retry loop**: Up to `dev_pipeline_max_fix_rounds` (default 3) rounds — invokes `coding_agent` to fix when `project_verifier_agent` fails
+- **Zip export**: Packages generated project into `<project_name>.zip` in parent of `project_root`; writes path to `dev_pipeline_zip_path` state key
+- `dev_pipeline_zip_path` persisted to `dev_pipeline_zip_path.txt` in the output directory
+
+### `kendr run --dev` flag
+- `--dev` — activates `dev_pipeline_mode`, routes to `dev_pipeline_agent` instead of planner
+- `--dev-skip-tests` — omit test stage
+- `--dev-skip-devops` — omit devops stage
+- `--dev-max-fix-rounds N` — override auto-fix retry count (default 3)
+
 ### Runtime changes
 - `_is_project_build_request()` in `kendr/runtime.py` — now returns `True` immediately when `project_build_mode` is already set in state (avoids requiring NLP marker detection for `generate` command)
+- New routing block in `kendr/runtime.py` — routes to `dev_pipeline_agent` when `dev_pipeline_mode=True`; takes priority over individual `project_blueprint_agent` routing
 - `skip_test_agent: bool` and `skip_devops_agent: bool` added to `RuntimeState` in `kendr/orchestration/state.py`
+- New dev pipeline state keys: `dev_pipeline_mode`, `dev_pipeline_status`, `dev_pipeline_stages_completed`, `dev_pipeline_error`, `dev_pipeline_zip_path`, `dev_pipeline_max_fix_rounds`, `project_verifier_status`, `project_verifier_output`
 - Planner prompt updated to honor `skip_test_agent` and `skip_devops_agent` flags from planning context
