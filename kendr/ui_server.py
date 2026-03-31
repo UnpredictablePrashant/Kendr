@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import html as _html
 import json
+import logging
 import os
 import queue
 import threading
 import time
 import traceback
+
 import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+_log = logging.getLogger("kendr.ui")
 
 from tasks.setup_config_store import (
     apply_setup_env_defaults,
@@ -162,8 +166,8 @@ def _start_run_background(run_id: str, payload: dict) -> None:
                     if eid and eid not in seen:
                         seen.add(eid)
                         _push_event(run_id, "step", _format_step(step))
-            except Exception:
-                pass
+            except Exception as _step_exc:
+                _log.debug("Step poll error for run %s: %s", run_id, _step_exc)
             if done:
                 break
             time.sleep(0.6)
@@ -958,7 +962,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
 <div class="main">
   <div class="page-title">Run History</div>
   <table class="run-table">
-    <thead><tr><th>Query</th><th>Run ID</th><th>Status</th><th>Agent</th><th>Created</th></tr></thead>
+    <thead><tr><th>Query</th><th>Run ID</th><th>Status</th><th>Agent</th><th>Created</th><th>Files</th></tr></thead>
     <tbody id="runBody"><tr><td colspan="5" style="color:var(--muted);text-align:center;padding:24px">Loading...</td></tr></tbody>
   </table>
 </div>
@@ -969,12 +973,28 @@ async function load() {
     const r = await fetch('/api/runs');
     const runs = await r.json();
     const body = document.getElementById('runBody');
-    if (!runs || !runs.length) { body.innerHTML = '<tr><td colspan="5" style="color:var(--muted);text-align:center;padding:24px">No runs yet. Start a chat to create your first run.</td></tr>'; return; }
+    if (!runs || !runs.length) { body.innerHTML = '<tr><td colspan="6" style="color:var(--muted);text-align:center;padding:24px">No runs yet. Start a chat to create your first run.</td></tr>'; return; }
     body.innerHTML = runs.map(run => {
       const status = (run.status || 'completed').toLowerCase();
-      return '<tr><td style="max-width:320px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + esc(run.query||run.text||'') + '">' + esc((run.query||run.text||'\u2014').substring(0,80)) + '</td><td style="font-family:monospace;font-size:11px;color:var(--muted)">' + esc(run.run_id||'') + '</td><td><span class="badge ' + status + '">' + status + '</span></td><td style="color:var(--muted)">' + esc(run.last_agent||'') + '</td><td style="color:var(--muted);white-space:nowrap">' + esc(run.created_at||'') + '</td></tr>';
+      const rid = run.run_id || '';
+      return '<tr><td style="max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + esc(run.query||run.text||'') + '">' + esc((run.query||run.text||'\u2014').substring(0,70)) + '</td><td style="font-family:monospace;font-size:11px;color:var(--muted)">' + esc(rid) + '</td><td><span class="badge ' + status + '">' + status + '</span></td><td style="color:var(--muted)">' + esc(run.last_agent||'') + '</td><td style="color:var(--muted);white-space:nowrap">' + esc(run.created_at||'') + '</td><td><button onclick="showArtifacts(\'' + rid + '\', this)" style="background:none;border:1px solid var(--border);color:var(--teal);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px">\ud83d\udcc1</button></td></tr>';
     }).join('');
-  } catch(e) { document.getElementById('runBody').innerHTML = '<tr><td colspan="5" style="color:var(--crimson)">Error: ' + String(e) + '</td></tr>'; }
+  } catch(e) { document.getElementById('runBody').innerHTML = '<tr><td colspan="6" style="color:var(--crimson)">Error: ' + String(e) + '</td></tr>'; }
+}
+async function showArtifacts(runId, btn) {
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/runs/' + runId + '/artifacts');
+    const d = await r.json();
+    const files = (d.files || []);
+    if (!files.length) { btn.textContent = '\u2205 none'; return; }
+    const row = btn.closest('tr');
+    const extra = document.createElement('tr');
+    extra.innerHTML = '<td colspan="6" style="background:var(--surface2);padding:10px 16px"><strong style="font-size:11px;color:var(--muted)">ARTIFACTS</strong> ' +
+      files.map(f => '<a href="/api/artifacts/download?run_id=' + encodeURIComponent(runId) + '&name=' + encodeURIComponent(f.name) + '" download="' + esc(f.name) + '" style="color:var(--teal);text-decoration:underline;margin-right:12px;font-size:12px">' + esc(f.name) + '</a>').join('') + '</td>';
+    row.insertAdjacentElement('afterend', extra);
+    btn.style.display = 'none';
+  } catch(e) { btn.disabled = false; }
 }
 load();
 </script>
