@@ -6,7 +6,8 @@ A plugin-driven multi-agent runtime and orchestration system built on LangGraph/
 
 - **`kendr/`** — Core package: runtime, registry, discovery, CLI, gateway server, UI server, setup UI
 - **`tasks/`** — Built-in task agent modules (research, coding, security, file ops, etc.)
-- **`mcp_servers/`** — MCP server implementations (research, vector, security)
+- **`mcp_servers/`** — MCP server implementations (research, vector, security) + `example_fastmcp_server.py` (scaffolding)
+- **`kendr/mcp_manager.py`** — MCP client manager: register, connect, and auto-discover tools from any MCP server (HTTP/SSE or stdio). Persisted in `~/.kendr/mcp_registry.json`
 - **`app.py`** — Entry point: builds registry and workflow
 - **`kendr/ui_server.py`** — NEW: Kendr Web Chat & Config UI on port 2151 (`kendr ui`); implemented as server-rendered HTML/JS (no React/Vite build step) to avoid build tooling complexity in a pure-Python CLI tool
 - **`kendr/setup_ui.py`** — OAuth/Setup Console on port 8787 (`kendr setup ui`)

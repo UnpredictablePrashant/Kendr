@@ -72,6 +72,21 @@ except Exception:
 _UI_PORT = int(os.getenv("KENDR_UI_PORT", "2151"))
 _UI_HOST = os.getenv("KENDR_UI_HOST", "127.0.0.1")
 
+try:
+    from kendr.mcp_manager import (
+        list_servers as _mcp_list_servers,
+        get_server as _mcp_get_server,
+        add_server as _mcp_add_server,
+        remove_server as _mcp_remove_server,
+        toggle_server as _mcp_toggle_server,
+        discover_tools as _mcp_discover_tools,
+        SCAFFOLD_CODE as _MCP_SCAFFOLD_CODE,
+    )
+    _HAS_MCP_MANAGER = True
+except Exception as _mcp_import_exc:
+    _HAS_MCP_MANAGER = False
+    _log.warning("MCP manager not available: %s", _mcp_import_exc)
+
 _GATEWAY_HOST = os.getenv("GATEWAY_HOST", "127.0.0.1")
 _GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8790"))
 
@@ -306,6 +321,7 @@ a:hover { text-decoration: underline; }
     <a href="/" class="nav-btn active"><span class="icon">💬</span> Chat</a>
     <a href="/setup" class="nav-btn"><span class="icon">⚙️</span> Setup & Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">📋</span> Run History</a>
+    <a href="/mcp" class="nav-btn"><span class="icon">🧩</span> MCP Servers</a>
   </div>
   <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
   <div class="sidebar-section">Recent Runs</div>
@@ -738,6 +754,7 @@ a { color: var(--teal); }
     <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
     <a href="/setup" class="nav-btn active"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
   </div>
   <div class="category-nav" id="categoryNav"></div>
 </div>
@@ -946,6 +963,316 @@ loadEnvExport();
 </html>"""
 
 
+_MCP_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kendr &mdash; MCP Servers</title>
+<style>
+:root { --teal: #00C9A7; --amber: #FFB347; --crimson: #FF4757; --purple: #A78BFA; --bg: #0d0f14; --surface: #161b22; --surface2: #1e2530; --surface3: #252d3a; --border: #2a3140; --text: #e6edf3; --muted: #7d8590; --sidebar-w: 280px; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; }
+.sidebar { width: var(--sidebar-w); min-width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; bottom: 0; left: 0; }
+.sidebar-header { padding: 20px 16px 12px; border-bottom: 1px solid var(--border); }
+.logo { font-size: 22px; font-weight: 800; color: var(--teal); }
+.logo span { color: var(--amber); }
+.tagline { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.sidebar-nav { padding: 12px 8px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.nav-btn { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer; border: none; background: transparent; width: 100%; text-align: left; text-decoration: none; transition: background 0.15s, color 0.15s; }
+.nav-btn:hover { background: var(--surface2); color: var(--text); }
+.nav-btn.active { background: rgba(167,139,250,0.12); color: var(--purple); }
+.nav-btn .icon { font-size: 16px; width: 20px; text-align: center; }
+.main { flex: 1; margin-left: var(--sidebar-w); padding: 32px; max-width: 960px; }
+.page-title { font-size: 26px; font-weight: 700; margin-bottom: 6px; }
+.page-subtitle { font-size: 13px; color: var(--muted); margin-bottom: 28px; }
+/* Cards */
+.section-title { font-size: 13px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; margin: 28px 0 12px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin-bottom: 12px; }
+.card-header { display: flex; align-items: center; gap: 12px; }
+.server-name { font-size: 15px; font-weight: 600; flex: 1; }
+.server-meta { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+.badge.connected { background: rgba(0,201,167,0.15); color: var(--teal); }
+.badge.error { background: rgba(255,71,87,0.15); color: var(--crimson); }
+.badge.unknown { background: rgba(125,133,144,0.15); color: var(--muted); }
+.badge.http { background: rgba(0,201,167,0.1); color: var(--teal); }
+.badge.stdio { background: rgba(167,139,250,0.1); color: var(--purple); }
+.tools-toggle { background: none; border: 1px solid var(--border); color: var(--teal); border-radius: 6px; padding: 4px 10px; cursor: pointer; font-size: 12px; }
+.tools-toggle:hover { background: var(--surface2); }
+.btn { padding: 8px 16px; border-radius: 7px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: opacity 0.15s; }
+.btn:hover { opacity: 0.85; }
+.btn-primary { background: var(--teal); color: #0d0f14; }
+.btn-sm { padding: 5px 12px; font-size: 12px; }
+.btn-danger { background: rgba(255,71,87,0.12); color: var(--crimson); border: 1px solid rgba(255,71,87,0.3); }
+.btn-ghost { background: none; color: var(--muted); border: 1px solid var(--border); }
+.tool-list { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 12px; display: none; }
+.tool-list.open { display: block; }
+.tool-item { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+.tool-item:last-child { border-bottom: none; }
+.tool-name { font-family: monospace; font-size: 13px; color: var(--teal); font-weight: 600; min-width: 160px; }
+.tool-desc { font-size: 12px; color: var(--muted); flex: 1; }
+/* Add form */
+.form-section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+.form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-bottom: 14px; }
+.form-full { margin-bottom: 14px; }
+label { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 5px; text-transform: uppercase; letter-spacing: 0.05em; }
+input, select, textarea { width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 9px 12px; color: var(--text); font-size: 13px; outline: none; transition: border-color 0.15s; }
+input:focus, select:focus, textarea:focus { border-color: var(--teal); }
+textarea { resize: vertical; min-height: 60px; font-family: inherit; }
+.form-actions { display: flex; gap: 10px; align-items: center; }
+.msg { font-size: 12px; padding: 6px 10px; border-radius: 6px; }
+.msg.ok { background: rgba(0,201,167,0.1); color: var(--teal); }
+.msg.err { background: rgba(255,71,87,0.1); color: var(--crimson); }
+/* Scaffold */
+.scaffold-box { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 16px; position: relative; }
+.scaffold-box pre { font-family: "Cascadia Code", "Fira Code", monospace; font-size: 12px; color: #b5c4de; white-space: pre-wrap; word-break: break-word; max-height: 420px; overflow-y: auto; }
+.copy-btn { position: absolute; top: 10px; right: 10px; background: var(--surface); border: 1px solid var(--border); color: var(--teal); border-radius: 6px; padding: 4px 10px; font-size: 11px; cursor: pointer; }
+.copy-btn:hover { background: var(--surface2); }
+/* Toggle switch */
+.toggle { position: relative; display: inline-block; width: 34px; height: 20px; }
+.toggle input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; cursor: pointer; inset: 0; background: var(--border); border-radius: 20px; transition: 0.2s; }
+.slider:before { position: absolute; content: ""; height: 14px; width: 14px; left: 3px; bottom: 3px; background: #fff; border-radius: 50%; transition: 0.2s; }
+input:checked + .slider { background: var(--teal); }
+input:checked + .slider:before { transform: translateX(14px); }
+.disc-spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--teal); border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.error-box { background: rgba(255,71,87,0.07); border: 1px solid rgba(255,71,87,0.25); border-radius: 6px; padding: 8px 12px; font-size: 12px; color: var(--crimson); margin-top: 10px; }
+::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="sidebar">
+  <div class="sidebar-header"><div class="logo">kendr<span>.</span></div><div class="tagline">Multi-agent intelligence runtime</div></div>
+  <div class="sidebar-nav">
+    <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
+    <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
+    <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/mcp" class="nav-btn active"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+  </div>
+</div>
+<div class="main">
+  <div class="page-title">MCP Servers</div>
+  <div class="page-subtitle">Connect kendr to any MCP server &mdash; kendr acts as the client, just like Cursor. Tools are auto-discovered.</div>
+
+  <!-- Add server form -->
+  <div class="section-title">Connect a New MCP Server</div>
+  <div class="form-section">
+    <div class="form-row">
+      <div>
+        <label>Server Name</label>
+        <input type="text" id="addName" placeholder="e.g. My Research Server">
+      </div>
+      <div>
+        <label>Type</label>
+        <select id="addType" onchange="toggleTypeHint()">
+          <option value="http">HTTP / SSE</option>
+          <option value="stdio">Stdio (shell command)</option>
+        </select>
+      </div>
+    </div>
+    <div class="form-full">
+      <label id="connLabel">Connection URL</label>
+      <input type="text" id="addConn" placeholder="http://localhost:8000/mcp">
+      <div id="connHint" style="font-size:11px;color:var(--muted);margin-top:4px">HTTP or SSE endpoint — e.g. http://localhost:8000/mcp</div>
+    </div>
+    <div class="form-full">
+      <label>Description (optional)</label>
+      <textarea id="addDesc" rows="2" placeholder="What does this server provide?"></textarea>
+    </div>
+    <div class="form-actions">
+      <button class="btn btn-primary" onclick="addServer()">Connect &amp; Discover Tools</button>
+      <span id="addMsg"></span>
+    </div>
+  </div>
+
+  <!-- Registered servers -->
+  <div class="section-title">Registered Servers</div>
+  <div id="serverList"><div style="color:var(--muted);font-size:13px">Loading...</div></div>
+
+  <!-- Scaffold section -->
+  <div class="section-title" style="margin-top:36px">How to Build Your Own MCP Server</div>
+  <p style="font-size:13px;color:var(--muted);margin-bottom:14px">
+    Any Python function decorated with <code style="color:var(--teal)">@mcp.tool</code> becomes a discoverable tool.
+    Run the server, then add it above. Uses <a href="https://github.com/jlowin/fastmcp" target="_blank" style="color:var(--teal)">FastMCP</a>.
+  </p>
+  <div class="scaffold-box">
+    <button class="copy-btn" onclick="copyScaffold()">Copy</button>
+    <pre id="scaffoldCode">Loading...</pre>
+  </div>
+  <p style="font-size:12px;color:var(--muted);margin-top:10px">
+    The full example is at <code style="color:var(--teal)">mcp_servers/example_fastmcp_server.py</code> &mdash; run with <code style="color:var(--teal)">python mcp_servers/example_fastmcp_server.py</code>
+  </p>
+</div>
+
+<script>
+const API = '';
+
+function toggleTypeHint() {
+  const t = document.getElementById('addType').value;
+  const lbl = document.getElementById('connLabel');
+  const inp = document.getElementById('addConn');
+  const hint = document.getElementById('connHint');
+  if (t === 'stdio') {
+    lbl.textContent = 'Shell Command';
+    inp.placeholder = 'python mcp_servers/my_server.py';
+    hint.textContent = 'Shell command to launch the stdio MCP server process';
+  } else {
+    lbl.textContent = 'Connection URL';
+    inp.placeholder = 'http://localhost:8000/mcp';
+    hint.textContent = 'HTTP or SSE endpoint — e.g. http://localhost:8000/mcp';
+  }
+}
+
+async function addServer() {
+  const name = document.getElementById('addName').value.trim();
+  const type = document.getElementById('addType').value;
+  const conn = document.getElementById('addConn').value.trim();
+  const desc = document.getElementById('addDesc').value.trim();
+  const msg = document.getElementById('addMsg');
+  if (!name) { showMsg(msg, 'Server name is required', 'err'); return; }
+  if (!conn) { showMsg(msg, 'Connection is required', 'err'); return; }
+  showMsg(msg, '<span class="disc-spinner"></span> Connecting and discovering tools…', 'ok');
+  try {
+    const r = await fetch(API + '/api/mcp/servers', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ name, type, connection: conn, description: desc })
+    });
+    const d = await r.json();
+    if (d.ok || d.server_id) {
+      showMsg(msg, '&#x2713; Connected — ' + (d.tool_count || 0) + ' tool(s) discovered', 'ok');
+      document.getElementById('addName').value = '';
+      document.getElementById('addConn').value = '';
+      document.getElementById('addDesc').value = '';
+      await loadServers();
+    } else {
+      showMsg(msg, 'Error: ' + (d.error || JSON.stringify(d)), 'err');
+    }
+  } catch(e) { showMsg(msg, 'Request failed: ' + e, 'err'); }
+}
+
+function showMsg(el, text, cls) {
+  el.className = 'msg ' + cls;
+  el.innerHTML = text;
+}
+
+async function loadServers() {
+  const box = document.getElementById('serverList');
+  try {
+    const r = await fetch(API + '/api/mcp/servers');
+    const servers = await r.json();
+    if (!servers.length) {
+      box.innerHTML = '<div style="color:var(--muted);font-size:13px;padding:16px 0">No servers registered yet. Add one above.</div>';
+      return;
+    }
+    box.innerHTML = servers.map(s => renderServer(s)).join('');
+  } catch(e) {
+    box.innerHTML = '<div style="color:var(--crimson);font-size:13px">Failed to load servers: ' + e + '</div>';
+  }
+}
+
+function renderServer(s) {
+  const statusCls = s.status === 'connected' ? 'connected' : s.status === 'error' ? 'error' : 'unknown';
+  const statusLabel = s.status === 'connected' ? '&#x25CF; Connected' : s.status === 'error' ? '&#x25CF; Error' : '&#x25CB; Unknown';
+  const typeBadge = '<span class="badge ' + s.type + '">' + (s.type === 'http' ? 'HTTP' : 'stdio') + '</span>';
+  const lastDisc = s.last_discovered ? 'Last discovered: ' + s.last_discovered.replace('T',' ').replace('Z','') + ' UTC' : 'Not yet discovered';
+  const toolCount = s.tool_count || 0;
+  const toolsId = 'tools-' + s.id;
+  const toolRows = (s.tools || []).map(t =>
+    '<div class="tool-item"><span class="tool-name">' + esc(t.name) + '</span><span class="tool-desc">' + esc(t.description || '—') + '</span></div>'
+  ).join('');
+  const errorBox = (s.error && s.status === 'error') ? '<div class="error-box">&#x26A0; ' + esc(s.error) + '</div>' : '';
+  return `<div class="card" id="srv-${s.id}">
+  <div class="card-header">
+    <div style="flex:1">
+      <div class="server-name">${esc(s.name)} ${typeBadge}</div>
+      <div class="server-meta">${esc(s.connection)} &mdash; <span class="badge ${statusCls}">${statusLabel}</span> &mdash; ${toolCount} tool${toolCount !== 1 ? 's' : ''} &mdash; ${esc(lastDisc)}</div>
+      ${s.description ? '<div class="server-meta" style="margin-top:2px">' + esc(s.description) + '</div>' : ''}
+    </div>
+    <label class="toggle" title="${s.enabled ? 'Enabled' : 'Disabled'}">
+      <input type="checkbox" ${s.enabled ? 'checked' : ''} onchange="toggleServer('${s.id}', this.checked)">
+      <span class="slider"></span>
+    </label>
+  </div>
+  ${errorBox}
+  <div style="display:flex;gap:8px;margin-top:12px;align-items:center">
+    <button class="btn btn-sm btn-ghost" onclick="discoverTools('${s.id}', this)">&#x1F50D; Re-discover Tools</button>
+    ${toolCount > 0 ? '<button class="tools-toggle" onclick="toggleTools(\'' + toolsId + '\', this)">\u25bc ' + toolCount + ' tools</button>' : ''}
+    <button class="btn btn-sm btn-danger" onclick="removeServer('${s.id}')">Remove</button>
+  </div>
+  <div class="tool-list" id="${toolsId}">
+    ${toolRows || '<div style="color:var(--muted);font-size:12px">No tools discovered yet. Click Re-discover.</div>'}
+  </div>
+</div>`;
+}
+
+function toggleTools(id, btn) {
+  const el = document.getElementById(id);
+  el.classList.toggle('open');
+  btn.textContent = el.classList.contains('open') ? '\u25b2 hide tools' : '\u25bc ' + btn.textContent.replace(/[▼▲]\s*/,'');
+}
+
+async function discoverTools(serverId, btn) {
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="disc-spinner"></span> Discovering…';
+  try {
+    const r = await fetch(API + '/api/mcp/servers/' + serverId + '/discover', { method: 'POST' });
+    const d = await r.json();
+    await loadServers();
+  } catch(e) { alert('Discovery failed: ' + e); }
+  btn.disabled = false;
+  btn.textContent = orig;
+}
+
+async function removeServer(serverId) {
+  if (!confirm('Remove this MCP server?')) return;
+  try {
+    await fetch(API + '/api/mcp/servers/' + serverId + '/remove', { method: 'POST' });
+    await loadServers();
+  } catch(e) { alert('Remove failed: ' + e); }
+}
+
+async function toggleServer(serverId, enabled) {
+  try {
+    await fetch(API + '/api/mcp/servers/' + serverId + '/toggle', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ enabled })
+    });
+  } catch(e) { console.warn('Toggle failed', e); }
+}
+
+async function loadScaffold() {
+  try {
+    const r = await fetch(API + '/api/mcp/scaffold');
+    const d = await r.json();
+    document.getElementById('scaffoldCode').textContent = d.code || '';
+  } catch(e) {
+    document.getElementById('scaffoldCode').textContent = '# Could not load scaffold: ' + e;
+  }
+}
+
+function copyScaffold() {
+  const code = document.getElementById('scaffoldCode').textContent;
+  navigator.clipboard.writeText(code).then(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy', 1800);
+  });
+}
+
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+loadServers();
+loadScaffold();
+</script>
+</body>
+</html>"""
+
+
 _RUNS_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -986,6 +1313,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
     <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn active"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
   </div>
 </div>
 <div class="main">
@@ -1076,6 +1404,9 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/runs":
             self._html(200, _RUNS_HTML)
+            return
+        if path == "/mcp":
+            self._html(200, _MCP_HTML)
             return
         if path == "/api/health":
             self._json(200, {"service": "kendr-ui", "status": "ok"})
@@ -1208,6 +1539,19 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             provider = path[len("/api/oauth/"):-len("/callback")]
             self._handle_oauth_callback(provider, parse_qs(parsed.query or ""))
             return
+        if path == "/api/mcp/servers":
+            if not _HAS_MCP_MANAGER:
+                self._json(503, {"error": "MCP manager not available"})
+                return
+            try:
+                self._json(200, _mcp_list_servers())
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
+        if path == "/api/mcp/scaffold":
+            code = _MCP_SCAFFOLD_CODE if _HAS_MCP_MANAGER else "# fastmcp not installed"
+            self._json(200, {"code": code})
+            return
         if path in ("/api/stream", "/stream"):
             params = parse_qs(parsed.query or "")
             run_id = (params.get("run_id") or [""])[0]
@@ -1238,6 +1582,23 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/setup/enabled":
             self._handle_setup_enabled(body)
+            return
+        if path == "/api/mcp/servers":
+            self._handle_mcp_add(body)
+            return
+        if path.startswith("/api/mcp/servers/"):
+            rest = path[len("/api/mcp/servers/"):]
+            if rest.endswith("/discover"):
+                server_id = rest[:-len("/discover")]
+                self._handle_mcp_discover(server_id)
+            elif rest.endswith("/remove"):
+                server_id = rest[:-len("/remove")]
+                self._handle_mcp_remove(server_id)
+            elif rest.endswith("/toggle"):
+                server_id = rest[:-len("/toggle")]
+                self._handle_mcp_toggle(server_id, body)
+            else:
+                self._json(404, {"error": "not_found"})
             return
         self._json(404, {"error": "not_found"})
 
@@ -1428,6 +1789,63 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
+    def _handle_mcp_add(self, body: dict) -> None:
+        if not _HAS_MCP_MANAGER:
+            self._json(503, {"error": "MCP manager not available"})
+            return
+        name = str(body.get("name", "")).strip()
+        connection = str(body.get("connection", "")).strip()
+        server_type = str(body.get("type", "http")).strip()
+        description = str(body.get("description", "")).strip()
+        if not name or not connection:
+            self._json(400, {"error": "name and connection are required"})
+            return
+        try:
+            entry = _mcp_add_server(name, connection, server_type, description)
+            server_id = entry["id"]
+            result = _mcp_discover_tools(server_id)
+            result["server"] = _mcp_get_server(server_id)
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_mcp_discover(self, server_id: str) -> None:
+        if not _HAS_MCP_MANAGER:
+            self._json(503, {"error": "MCP manager not available"})
+            return
+        server_id = server_id.strip().rstrip("/")
+        if not server_id:
+            self._json(400, {"error": "missing_server_id"})
+            return
+        try:
+            result = _mcp_discover_tools(server_id)
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_mcp_remove(self, server_id: str) -> None:
+        if not _HAS_MCP_MANAGER:
+            self._json(503, {"error": "MCP manager not available"})
+            return
+        server_id = server_id.strip().rstrip("/")
+        try:
+            removed = _mcp_remove_server(server_id)
+            self._json(200, {"removed": removed, "server_id": server_id})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_mcp_toggle(self, server_id: str, body: dict) -> None:
+        if not _HAS_MCP_MANAGER:
+            self._json(503, {"error": "MCP manager not available"})
+            return
+        server_id = server_id.strip().rstrip("/")
+        enabled = bool(body.get("enabled", True))
+        try:
+            ok = _mcp_toggle_server(server_id, enabled)
+            self._json(200, {"ok": ok, "server_id": server_id, "enabled": enabled})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
     def _handle_test_connection(self, comp_id: str) -> None:
         comp_id = comp_id.strip().rstrip("/")
         if comp_id == "github":
@@ -1459,6 +1877,7 @@ def main() -> None:
     print(f"  Chat:   {display_url}/")
     print(f"  Setup:  {display_url}/setup")
     print(f"  Runs:   {display_url}/runs")
+    print(f"  MCP:    {display_url}/mcp")
     print(f"  Gateway: {_gateway_url()} ({'online' if _gateway_ready(timeout=0.5) else 'offline — run: kendr gateway start'})")
     server.serve_forever()
 
