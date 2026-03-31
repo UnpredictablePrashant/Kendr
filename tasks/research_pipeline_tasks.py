@@ -10,12 +10,13 @@ from tasks.research_infra import (
     arxiv_search,
     llm_text,
     openalex_search,
+    parse_documents,
     reddit_search,
     serp_patent_search,
     serp_scholar_search,
     serp_search,
 )
-from tasks.utils import OUTPUT_DIR, log_task_update, write_text_file
+from tasks.utils import OUTPUT_DIR, _client_for_model, log_task_update, write_text_file
 
 
 AGENT_METADATA = {
@@ -204,6 +205,55 @@ def _format_openalex_results(payload: dict, query: str) -> str:
     return "\n".join(lines).strip()
 
 
+def _format_local_results(docs: list[dict]) -> str:
+    if not docs:
+        return "No local documents returned."
+    lines = [f"### Local Document Results ({len(docs)} file(s))", ""]
+    for index, doc in enumerate(docs, start=1):
+        title = str(doc.get("title", "Untitled")).strip()
+        path = str(doc.get("path", "")).strip()
+        char_count = int(doc.get("char_count", 0) or 0)
+        error = str(doc.get("error", "")).strip()
+        text = str(doc.get("text", "")).strip()
+        lines.append(f"{index}. **{title}**")
+        if path:
+            lines.append(f"   Path: {path}")
+        lines.append(f"   Size: {char_count:,} chars")
+        if error:
+            lines.append(f"   Error: {error}")
+        elif text:
+            lines.append(f"   Excerpt: {text[:300]}...")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _fetch_local_documents(local_drive_paths: list[str]) -> list[dict]:
+    """Parse local files from local_drive_paths and return a list of document dicts."""
+    if not local_drive_paths:
+        return []
+    docs = parse_documents(
+        [str(p) for p in local_drive_paths],
+        continue_on_error=True,
+    )
+    results = []
+    for doc in docs:
+        path = str(doc.get("path", "")).strip()
+        text = str(doc.get("text", "")).strip()
+        meta = doc.get("metadata", {}) or {}
+        results.append(
+            {
+                "title": meta.get("file_name") or path.split("/")[-1] or "Local document",
+                "text": text[:2000],
+                "char_count": len(text),
+                "path": path,
+                "file_type": meta.get("type", ""),
+                "error": str(meta.get("error", "")).strip(),
+                "source": "local",
+            }
+        )
+    return results
+
+
 def _fetch_one_source(
     source: str,
     query: str,
@@ -215,11 +265,17 @@ def _fetch_one_source(
     scholar_num: int,
     patents_num: int,
     openalex_per_page: int,
+    local_drive_paths: list[str] | None = None,
 ) -> tuple[str, Any, str | None]:
     """Fetch results from a single source. Returns (source, result_or_None, error_or_None)."""
     try:
         if source == "local":
-            return (source, None, "local source requires --local-drive-paths; skipping remote fetch.")
+            paths = local_drive_paths or []
+            if not paths:
+                return (source, None, "local source: no --local-drive-paths provided; skipping.")
+            log_task_update("Research Pipeline", f"[parallel] Parsing {len(paths)} local document(s)...")
+            docs = _fetch_local_documents(paths)
+            return (source, docs, None)
         if source == "arxiv":
             log_task_update("Research Pipeline", f"[parallel] Fetching arXiv papers for: {query}")
             return (source, arxiv_search(query, max_results=arxiv_max), None)
@@ -256,6 +312,7 @@ def _collect_pipeline_sources(
     scholar_num: int = 10,
     patents_num: int = 10,
     openalex_per_page: int = 10,
+    local_drive_paths: list[str] | None = None,
 ) -> dict:
     """Fan-out source fetches in parallel using a thread pool, then collect results."""
     serp_key_available = bool(os.getenv("SERP_API_KEY", "").strip())
@@ -281,6 +338,7 @@ def _collect_pipeline_sources(
                 scholar_num=scholar_num,
                 patents_num=patents_num,
                 openalex_per_page=openalex_per_page,
+                local_drive_paths=local_drive_paths or [],
             ): source
             for source in valid
         }
@@ -335,6 +393,9 @@ def _build_evidence_report(
     if "patents" in results:
         lines.append(_format_patents_results(results["patents"], query))
         lines.append("")
+    if "local" in results:
+        lines.append(_format_local_results(results["local"]))
+        lines.append("")
 
     return "\n".join(lines).strip() + "\n"
 
@@ -343,7 +404,7 @@ def _build_evidence_report(
 _SYNTHESIS_MAX_CHARS = int(os.getenv("PIPELINE_SYNTHESIS_MAX_CHARS", "12000"))
 
 
-def _synthesize_evidence(query: str, raw_report: str) -> str:
+def _synthesize_evidence(query: str, raw_report: str, *, model: str | None = None) -> str:
     """
     Run a structured LLM synthesis pass over the raw multi-source evidence report.
 
@@ -352,6 +413,14 @@ def _synthesize_evidence(query: str, raw_report: str) -> str:
     - Agreements / convergences across sources
     - Contradictions / gaps
     - Ranked top items by relevance and credibility
+
+    Args:
+        query: The original research query.
+        raw_report: The raw markdown evidence report from all sources.
+        model: Optional explicit model name to use (e.g. state["research_model"]). When
+               provided, bypasses the default RoutedLLM and calls the model directly so that
+               the --research-model CLI flag is honored in the synthesis stage.
+
     Returns empty string if LLM is unavailable (caller falls back to raw_report).
     """
     truncated = raw_report[:_SYNTHESIS_MAX_CHARS]
@@ -380,7 +449,11 @@ Format your response in clean Markdown with the three sections clearly labeled.
 Do NOT repeat raw search result text verbatim — synthesize and paraphrase.
 """
     try:
-        synthesis = llm_text(prompt)
+        if model and model.strip():
+            response = _client_for_model(model.strip()).invoke(prompt)
+            synthesis = response.content.strip() if hasattr(response, "content") else str(response).strip()
+        else:
+            synthesis = llm_text(prompt)
         return synthesis.strip()
     except Exception as exc:
         log_task_update("Research Pipeline", f"LLM synthesis failed (falling back to raw report): {exc}")
@@ -418,6 +491,13 @@ def _extract_source_urls(collected: dict) -> list[dict]:
         if doi:
             _add(doi, title, "openalex")
 
+    local_docs = results.get("local", []) or []
+    for doc in local_docs:
+        path = str(doc.get("path", "")).strip()
+        title = str(doc.get("title", "Local document")).strip()
+        if path:
+            _add(f"file://{path}", title, "local")
+
     return entries
 
 
@@ -452,6 +532,10 @@ def research_pipeline_agent(state: dict) -> dict:
     scholar_num = int(state.get("pipeline_scholar_num", 10) or 10)
     patents_num = int(state.get("pipeline_patents_num", 10) or 10)
     openalex_per_page = int(state.get("pipeline_openalex_per_page", 10) or 10)
+    # research_model is read so --research-model CLI flag is honored in synthesis
+    research_model = str(state.get("research_model", "") or "").strip() or None
+    # local_drive_paths are passed through for local document ingestion
+    local_drive_paths: list[str] = list(state.get("local_drive_paths") or [])
 
     log_task_update(
         "Research Pipeline",
@@ -467,6 +551,7 @@ def research_pipeline_agent(state: dict) -> dict:
         scholar_num=scholar_num,
         patents_num=patents_num,
         openalex_per_page=openalex_per_page,
+        local_drive_paths=local_drive_paths,
     )
 
     raw_report_md = _build_evidence_report(query, sources, collected)
@@ -478,7 +563,7 @@ def research_pipeline_agent(state: dict) -> dict:
     synthesis_md = ""
     if not skip_synthesis and fetched_sources:
         log_task_update("Research Pipeline", "Running LLM synthesis and reconciliation pass...")
-        synthesis_md = _synthesize_evidence(query, raw_report_md)
+        synthesis_md = _synthesize_evidence(query, raw_report_md, model=research_model)
         if synthesis_md:
             log_task_update("Research Pipeline", "Synthesis complete.")
 
@@ -508,15 +593,36 @@ def research_pipeline_agent(state: dict) -> dict:
     state["draft_response"] = report_md
 
     if bool(state.get("long_document_collect_sources_first", False)) and not state.get("long_document_sources_collected"):
+        errors = collected.get("errors", {})
+        # Only signal that all sources are collected when at least one source succeeded
+        # and there are no unexpected errors (SERP key absence is an expected skip, not an error
+        # that warrants blocking long_document_agent from collecting its own sources).
+        # This allows long_document_agent to supplement with its own collection when pipeline
+        # had required sources fail (e.g. local drive requested but no paths provided).
+        hard_errors = {
+            src: err for src, err in errors.items()
+            if "not set" not in err.lower() and "not provided" not in err.lower() and "skipping" not in err.lower()
+        }
+        pipeline_collected_all = not hard_errors and bool(fetched_sources)
+
         evidence_bank_filename = f"research_pipeline_evidence_bank_{call_number}.md"
         write_text_file(evidence_bank_filename, report_md)
-        state["long_document_sources_collected"] = True
         state["long_document_evidence_bank_path"] = f"{OUTPUT_DIR}/{evidence_bank_filename}"
         state["long_document_evidence_bank_excerpt"] = report_md[:18000]
         state["long_document_evidence_sources"] = [
             {"id": f"P{i + 1}", "url": item["url"], "label": item["label"]}
             for i, item in enumerate(source_urls[:60])
         ]
+        if pipeline_collected_all:
+            # Signal to long_document_agent that sources are fully pre-populated
+            state["long_document_sources_collected"] = True
+        else:
+            # Pipeline collected partial sources — long_document_agent should still run
+            # its own collection for missing/failed sources (don't set collected=True)
+            log_task_update(
+                "Research Pipeline",
+                f"Partial source collection ({len(hard_errors)} hard errors) — long_document_agent will supplement.",
+            )
         log_task_update(
             "Research Pipeline",
             f"Evidence bank written to {OUTPUT_DIR}/{evidence_bank_filename} ({len(source_urls)} source URLs).",
