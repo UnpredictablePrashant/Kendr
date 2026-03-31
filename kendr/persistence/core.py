@@ -108,6 +108,7 @@ def initialize_db(db_path: str = DB_PATH):
                 execution_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 run_id TEXT,
                 timestamp TEXT,
+                completed_at TEXT,
                 agent_name TEXT,
                 status TEXT,
                 reason TEXT,
@@ -299,3 +300,4 @@ def initialize_db(db_path: str = DB_PATH):
         _ensure_column(conn, "runs", "parent_run_id", "TEXT")
         _ensure_column(conn, "runs", "resumable", "INTEGER")
         _ensure_column(conn, "runs", "checkpoint_json", "TEXT")
+        _ensure_column(conn, "agent_executions", "completed_at", "TEXT")

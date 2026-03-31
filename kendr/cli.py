@@ -2198,9 +2198,11 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     base_ingest_payload["is_group"] = False
 
     if not _gateway_ready():
-        _emit_status(args, f"[gateway] not running at {gateway_base}; starting gateway...")
-        _start_gateway_process()
-        _emit_status(args, f"[gateway] ready at {gateway_base}")
+        raise SystemExit(
+            f"Gateway is not running at {gateway_base}.\n"
+            "Start it first with:  kendr gateway start\n"
+            f"Then retry:           kendr generate ..."
+        )
 
     client_run_id = f"run_cli_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     ingest_payload = dict(base_ingest_payload)
@@ -2508,9 +2510,11 @@ def _cmd_research(args: argparse.Namespace) -> int:
     base_ingest_payload["is_group"] = False
 
     if not _gateway_ready():
-        _emit_status(args, f"[gateway] not running at {gateway_base}; starting gateway...")
-        _start_gateway_process()
-        _emit_status(args, f"[gateway] ready at {gateway_base}")
+        raise SystemExit(
+            f"Gateway is not running at {gateway_base}.\n"
+            "Start it first with:  kendr gateway start\n"
+            f"Then retry:           kendr research ..."
+        )
 
     client_run_id = f"run_cli_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     ingest_payload = dict(base_ingest_payload)
@@ -2997,9 +3001,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
     )
 
     if not _gateway_ready():
-        _emit_status(args, f"[gateway] not running at {gateway_base}; starting gateway...")
-        _start_gateway_process()
-        _emit_status(args, f"[gateway] ready at {gateway_base}")
+        raise SystemExit(
+            f"Gateway is not running at {gateway_base}.\n"
+            "Start it first with:  kendr gateway start\n"
+            f"Then retry:           kendr run ..."
+        )
 
     interactive_follow_up = bool(getattr(sys.stdin, "isatty", lambda: False)()) and not bool(args.json)
     resume_output_dir: str | None = None
@@ -3410,12 +3416,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     or (bool(getattr(args, "dev", False)) and "blueprint" in (prompt or "")[:120].lower())
                 )
                 if is_blueprint_gate:
-                    print()
-                    print("═" * 72)
-                    print("  BLUEPRINT READY FOR REVIEW")
-                    print("═" * 72)
-                    if prompt:
-                        print(f"\n{prompt}\n")
+                    try:
+                        from kendr import cli_output as _cout
+                        _cout._console.print()
+                        _cout._console.rule("[bold #FFB347]BLUEPRINT READY FOR REVIEW[/bold #FFB347]")
+                        if prompt:
+                            _cout._console.print(f"\n{prompt}\n", style="grey62")
+                    except Exception:
+                        print()
+                        print("═" * 72)
+                        print("  BLUEPRINT READY FOR REVIEW")
+                        print("═" * 72)
+                        if prompt:
+                            print(f"\n{prompt}\n")
                     sys.stdout.write("Proceed with this blueprint? [y/n]: ")
                     sys.stdout.flush()
                     try:
@@ -3425,7 +3438,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     if answer in ("y", "yes", "approve", "ok", "1"):
                         current_query = "approve"
                     else:
-                        print("\nGeneration cancelled at blueprint review.")
+                        try:
+                            from kendr import cli_output as _cout
+                            _cout._console.print("\nGeneration cancelled at blueprint review.", style="#FF4757")
+                        except Exception:
+                            print("\nGeneration cancelled at blueprint review.")
                         return 0
                 else:
                     if prompt:
@@ -3969,6 +3986,16 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     apply_setup_env_defaults()
     action = args.setup_action
 
+    if action == "status" and not getattr(args, "json", False):
+        try:
+            from kendr import cli_output as _out
+            _out.startup_banner(
+                version=_cli_version(),
+                tagline="Configuration & setup status",
+            )
+        except Exception:
+            pass
+
     if action == "components":
         payload = setup_overview()
         if args.json:
@@ -4234,7 +4261,10 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
 
     gateway_base = _gateway_base_url()
     if not _gateway_ready():
-        _start_gateway_process()
+        raise SystemExit(
+            f"Gateway is not running at {gateway_base}.\n"
+            "Start it first with:  kendr gateway start"
+        )
     sessions = _http_json_get(f"{gateway_base}/sessions", timeout_seconds=2.5)
     if not isinstance(sessions, list):
         raise SystemExit("Gateway returned invalid session payload.")

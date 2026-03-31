@@ -233,17 +233,48 @@ def insert_agent_execution(
     reason: str,
     output_excerpt: str,
     db_path: str = DB_PATH,
-):
+    completed_at: str | None = None,
+) -> int:
     initialize_db(db_path)
     with _connect(db_path) as conn:
-        conn.execute(
+        cursor = conn.execute(
             """
             INSERT INTO agent_executions (
-                run_id, timestamp, agent_name, status, reason, output_excerpt
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                run_id, timestamp, completed_at, agent_name, status, reason, output_excerpt
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (run_id, timestamp, agent_name, status, reason, output_excerpt),
+            (run_id, timestamp, completed_at, agent_name, status, reason, output_excerpt),
         )
+        return cursor.lastrowid or 0
+
+
+def update_agent_execution_completed(
+    execution_id: int,
+    completed_at: str,
+    status: str,
+    output_excerpt: str | None = None,
+    db_path: str = DB_PATH,
+) -> None:
+    initialize_db(db_path)
+    with _connect(db_path) as conn:
+        if output_excerpt is not None:
+            conn.execute(
+                """
+                UPDATE agent_executions
+                SET completed_at = ?, status = ?, output_excerpt = ?
+                WHERE execution_id = ?
+                """,
+                (completed_at, status, output_excerpt, execution_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE agent_executions
+                SET completed_at = ?, status = ?
+                WHERE execution_id = ?
+                """,
+                (completed_at, status, execution_id),
+            )
 
 
 def upsert_channel_session(session_key: str, payload: dict, db_path: str = DB_PATH):
@@ -492,7 +523,7 @@ def list_agent_executions_for_run(run_id: str, db_path: str = DB_PATH) -> list[d
     with _connect(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT execution_id, run_id, timestamp, agent_name, status, reason, output_excerpt
+            SELECT execution_id, run_id, timestamp, completed_at, agent_name, status, reason, output_excerpt
             FROM agent_executions
             WHERE run_id = ?
             ORDER BY execution_id ASC

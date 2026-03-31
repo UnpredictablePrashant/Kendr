@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -474,8 +475,17 @@ class AgentRuntime:
             for item in messages[-8:]
         )
 
-    def _append_history(self, state: dict, agent_name: str, status: str, reason: str, output_text: str) -> dict:
-        timestamp = datetime.now(timezone.utc).isoformat()
+    def _append_history(
+        self,
+        state: dict,
+        agent_name: str,
+        status: str,
+        reason: str,
+        output_text: str,
+        start_timestamp: str | None = None,
+    ) -> dict:
+        completed_at = datetime.now(timezone.utc).isoformat()
+        timestamp = start_timestamp or completed_at
         history = state.get("agent_history", [])
         history.append(
             {
@@ -492,7 +502,15 @@ class AgentRuntime:
         state["last_agent_output"] = output_text
         run_id = state.get("run_id")
         if run_id:
-            insert_agent_execution(run_id, timestamp, agent_name, status, reason, self._truncate(output_text))
+            insert_agent_execution(
+                run_id,
+                timestamp,
+                agent_name,
+                status,
+                reason,
+                self._truncate(output_text),
+                completed_at=completed_at,
+            )
         self._write_session_record(state, status="running", active_agent=agent_name)
         return state
 
@@ -1129,9 +1147,29 @@ class AgentRuntime:
         self._write_session_record(state, status="running", active_agent=agent_name)
 
         before_state = {k: v for k, v in state.items() if k != "a2a"}
+        _agent_start_mono = time.monotonic()
+        _agent_start_ts = datetime.now(timezone.utc).isoformat()
+        _spinner_ctx = None
+        try:
+            from kendr.cli_output import make_spinner as _make_spinner
+            import sys as _sys
+            if getattr(_sys.stdout, "isatty", lambda: False)():
+                _spinner = _make_spinner(description=f"{agent_name}")
+                _spinner_task = _spinner.add_task(agent_name)
+                _spinner.start()
+                _spinner_ctx = _spinner
+        except Exception:
+            pass
         try:
             with agent_model_context(agent_name):
                 state = spec.handler(state)
+            if _spinner_ctx is not None:
+                try:
+                    _spinner_ctx.stop()
+                except Exception:
+                    pass
+                _spinner_ctx = None
+            _agent_elapsed = time.monotonic() - _agent_start_mono
             output_text = self._infer_agent_output(before_state, state)
             self._clear_agent_failures(state, agent_name)
             state["effective_steps"] = int(state.get("effective_steps", 0)) + 1
@@ -1147,10 +1185,10 @@ class AgentRuntime:
                 and not self._awaiting_user_input(state)
             )
             state["review_pending"] = requires_review
-            state = self._append_history(state, agent_name, "success", state.get("orchestrator_reason", ""), output_text)
+            state = self._append_history(state, agent_name, "success", state.get("orchestrator_reason", ""), output_text, start_timestamp=_agent_start_ts)
             try:
                 from kendr.cli_output import step_done as _cli_step_done
-                _cli_step_done(agent_name)
+                _cli_step_done(agent_name, duration=_agent_elapsed)
             except Exception:
                 pass
             append_daily_memory_note(state, agent_name, "completed", self._truncate(output_text, 1000))
@@ -1167,6 +1205,11 @@ class AgentRuntime:
                 state["planned_active_step_title"] = ""
                 state["planned_active_step_success_criteria"] = ""
         except Exception as exc:
+            if _spinner_ctx is not None:
+                try:
+                    _spinner_ctx.stop()
+                except Exception:
+                    pass
             error_message = str(exc)
             state["last_error"] = error_message
             self._record_agent_failure(state, agent_name, error_message)
@@ -1182,7 +1225,7 @@ class AgentRuntime:
                     metadata={"task_id": active_task["task_id"], "status": "failed"},
                 ),
             )
-            state = self._append_history(state, agent_name, "error", state.get("orchestrator_reason", ""), error_message)
+            state = self._append_history(state, agent_name, "error", state.get("orchestrator_reason", ""), error_message, start_timestamp=_agent_start_ts)
             try:
                 from kendr.cli_output import step_error as _cli_step_error
                 _cli_step_error(agent_name, error_message)
