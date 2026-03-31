@@ -10,7 +10,7 @@ A plugin-driven multi-agent runtime and orchestration system built on LangGraph/
 - **`app.py`** — Entry point: builds registry and workflow
 - **`kendr/ui_server.py`** — NEW: Kendr Web Chat & Config UI on port 2151 (`kendr ui`)
 - **`kendr/setup_ui.py`** — OAuth/Setup Console on port 8787 (`kendr setup ui`)
-- **`kendr/gateway_server.py`** — HTTP gateway/ingest server on port 8000 (`kendr gateway start`)
+- **`kendr/gateway_server.py`** — HTTP gateway/ingest server (default port 8790, Replit uses `GATEWAY_PORT=8000`) (`kendr gateway start`)
 
 ## Running on Replit
 
@@ -46,7 +46,7 @@ Set via Replit secrets/env vars (see `.env.example` for the full list):
 | `SETUP_UI_HOST` | Bind host for OAuth Setup UI (default: 127.0.0.1) |
 | `SETUP_UI_PORT` | Port for OAuth Setup UI (default: 8787) |
 | `GATEWAY_HOST` | Bind host for Gateway server (default: 0.0.0.0) |
-| `GATEWAY_PORT` | Port for Gateway server (default: 8000) |
+| `GATEWAY_PORT` | Port for Gateway server (default: 8790; Replit sets 8000) |
 | `KENDR_WORKING_DIR` | Default output/workspace directory |
 
 ## Python 3.10 Compatibility Fixes

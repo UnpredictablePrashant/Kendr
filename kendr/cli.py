@@ -3849,7 +3849,9 @@ def _cmd_ui(args: argparse.Namespace) -> int:
         os.environ["KENDR_UI_HOST"] = host_override
 
     ui_port = int(os.getenv("KENDR_UI_PORT", "2151"))
-    ui_url = f"http://localhost:{ui_port}"
+    _display_host = os.getenv("KENDR_UI_HOST", "0.0.0.0")
+    _url_host = "localhost" if _display_host in ("0.0.0.0", "") else _display_host
+    ui_url = f"http://{_url_host}:{ui_port}"
 
     if not _gateway_ready(timeout_seconds=0.8):
         print(f"[ui] Gateway not running — starting it in background...")
