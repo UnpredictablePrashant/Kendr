@@ -74,7 +74,7 @@ ChromaDB is suitable for:
 - Getting started quickly
 - Runs where persistence is local and not shared across machines
 
-Data is stored under `KENDR_WORKING_DIR/chroma_db/` by default.
+Data is stored under `KENDR_WORKING_DIR/.chroma/` by default.
 
 ### Qdrant (opt-in — persistent, scalable)
 
@@ -320,6 +320,85 @@ The CVE database uses the public NVD API endpoint by default. Set `NVD_API_KEY` 
 ```bash
 NVD_API_KEY="nvd-api-key-here"
 ```
+
+---
+
+### ElevenLabs
+
+Required for voice synthesis and transcription workflows.
+
+```bash
+ELEVENLABS_API_KEY="el_sk_..."
+```
+
+Get your key at [elevenlabs.io](https://elevenlabs.io). Without this, voice and audio agents are disabled.
+
+### Qdrant
+
+See the [Vector Backend section above](#vector-backend-chromadb-vs-qdrant) for the full Qdrant setup guide. The key environment variables are:
+
+```bash
+QDRANT_URL="http://127.0.0.1:6333"
+QDRANT_API_KEY=""
+QDRANT_COLLECTION="research_memory"
+```
+
+### Playwright
+
+Required for browser automation and screenshot workflows.
+
+```bash
+pip install playwright
+playwright install chromium
+```
+
+Or use the install command:
+
+```bash
+kendr setup install --yes --only playwright
+```
+
+### CVE Database
+
+Provides CVE and NVD vulnerability lookup capabilities. Uses the public NVD API by default — no setup required. Optionally add an NVD API key for higher rate limits.
+
+```bash
+CVE_API_BASE_URL="https://services.nvd.nist.gov/rest/json/cves/2.0"
+NVD_API_KEY=""     # optional — raises rate limits
+```
+
+### Coding Integrations
+
+Kendr coding agents work via OpenAI (`OPENAI_API_KEY`) by default. Optionally, the local `codex` CLI can be used as a fallback:
+
+```bash
+# install the codex CLI via npm
+npm install -g @openai/codex
+
+# Set the preferred coding backend
+OPENAI_MODEL_CODING="gpt-4o"
+OPENAI_CODEX_MODEL=""      # legacy fallback after OPENAI_MODEL_CODING
+```
+
+The `coding_backend` can also be specified per-run with `kendr run --coding-backend codex-cli`.
+
+### Privileged Control
+
+Controls safety boundaries for local command execution and OS automation. All gates are disabled by default.
+
+```bash
+KENDR_PRIVILEGED_MODE="false"       # enable privileged policy controls
+KENDR_REQUIRE_APPROVALS="true"      # require --privileged-approved flag
+KENDR_READ_ONLY_MODE="false"        # block all mutating commands
+KENDR_ALLOW_ROOT="false"            # allow sudo/root escalation
+KENDR_ALLOW_DESTRUCTIVE="false"     # allow destructive operations
+KENDR_ENABLE_BACKUPS="true"         # snapshot before mutating actions
+KENDR_ALLOWED_PATHS=""              # comma-separated allowed path roots
+KENDR_ALLOWED_DOMAINS=""            # comma-separated allowed domains
+KENDR_KILL_SWITCH_FILE="output/KENDR_STOP"
+```
+
+Each privileged run must include `--privileged-approved` and `--privileged-approval-note` with a ticket reference.
 
 ---
 

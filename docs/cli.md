@@ -367,7 +367,7 @@ kendr setup <action> [args]
 | `status` | Show setup status: which components are configured, available agents, and setup actions. |
 | `components` | List all configurable components (integrations). |
 | `show COMPONENT` | Show one component's current configuration. |
-| `set COMPONENT KEY VALUE` | Set one configuration field for a component (stored in local DB). |
+| `set COMPONENT KEY VALUE` | Set one configuration field for a component (stored in local DB). Pass `--secret` to mark the value as a secret (alias for `--encrypt`, accepted for backward compatibility). |
 | `unset COMPONENT KEY` | Remove one configuration field. |
 | `enable COMPONENT` | Enable a component. |
 | `disable COMPONENT` | Disable a component. |

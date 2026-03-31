@@ -43,7 +43,7 @@ Kendr ships with **ChromaDB as the zero-config default** vector backend. No setu
 
 ChromaDB runs in-process with no external dependencies. It is selected automatically when `QDRANT_URL` is not set or Qdrant is unreachable.
 
-No environment variables are required. ChromaDB stores its data under `KENDR_WORKING_DIR/chroma_db/` by default.
+No environment variables are required. ChromaDB stores its data under `KENDR_WORKING_DIR/.chroma/` by default.
 
 ### Qdrant (opt-in)
 
