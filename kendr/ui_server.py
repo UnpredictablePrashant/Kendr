@@ -87,6 +87,31 @@ except Exception as _mcp_import_exc:
     _HAS_MCP_MANAGER = False
     _log.warning("MCP manager not available: %s", _mcp_import_exc)
 
+try:
+    from kendr.project_manager import (
+        list_projects as _pm_list_projects,
+        get_active_project as _pm_get_active,
+        set_active_project as _pm_set_active,
+        add_project as _pm_add_project,
+        remove_project as _pm_remove_project,
+        read_file_tree as _pm_file_tree,
+        read_file_content as _pm_read_file,
+        run_shell as _pm_shell,
+        git_status as _pm_git_status,
+        git_pull as _pm_git_pull,
+        git_push as _pm_git_push,
+        git_add_all as _pm_git_add,
+        git_commit as _pm_git_commit,
+        git_commit_and_push as _pm_git_commit_push,
+        git_clone as _pm_git_clone,
+        git_branches as _pm_git_branches,
+        git_checkout as _pm_git_checkout,
+    )
+    _HAS_PROJECT_MANAGER = True
+except Exception as _pm_import_exc:
+    _HAS_PROJECT_MANAGER = False
+    _log.warning("Project manager not available: %s", _pm_import_exc)
+
 _GATEWAY_HOST = os.getenv("GATEWAY_HOST", "127.0.0.1")
 _GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8790"))
 
@@ -322,6 +347,7 @@ a:hover { text-decoration: underline; }
     <a href="/setup" class="nav-btn"><span class="icon">⚙️</span> Setup & Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">📋</span> Run History</a>
     <a href="/mcp" class="nav-btn"><span class="icon">🧩</span> MCP Servers</a>
+    <a href="/projects" class="nav-btn"><span class="icon">📁</span> Projects</a>
   </div>
   <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
   <div class="sidebar-section">Recent Runs</div>
@@ -755,6 +781,7 @@ a { color: var(--teal); }
     <a href="/setup" class="nav-btn active"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
   <div class="category-nav" id="categoryNav"></div>
 </div>
@@ -963,6 +990,607 @@ loadEnvExport();
 </html>"""
 
 
+_PROJECTS_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kendr &mdash; Projects</title>
+<style>
+:root { --teal: #00C9A7; --amber: #FFB347; --crimson: #FF4757; --purple: #A78BFA; --blue: #58A6FF; --bg: #0d0f14; --surface: #161b22; --surface2: #1e2530; --surface3: #252d3a; --border: #2a3140; --text: #e6edf3; --muted: #7d8590; --sidebar-w: 220px; --file-w: 260px; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; overflow: hidden; height: 100vh; }
+/* Left nav sidebar */
+.nav-sidebar { width: var(--sidebar-w); min-width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; bottom: 0; left: 0; z-index: 10; }
+.nav-header { padding: 20px 16px 12px; border-bottom: 1px solid var(--border); }
+.logo { font-size: 20px; font-weight: 800; color: var(--teal); }
+.logo span { color: var(--amber); }
+.tagline { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.nav-links { padding: 10px 8px; display: flex; flex-direction: column; gap: 3px; border-bottom: 1px solid var(--border); }
+.nav-btn { display: flex; align-items: center; gap: 9px; padding: 8px 11px; border-radius: 7px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer; border: none; background: transparent; width: 100%; text-align: left; text-decoration: none; transition: background 0.15s, color 0.15s; }
+.nav-btn:hover { background: var(--surface2); color: var(--text); }
+.nav-btn.active { background: rgba(0,201,167,0.12); color: var(--teal); }
+.nav-btn .icon { font-size: 15px; width: 18px; text-align: center; }
+/* Project list in nav */
+.proj-list-nav { padding: 8px; flex: 1; overflow-y: auto; }
+.proj-list-label { font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; padding: 6px 8px 4px; }
+.proj-item { display: flex; align-items: center; gap: 7px; padding: 7px 10px; border-radius: 7px; cursor: pointer; font-size: 12px; color: var(--muted); transition: background 0.12s, color 0.12s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.proj-item:hover { background: var(--surface2); color: var(--text); }
+.proj-item.active { background: rgba(0,201,167,0.1); color: var(--teal); }
+.proj-add-btn { display: flex; align-items: center; gap: 6px; padding: 7px 10px; font-size: 12px; color: var(--muted); cursor: pointer; border-radius: 7px; border: 1px dashed var(--border); margin: 6px 8px; background: none; width: calc(100% - 16px); transition: color 0.12s, border-color 0.12s; }
+.proj-add-btn:hover { color: var(--teal); border-color: var(--teal); }
+/* File panel */
+.file-panel { width: var(--file-w); min-width: var(--file-w); background: var(--surface); border-right: 1px solid var(--border); position: fixed; top: 0; bottom: 0; left: var(--sidebar-w); display: flex; flex-direction: column; }
+.file-panel-header { padding: 14px 14px 10px; border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+.file-panel-title { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.file-tree { flex: 1; overflow-y: auto; padding: 6px 0; }
+.tree-node { cursor: pointer; user-select: none; }
+.tree-row { display: flex; align-items: center; gap: 5px; padding: 3px 12px; font-size: 12px; color: var(--muted); transition: background 0.1s, color 0.1s; white-space: nowrap; overflow: hidden; }
+.tree-row:hover { background: var(--surface2); color: var(--text); }
+.tree-row.selected { background: rgba(0,201,167,0.08); color: var(--teal); }
+.tree-row .icon { font-size: 12px; width: 14px; text-align: center; flex-shrink: 0; }
+.tree-row .fname { overflow: hidden; text-overflow: ellipsis; }
+.tree-children { padding-left: 14px; }
+/* Main workspace */
+.workspace { margin-left: calc(var(--sidebar-w) + var(--file-w)); flex: 1; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+.workspace-top { background: var(--surface); border-bottom: 1px solid var(--border); padding: 0 20px; display: flex; align-items: center; gap: 16px; min-height: 48px; }
+.ws-title { font-size: 14px; font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ws-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); background: var(--surface2); border: 1px solid var(--border); border-radius: 5px; padding: 3px 8px; }
+/* Tabs */
+.tab-bar { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); }
+.tab { padding: 10px 20px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; transition: color 0.15s, border-color 0.15s; }
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--teal); border-bottom-color: var(--teal); }
+.tab-panels { flex: 1; overflow: hidden; }
+.tab-panel { display: none; height: 100%; flex-direction: column; overflow: hidden; }
+.tab-panel.active { display: flex; }
+/* Chat panel */
+.chat-messages { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+.msg-row { display: flex; gap: 10px; }
+.msg-row.user { flex-direction: row-reverse; }
+.msg-bubble { max-width: 75%; padding: 10px 14px; border-radius: 12px; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+.msg-row.user .msg-bubble { background: rgba(0,201,167,0.15); border: 1px solid rgba(0,201,167,0.3); color: var(--text); border-radius: 12px 12px 3px 12px; }
+.msg-row.agent .msg-bubble { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 12px 12px 12px 3px; }
+.msg-row.system .msg-bubble { background: var(--surface3); border: 1px solid var(--border); color: var(--muted); font-size: 12px; font-style: italic; border-radius: 8px; }
+.chat-input-bar { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 10px; background: var(--surface); }
+.chat-input { flex: 1; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 9px 13px; color: var(--text); font-size: 13px; outline: none; resize: none; min-height: 40px; max-height: 120px; font-family: inherit; transition: border-color 0.15s; }
+.chat-input:focus { border-color: var(--teal); }
+.send-btn { background: var(--teal); color: #0d0f14; border: none; border-radius: 8px; padding: 9px 16px; font-size: 13px; font-weight: 700; cursor: pointer; }
+.send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+/* Terminal panel */
+.terminal-output { flex: 1; overflow-y: auto; padding: 12px 16px; background: #0a0c10; font-family: "Cascadia Code","Fira Code",monospace; font-size: 12px; color: #b5c4de; white-space: pre-wrap; word-break: break-word; }
+.terminal-output .cmd-line { color: var(--teal); margin-top: 8px; }
+.terminal-output .err-line { color: var(--crimson); }
+.terminal-input-bar { padding: 10px 12px; background: #0a0c10; border-top: 1px solid var(--border); display: flex; align-items: center; gap: 8px; }
+.terminal-prompt { color: var(--teal); font-family: monospace; font-size: 13px; flex-shrink: 0; }
+.terminal-input { flex: 1; background: transparent; border: none; color: var(--text); font-family: "Cascadia Code","Fira Code",monospace; font-size: 13px; outline: none; }
+/* Git panel */
+.git-panel { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+.git-section { background: var(--surface2); border: 1px solid var(--border); border-radius: 9px; padding: 14px 16px; }
+.git-section-title { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+.git-info-row { display: flex; align-items: center; gap: 8px; font-size: 13px; margin-bottom: 6px; }
+.git-info-label { color: var(--muted); font-size: 12px; min-width: 80px; }
+.git-info-val { font-family: monospace; font-size: 12px; color: var(--text); }
+.file-badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace; margin: 2px 4px 2px 0; }
+.file-badge.changed { background: rgba(255,179,71,0.12); color: var(--amber); }
+.file-badge.staged { background: rgba(0,201,167,0.1); color: var(--teal); }
+.file-badge.untracked { background: rgba(125,133,144,0.12); color: var(--muted); }
+.git-commit-area { display: flex; flex-direction: column; gap: 10px; }
+.git-msg-input { background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 9px 12px; color: var(--text); font-size: 13px; outline: none; resize: none; min-height: 60px; font-family: inherit; transition: border-color 0.15s; width: 100%; }
+.git-msg-input:focus { border-color: var(--teal); }
+.git-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn { padding: 8px 15px; border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer; border: none; transition: opacity 0.15s; }
+.btn:hover { opacity: 0.85; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-primary { background: var(--teal); color: #0d0f14; }
+.btn-outline { background: none; border: 1px solid var(--border); color: var(--text); }
+.btn-danger { background: rgba(255,71,87,0.1); border: 1px solid rgba(255,71,87,0.3); color: var(--crimson); }
+.btn-purple { background: rgba(167,139,250,0.12); border: 1px solid rgba(167,139,250,0.3); color: var(--purple); }
+.git-output { font-family: monospace; font-size: 12px; color: var(--muted); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; white-space: pre-wrap; max-height: 120px; overflow-y: auto; display: none; }
+.git-output.show { display: block; }
+/* File viewer (inside chat or modal) */
+.file-viewer { flex: 1; overflow: auto; padding: 16px 20px; background: #0a0c10; }
+.file-viewer pre { font-family: "Cascadia Code","Fira Code",monospace; font-size: 12px; color: #b5c4de; white-space: pre; }
+.file-viewer-header { padding: 10px 20px; background: var(--surface); border-bottom: 1px solid var(--border); font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 10px; }
+.file-viewer-header .fpath { font-family: monospace; color: var(--teal); }
+/* Modals */
+.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; z-index: 100; display: none; }
+.modal-overlay.open { display: flex; }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 24px; width: 460px; max-width: 95vw; }
+.modal-title { font-size: 16px; font-weight: 700; margin-bottom: 16px; }
+.form-field { margin-bottom: 14px; }
+.form-field label { display: block; font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 5px; }
+.form-field input, .form-field select { width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 9px 12px; color: var(--text); font-size: 13px; outline: none; transition: border-color 0.15s; }
+.form-field input:focus, .form-field select:focus { border-color: var(--teal); }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+.status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.status-dot.green { background: var(--teal); }
+.status-dot.amber { background: var(--amber); }
+.status-dot.red { background: var(--crimson); }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--border); border-top-color: var(--teal); border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; }
+@keyframes spin { to { transform: rotate(360deg); } }
+::-webkit-scrollbar { width: 5px; height: 5px; } ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- Left nav sidebar -->
+<div class="nav-sidebar">
+  <div class="nav-header"><div class="logo">kendr<span>.</span></div><div class="tagline">Multi-agent intelligence runtime</div></div>
+  <div class="nav-links">
+    <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
+    <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
+    <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/projects" class="nav-btn active"><span class="icon">&#x1F4C1;</span> Projects</a>
+  </div>
+  <div class="proj-list-nav">
+    <div class="proj-list-label">My Projects</div>
+    <div id="navProjList"></div>
+    <button class="proj-add-btn" onclick="openAddModal('dir')">+ Add / Clone Project</button>
+  </div>
+</div>
+
+<!-- File panel -->
+<div class="file-panel">
+  <div class="file-panel-header">
+    <span class="file-panel-title" id="filePanelTitle">No project open</span>
+  </div>
+  <div class="file-tree" id="fileTree"><div style="padding:14px;font-size:12px;color:var(--muted)">Open a project to see its files.</div></div>
+</div>
+
+<!-- Main workspace -->
+<div class="workspace">
+  <div class="workspace-top">
+    <span class="ws-title" id="wsTitle">Projects</span>
+    <span class="ws-badge" id="wsBranch" style="display:none">&#x1F533; <span id="wsBranchName">main</span></span>
+    <span class="ws-badge" id="wsPath" style="display:none;font-family:monospace;font-size:11px;color:var(--muted)"></span>
+  </div>
+  <div class="tab-bar">
+    <div class="tab active" onclick="switchTab('chat')">&#x1F4AC; Agent Chat</div>
+    <div class="tab" onclick="switchTab('file')">&#x1F4C4; File Viewer</div>
+    <div class="tab" onclick="switchTab('terminal')">&#x1F4BB; Terminal</div>
+    <div class="tab" onclick="switchTab('git')">&#x1F500; Git</div>
+  </div>
+  <div class="tab-panels">
+
+    <!-- Chat tab -->
+    <div class="tab-panel active" id="panel-chat">
+      <div class="chat-messages" id="chatMessages">
+        <div class="msg-row system"><div class="msg-bubble">Open a project, then ask me anything about it — review code, explain files, find bugs, add features.</div></div>
+      </div>
+      <div class="chat-input-bar">
+        <textarea class="chat-input" id="chatInput" rows="1" placeholder="Ask about your project..." onkeydown="chatKeydown(event)"></textarea>
+        <button class="send-btn" id="sendBtn" onclick="sendChat()">&#x27A4;</button>
+      </div>
+    </div>
+
+    <!-- File viewer tab -->
+    <div class="tab-panel" id="panel-file">
+      <div class="file-viewer-header">
+        <span id="fileViewerPath" class="fpath">No file selected — click a file in the tree</span>
+      </div>
+      <div class="file-viewer"><pre id="fileViewerContent" style="color:var(--muted)">Select a file from the tree on the left.</pre></div>
+    </div>
+
+    <!-- Terminal tab -->
+    <div class="tab-panel" id="panel-terminal">
+      <div class="terminal-output" id="termOutput">kendr project terminal — type a command below and press Enter.
+</div>
+      <div class="terminal-input-bar">
+        <span class="terminal-prompt" id="termPrompt">$</span>
+        <input class="terminal-input" id="termInput" placeholder="ls -la" autocomplete="off" onkeydown="termKeydown(event)">
+      </div>
+    </div>
+
+    <!-- Git tab -->
+    <div class="tab-panel" id="panel-git">
+      <div class="git-panel" id="gitPanel">
+        <div style="color:var(--muted);font-size:13px">Open a project to see git status.</div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- Add / Clone modal -->
+<div class="modal-overlay" id="addModal">
+  <div class="modal">
+    <div class="modal-title">Add Project</div>
+    <div style="display:flex;gap:10px;margin-bottom:18px">
+      <button class="btn btn-outline" id="tabDir" onclick="setAddMode('dir')" style="flex:1">&#x1F4C1; Open Directory</button>
+      <button class="btn btn-outline" id="tabClone" onclick="setAddMode('clone')" style="flex:1">&#x2B07; Clone from GitHub</button>
+    </div>
+    <div id="formDir">
+      <div class="form-field"><label>Project Path</label><input type="text" id="inputPath" placeholder="/home/user/my-project"></div>
+      <div class="form-field"><label>Display Name (optional)</label><input type="text" id="inputName" placeholder="My Project"></div>
+    </div>
+    <div id="formClone" style="display:none">
+      <div class="form-field"><label>GitHub Repository URL</label><input type="text" id="inputCloneUrl" placeholder="https://github.com/user/repo.git"></div>
+      <div class="form-field"><label>Clone into directory</label><input type="text" id="inputCloneDest" placeholder="/home/user/projects"></div>
+    </div>
+    <div id="addModalMsg" style="font-size:12px;color:var(--muted);min-height:18px"></div>
+    <div class="modal-actions">
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" id="addModalBtn" onclick="submitAddProject()">Add Project</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let _activeProjectId = null;
+let _activeProjectPath = null;
+let _activeProjectName = '';
+let _runId = null;
+let _sseSource = null;
+let _termHistory = [];
+let _termHistIdx = -1;
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    const tabs = ['chat','file','terminal','git'];
+    t.classList.toggle('active', tabs[i] === name);
+  });
+  document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+  if (name === 'git') loadGitStatus();
+}
+
+// ── Projects ─────────────────────────────────────────────────────────────────
+async function loadProjects() {
+  try {
+    const r = await fetch(API + '/api/projects');
+    const projects = await r.json();
+    const box = document.getElementById('navProjList');
+    box.innerHTML = projects.map(p =>
+      `<div class="proj-item ${p.id === _activeProjectId ? 'active' : ''}" onclick="openProject('${p.id}','${esc(p.path)}','${esc(p.name)}')">
+        <span style="font-size:14px">&#x1F4C1;</span>
+        <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.path)}">${esc(p.name)}</span>
+      </div>`
+    ).join('') || '<div style="padding:8px 10px;font-size:12px;color:var(--muted)">No projects yet.</div>';
+  } catch(e) { console.warn('load projects error', e); }
+}
+
+async function openProject(id, path, name) {
+  _activeProjectId = id;
+  _activeProjectPath = path;
+  _activeProjectName = name;
+  document.getElementById('wsTitle').textContent = name;
+  document.getElementById('wsPath').textContent = path;
+  document.getElementById('wsPath').style.display = '';
+  document.getElementById('filePanelTitle').textContent = name;
+  document.getElementById('termPrompt').textContent = name.substring(0,12) + ' $';
+  await fetch(API + '/api/projects/' + id + '/activate', { method: 'POST' });
+  await loadProjects();
+  await loadFileTree();
+  appendSysMsg('Opened project: ' + name + ' (' + path + ')');
+  const gitBadge = document.getElementById('wsBranch');
+  const status = await fetch(API + '/api/projects/' + id + '/git/status').then(r => r.json()).catch(() => null);
+  if (status && status.is_git) {
+    document.getElementById('wsBranchName').textContent = status.branch || 'main';
+    gitBadge.style.display = '';
+  } else {
+    gitBadge.style.display = 'none';
+  }
+}
+
+// ── File tree ─────────────────────────────────────────────────────────────────
+async function loadFileTree() {
+  if (!_activeProjectId) return;
+  const box = document.getElementById('fileTree');
+  box.innerHTML = '<div style="padding:10px 12px;font-size:12px;color:var(--muted)"><span class="spinner"></span> Loading...</div>';
+  try {
+    const r = await fetch(API + '/api/projects/' + _activeProjectId + '/files');
+    const tree = await r.json();
+    box.innerHTML = renderTree(tree, 0);
+  } catch(e) { box.innerHTML = '<div style="padding:10px;color:var(--crimson);font-size:12px">Error: ' + e + '</div>'; }
+}
+
+function renderTree(nodes, depth) {
+  return nodes.map(n => {
+    const indent = depth * 14;
+    if (n.type === 'dir') {
+      const childHtml = renderTree(n.children || [], depth + 1);
+      const id = 'tree-' + btoa(n.path).replace(/[^a-zA-Z0-9]/g,'').slice(-10);
+      return `<div class="tree-node">
+        <div class="tree-row" style="padding-left:${12 + indent}px" onclick="toggleDir('${id}', this)">
+          <span class="icon" id="icon-${id}">&#x25B8;</span>
+          <span style="font-size:13px">&#x1F4C2;</span>
+          <span class="fname">${esc(n.name)}</span>
+        </div>
+        <div class="tree-children" id="${id}" style="display:none">${childHtml}</div>
+      </div>`;
+    } else {
+      const fileIcon = getFileIcon(n.name);
+      return `<div class="tree-row" style="padding-left:${12 + indent}px" onclick="openFile('${esc(n.path)}','${esc(n.name)}')">
+        <span class="icon">&nbsp;</span>
+        <span style="font-size:12px">${fileIcon}</span>
+        <span class="fname">${esc(n.name)}</span>
+        <span style="margin-left:auto;font-size:10px;color:var(--muted)">${fmtSize(n.size)}</span>
+      </div>`;
+    }
+  }).join('');
+}
+
+function toggleDir(id, row) {
+  const el = document.getElementById(id);
+  const icon = document.getElementById('icon-' + id);
+  const open = el.style.display !== 'none';
+  el.style.display = open ? 'none' : 'block';
+  icon.textContent = open ? '\u25B8' : '\u25BE';
+}
+
+async function openFile(path, name) {
+  document.querySelectorAll('.tree-row').forEach(r => r.classList.remove('selected'));
+  switchTab('file');
+  document.getElementById('fileViewerPath').textContent = path;
+  document.getElementById('fileViewerContent').textContent = 'Loading...';
+  try {
+    const r = await fetch(API + '/api/projects/file?path=' + encodeURIComponent(path) + '&root=' + encodeURIComponent(_activeProjectPath || ''));
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('fileViewerContent').textContent = d.content;
+    } else {
+      document.getElementById('fileViewerContent').textContent = 'Error: ' + d.error;
+    }
+  } catch(e) {
+    document.getElementById('fileViewerContent').textContent = 'Error: ' + e;
+  }
+}
+
+function getFileIcon(name) {
+  const ext = name.split('.').pop().toLowerCase();
+  const icons = { py:'&#x1F40D;', js:'&#x1F7E1;', ts:'&#x1F535;', tsx:'&#x1F535;', jsx:'&#x1F7E1;', html:'&#x1F4C4;', css:'&#x1F3A8;', json:'&#x1F4CB;', md:'&#x1F4DD;', yml:'&#x2699;', yaml:'&#x2699;', sh:'&#x1F4DC;', env:'&#x1F512;', txt:'&#x1F4C4;', go:'&#x1F535;', rs:'&#x1F7E0;', java:'&#x2615;', sql:'&#x1F5C3;', dockerfile:'&#x1F433;', toml:'&#x2699;' };
+  return icons[ext] || '&#x1F4C4;';
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return '';
+  if (bytes < 1024) return bytes + 'B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(0) + 'KB';
+  return (bytes / 1048576).toFixed(1) + 'MB';
+}
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+function appendMsg(role, text) {
+  const box = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg-row ' + role;
+  div.innerHTML = '<div class="msg-bubble">' + esc(text).replace(/\n/g,'<br>') + '</div>';
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+  return div;
+}
+function appendSysMsg(text) {
+  const box = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg-row system';
+  div.innerHTML = '<div class="msg-bubble">' + esc(text) + '</div>';
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+
+function chatKeydown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+}
+
+async function sendChat() {
+  const inp = document.getElementById('chatInput');
+  const btn = document.getElementById('sendBtn');
+  const text = inp.value.trim();
+  if (!text) return;
+  if (!_activeProjectPath) { appendSysMsg('Please open a project first.'); return; }
+  inp.value = '';
+  inp.style.height = 'auto';
+  btn.disabled = true;
+  appendMsg('user', text);
+  const agentDiv = appendMsg('agent', '');
+  const bubble = agentDiv.querySelector('.msg-bubble');
+  bubble.innerHTML = '<span class="spinner"></span>';
+  _runId = 'proj-' + Math.random().toString(36).slice(2, 10);
+  try {
+    const resp = await fetch(API + '/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ text, run_id: _runId, working_directory: _activeProjectPath, channel: 'project_chat', sender_id: 'project_ui' })
+    });
+    const d = await resp.json();
+    if (!d.run_id) { bubble.textContent = 'Error: ' + (d.error || 'No run id'); btn.disabled = false; return; }
+    _runId = d.run_id;
+    let collected = '';
+    const sse = new EventSource(API + '/api/stream?run_id=' + encodeURIComponent(_runId));
+    sse.addEventListener('result', e => {
+      const data = JSON.parse(e.data || '{}');
+      const reply = data.final_response || data.response || data.result || data.output || '';
+      collected = reply;
+      bubble.innerHTML = esc(reply).replace(/\n/g,'<br>') || '<em style="color:var(--muted)">No response</em>';
+      document.getElementById('chatMessages').scrollTop = 999999;
+    });
+    sse.addEventListener('step', e => {
+      const data = JSON.parse(e.data || '{}');
+      if (!collected) bubble.innerHTML = '<span style="color:var(--muted);font-size:11px">&#x1F504; ' + esc(data.agent || 'working') + '...</span>';
+    });
+    sse.addEventListener('done', () => { sse.close(); btn.disabled = false; });
+    sse.addEventListener('error', () => { sse.close(); if (!collected) bubble.textContent = 'Connection error'; btn.disabled = false; });
+  } catch(e) { bubble.textContent = 'Error: ' + e; btn.disabled = false; }
+}
+
+// ── Terminal ──────────────────────────────────────────────────────────────────
+function termKeydown(e) {
+  if (e.key === 'Enter') { e.preventDefault(); runTermCmd(); }
+  else if (e.key === 'ArrowUp') { e.preventDefault(); if (_termHistIdx < _termHistory.length-1) { _termHistIdx++; document.getElementById('termInput').value = _termHistory[_termHistIdx]; } }
+  else if (e.key === 'ArrowDown') { e.preventDefault(); if (_termHistIdx > 0) { _termHistIdx--; document.getElementById('termInput').value = _termHistory[_termHistIdx]; } else { _termHistIdx = -1; document.getElementById('termInput').value = ''; } }
+}
+
+async function runTermCmd() {
+  const input = document.getElementById('termInput');
+  const output = document.getElementById('termOutput');
+  const cmd = input.value.trim();
+  if (!cmd) return;
+  if (!_activeProjectPath) { output.textContent += '\n\u26A0 Open a project first.'; return; }
+  _termHistory.unshift(cmd); _termHistIdx = -1;
+  input.value = '';
+  output.textContent += '\n$ ' + cmd + '\n';
+  output.scrollTop = output.scrollHeight;
+  try {
+    const r = await fetch(API + '/api/projects/shell', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ command: cmd, project_id: _activeProjectId, cwd: _activeProjectPath })
+    });
+    const d = await r.json();
+    if (d.stdout) output.textContent += d.stdout;
+    if (d.stderr) output.textContent += d.stderr;
+    if (!d.ok && !d.stderr && !d.stdout) output.textContent += '(exit code ' + d.returncode + ')';
+  } catch(e) { output.textContent += 'Request error: ' + e; }
+  output.scrollTop = output.scrollHeight;
+  if (output.textContent.length > 30000) output.textContent = output.textContent.slice(-20000);
+}
+
+// ── Git ───────────────────────────────────────────────────────────────────────
+async function loadGitStatus() {
+  if (!_activeProjectId) return;
+  const panel = document.getElementById('gitPanel');
+  panel.innerHTML = '<div style="color:var(--muted);font-size:13px"><span class="spinner"></span> Loading git status...</div>';
+  try {
+    const r = await fetch(API + '/api/projects/' + _activeProjectId + '/git/status');
+    const s = await r.json();
+    if (!s.is_git) {
+      panel.innerHTML = '<div class="git-section"><div style="color:var(--muted)">&#x26A0; Not a git repository.</div><button class="btn btn-outline" style="margin-top:10px" onclick="gitRun(\'git init\')">Initialize git repo</button></div>';
+      return;
+    }
+    const changed = (s.changed || []).map(f => `<span class="file-badge changed">M ${esc(f)}</span>`).join('');
+    const staged = (s.staged || []).map(f => `<span class="file-badge staged">&#x2713; ${esc(f)}</span>`).join('');
+    const untracked = (s.untracked || []).map(f => `<span class="file-badge untracked">? ${esc(f)}</span>`).join('');
+    const aheadBehind = s.ahead > 0 ? `<span style="color:var(--teal)">&#x2B06; ${s.ahead} ahead</span> ` : '';
+    const behindStr = s.behind > 0 ? `<span style="color:var(--amber)">&#x2B07; ${s.behind} behind</span>` : '';
+    panel.innerHTML = `
+    <div class="git-section">
+      <div class="git-section-title">Repository Status</div>
+      <div class="git-info-row"><span class="git-info-label">Branch</span><span class="git-info-val">&#x1F533; ${esc(s.branch)}</span> ${aheadBehind}${behindStr}</div>
+      <div class="git-info-row"><span class="git-info-label">Remote</span><span class="git-info-val" style="color:var(--muted)">${esc(s.remote || 'none')}</span></div>
+      <div class="git-info-row"><span class="git-info-label">Last commit</span><span class="git-info-val" style="color:var(--muted)">${esc(s.last_commit)}</span></div>
+      <div class="git-info-row"><span class="git-info-label">Status</span><span class="${s.clean ? 'git-info-val' : ''}" style="color:${s.clean ? 'var(--teal)' : 'var(--amber)'}">${s.clean ? '&#x2713; Clean' : 'Modified'}</span></div>
+    </div>
+    ${!s.clean ? `<div class="git-section">
+      <div class="git-section-title">Changed Files</div>
+      <div style="margin-bottom:6px">${staged || '<span style="color:var(--muted);font-size:12px">No staged files</span>'}</div>
+      <div style="margin-bottom:6px">${changed}</div>
+      <div>${untracked}</div>
+    </div>` : ''}
+    <div class="git-section">
+      <div class="git-section-title">Commit &amp; Push</div>
+      <div class="git-commit-area">
+        <textarea class="git-msg-input" id="commitMsg" placeholder="Commit message..."></textarea>
+        <div class="git-actions">
+          <button class="btn btn-primary" onclick="gitCommitPush()">&#x2B06; Stage All &amp; Commit &amp; Push</button>
+          <button class="btn btn-outline" onclick="gitPull()">&#x2B07; Pull</button>
+          <button class="btn btn-outline" onclick="gitPush()">&#x2B06; Push only</button>
+        </div>
+        <div class="git-output" id="gitOutput"></div>
+      </div>
+    </div>
+    <div class="git-section">
+      <div class="git-section-title">Quick Actions</div>
+      <div class="git-actions">
+        <button class="btn btn-outline" onclick="gitRun('git status')">git status</button>
+        <button class="btn btn-outline" onclick="gitRun('git log --oneline -10')">git log</button>
+        <button class="btn btn-outline" onclick="gitRun('git diff')">git diff</button>
+        <button class="btn btn-purple" onclick="switchTab(\'terminal\')">&#x1F4BB; Open Terminal</button>
+      </div>
+    </div>`;
+  } catch(e) { panel.innerHTML = '<div style="color:var(--crimson)">Error: ' + e + '</div>'; }
+}
+
+async function gitCommitPush() {
+  const msg = document.getElementById('commitMsg').value.trim();
+  if (!msg) { alert('Enter a commit message first.'); return; }
+  await doGitAction('/api/projects/' + _activeProjectId + '/git/commit-push', { message: msg });
+}
+async function gitPull() { await doGitAction('/api/projects/' + _activeProjectId + '/git/pull'); }
+async function gitPush() { await doGitAction('/api/projects/' + _activeProjectId + '/git/push'); }
+async function gitRun(cmd) {
+  switchTab('terminal');
+  document.getElementById('termInput').value = cmd;
+  await runTermCmd();
+}
+
+async function doGitAction(url, body = {}) {
+  const outEl = document.getElementById('gitOutput');
+  if (outEl) { outEl.textContent = 'Running...'; outEl.classList.add('show'); }
+  try {
+    const r = await fetch(API + url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const d = await r.json();
+    const text = [d.stdout, d.stderr].filter(Boolean).join('\n').trim() || (d.ok ? 'Done.' : 'Failed.');
+    if (outEl) { outEl.textContent = text; }
+    await loadGitStatus();
+    const badge = document.getElementById('wsBranchName');
+    if (badge && d.branch) badge.textContent = d.branch;
+  } catch(e) { if (outEl) outEl.textContent = 'Error: ' + e; }
+}
+
+// ── Add project modal ─────────────────────────────────────────────────────────
+let _addMode = 'dir';
+function openAddModal(mode) { setAddMode(mode || 'dir'); document.getElementById('addModal').classList.add('open'); }
+function closeModal() { document.getElementById('addModal').classList.remove('open'); document.getElementById('addModalMsg').textContent = ''; }
+function setAddMode(mode) {
+  _addMode = mode;
+  document.getElementById('formDir').style.display = mode === 'dir' ? '' : 'none';
+  document.getElementById('formClone').style.display = mode === 'clone' ? '' : 'none';
+  document.getElementById('tabDir').style.borderColor = mode === 'dir' ? 'var(--teal)' : '';
+  document.getElementById('tabDir').style.color = mode === 'dir' ? 'var(--teal)' : '';
+  document.getElementById('tabClone').style.borderColor = mode === 'clone' ? 'var(--teal)' : '';
+  document.getElementById('tabClone').style.color = mode === 'clone' ? 'var(--teal)' : '';
+}
+
+async function submitAddProject() {
+  const msg = document.getElementById('addModalMsg');
+  const btn = document.getElementById('addModalBtn');
+  btn.disabled = true;
+  msg.textContent = 'Working...'; msg.style.color = 'var(--muted)';
+  try {
+    let r, d;
+    if (_addMode === 'dir') {
+      const path = document.getElementById('inputPath').value.trim();
+      const name = document.getElementById('inputName').value.trim();
+      if (!path) { msg.textContent = 'Path is required'; msg.style.color = 'var(--crimson)'; btn.disabled = false; return; }
+      r = await fetch(API + '/api/projects', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ path, name }) });
+    } else {
+      const url = document.getElementById('inputCloneUrl').value.trim();
+      const dest = document.getElementById('inputCloneDest').value.trim();
+      if (!url || !dest) { msg.textContent = 'URL and destination are required'; msg.style.color = 'var(--crimson)'; btn.disabled = false; return; }
+      r = await fetch(API + '/api/projects/clone', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ url, dest }) });
+    }
+    d = await r.json();
+    if (d.id || d.project) {
+      closeModal();
+      await loadProjects();
+      const p = d.id ? d : d.project;
+      if (p && p.id) await openProject(p.id, p.path, p.name);
+    } else { msg.textContent = d.error || 'Failed'; msg.style.color = 'var(--crimson)'; }
+  } catch(e) { msg.textContent = 'Error: ' + e; msg.style.color = 'var(--crimson)'; }
+  btn.disabled = false;
+}
+
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// ── Startup ───────────────────────────────────────────────────────────────────
+(async () => {
+  await loadProjects();
+  // Try to open the active project
+  try {
+    const r = await fetch(API + '/api/projects/active');
+    const p = await r.json();
+    if (p && p.id) await openProject(p.id, p.path, p.name);
+  } catch(e) {}
+})();
+</script>
+</body>
+</html>"""
+
+
 _MCP_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -1050,6 +1678,7 @@ input:checked + .slider:before { transform: translateX(14px); }
     <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
     <a href="/mcp" class="nav-btn active"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
 </div>
 <div class="main">
@@ -1314,6 +1943,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn active"><span class="icon">&#x1F4CB;</span> Run History</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
 </div>
 <div class="main">
@@ -1407,6 +2037,9 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/mcp":
             self._html(200, _MCP_HTML)
+            return
+        if path == "/projects":
+            self._html(200, _PROJECTS_HTML)
             return
         if path == "/api/health":
             self._json(200, {"service": "kendr-ui", "status": "ok"})
@@ -1539,6 +2172,26 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             provider = path[len("/api/oauth/"):-len("/callback")]
             self._handle_oauth_callback(provider, parse_qs(parsed.query or ""))
             return
+        if path == "/api/projects":
+            self._handle_projects_list()
+            return
+        if path == "/api/projects/active":
+            self._handle_project_active()
+            return
+        if path == "/api/projects/file":
+            params = parse_qs(parsed.query or "")
+            file_path = (params.get("path") or [""])[0]
+            project_root = (params.get("root") or [""])[0]
+            self._handle_project_read_file(file_path, project_root)
+            return
+        if path.startswith("/api/projects/") and path.endswith("/files"):
+            project_id = path[len("/api/projects/"):-len("/files")]
+            self._handle_project_file_tree(project_id)
+            return
+        if path.startswith("/api/projects/") and path.endswith("/git/status"):
+            project_id = path[len("/api/projects/"):-len("/git/status")]
+            self._handle_project_git_status(project_id)
+            return
         if path == "/api/mcp/servers":
             if not _HAS_MCP_MANAGER:
                 self._json(503, {"error": "MCP manager not available"})
@@ -1582,6 +2235,35 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/setup/enabled":
             self._handle_setup_enabled(body)
+            return
+        if path == "/api/projects":
+            self._handle_project_add(body)
+            return
+        if path == "/api/projects/clone":
+            self._handle_project_clone(body)
+            return
+        if path == "/api/projects/shell":
+            self._handle_project_shell(body)
+            return
+        if path.startswith("/api/projects/") and path.endswith("/activate"):
+            project_id = path[len("/api/projects/"):-len("/activate")]
+            self._handle_project_activate(project_id)
+            return
+        if path.startswith("/api/projects/") and path.endswith("/remove"):
+            project_id = path[len("/api/projects/"):-len("/remove")]
+            self._handle_project_remove(project_id)
+            return
+        if path.startswith("/api/projects/") and path.endswith("/git/pull"):
+            project_id = path[len("/api/projects/"):-len("/git/pull")]
+            self._handle_project_git_pull(project_id)
+            return
+        if path.startswith("/api/projects/") and path.endswith("/git/push"):
+            project_id = path[len("/api/projects/"):-len("/git/push")]
+            self._handle_project_git_push(project_id)
+            return
+        if path.startswith("/api/projects/") and path.endswith("/git/commit-push"):
+            project_id = path[len("/api/projects/"):-len("/git/commit-push")]
+            self._handle_project_git_commit_push(project_id, body)
             return
         if path == "/api/mcp/servers":
             self._handle_mcp_add(body)
@@ -1789,6 +2471,188 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
+    def _handle_projects_list(self) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        try:
+            self._json(200, _pm_list_projects())
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_active(self) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(404, {})
+            return
+        try:
+            proj = _pm_get_active()
+            self._json(200, proj or {})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_add(self, body: dict) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        path = str(body.get("path", "")).strip()
+        name = str(body.get("name", "")).strip()
+        if not path:
+            self._json(400, {"error": "path is required"})
+            return
+        try:
+            entry = _pm_add_project(path, name)
+            self._json(200, entry)
+        except Exception as exc:
+            self._json(400, {"error": str(exc)})
+
+    def _handle_project_clone(self, body: dict) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        url = str(body.get("url", "")).strip()
+        dest = str(body.get("dest", "")).strip()
+        name = str(body.get("name", "")).strip()
+        if not url or not dest:
+            self._json(400, {"error": "url and dest are required"})
+            return
+        try:
+            result = _pm_git_clone(url, dest, name)
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_activate(self, project_id: str) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        try:
+            ok = _pm_set_active(project_id)
+            self._json(200, {"ok": ok, "project_id": project_id})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_remove(self, project_id: str) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        try:
+            removed = _pm_remove_project(project_id)
+            self._json(200, {"removed": removed, "project_id": project_id})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_file_tree(self, project_id: str) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        try:
+            import kendr.project_manager as _pm_mod
+            projects = {p["id"]: p for p in _pm_mod.list_projects()}
+            proj = projects.get(project_id)
+            if not proj:
+                self._json(404, {"error": "Project not found"})
+                return
+            tree = _pm_file_tree(proj["path"])
+            self._json(200, tree)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_read_file(self, file_path: str, project_root: str) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        if not file_path:
+            self._json(400, {"error": "path is required"})
+            return
+        try:
+            result = _pm_read_file(file_path, project_root)
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_shell(self, body: dict) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        command = str(body.get("command", "")).strip()
+        cwd = str(body.get("cwd", "")).strip() or os.getcwd()
+        if not command:
+            self._json(400, {"error": "command is required"})
+            return
+        try:
+            result = _pm_shell(command, cwd, timeout=30)
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_git_status(self, project_id: str) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        try:
+            import kendr.project_manager as _pm_mod
+            projects = {p["id"]: p for p in _pm_mod.list_projects()}
+            proj = projects.get(project_id)
+            if not proj:
+                self._json(404, {"error": "Project not found"})
+                return
+            status = _pm_git_status(proj["path"])
+            self._json(200, status)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_git_pull(self, project_id: str) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        try:
+            import kendr.project_manager as _pm_mod
+            projects = {p["id"]: p for p in _pm_mod.list_projects()}
+            proj = projects.get(project_id)
+            if not proj:
+                self._json(404, {"error": "Project not found"})
+                return
+            result = _pm_git_pull(proj["path"])
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_git_push(self, project_id: str) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        try:
+            import kendr.project_manager as _pm_mod
+            projects = {p["id"]: p for p in _pm_mod.list_projects()}
+            proj = projects.get(project_id)
+            if not proj:
+                self._json(404, {"error": "Project not found"})
+                return
+            result = _pm_git_push(proj["path"])
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_git_commit_push(self, project_id: str, body: dict) -> None:
+        if not _HAS_PROJECT_MANAGER:
+            self._json(503, {"error": "Project manager not available"})
+            return
+        message = str(body.get("message", "")).strip()
+        if not message:
+            self._json(400, {"error": "commit message is required"})
+            return
+        try:
+            import kendr.project_manager as _pm_mod
+            projects = {p["id"]: p for p in _pm_mod.list_projects()}
+            proj = projects.get(project_id)
+            if not proj:
+                self._json(404, {"error": "Project not found"})
+                return
+            result = _pm_git_commit_push(proj["path"], message)
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
     def _handle_mcp_add(self, body: dict) -> None:
         if not _HAS_MCP_MANAGER:
             self._json(503, {"error": "MCP manager not available"})
@@ -1878,6 +2742,7 @@ def main() -> None:
     print(f"  Setup:  {display_url}/setup")
     print(f"  Runs:   {display_url}/runs")
     print(f"  MCP:    {display_url}/mcp")
+    print(f"  Projects: {display_url}/projects")
     print(f"  Gateway: {_gateway_url()} ({'online' if _gateway_ready(timeout=0.5) else 'offline — run: kendr gateway start'})")
     server.serve_forever()
 

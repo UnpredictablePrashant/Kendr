@@ -1,0 +1,353 @@
+"""Project Manager — kendr project workspace backend.
+
+Stores a registry of known project directories and provides:
+  - File tree reading
+  - File content access
+  - Shell command execution
+  - Git operations (status, pull, push, commit, clone, branch)
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import subprocess
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+_log = logging.getLogger("kendr.project_manager")
+
+_DEFAULT_STORE = os.path.join(os.path.expanduser("~"), ".kendr", "projects.json")
+_PROJECTS_STORE = os.getenv("KENDR_PROJECTS_STORE", _DEFAULT_STORE)
+_store_lock = threading.Lock()
+
+_MAX_FILE_SIZE = 256 * 1024  # 256 KB
+_MAX_TREE_DEPTH = 6
+_IGNORED_DIRS = {
+    ".git", "__pycache__", "node_modules", ".venv", "venv", ".env",
+    "dist", "build", ".next", ".nuxt", ".cache", "coverage",
+    ".mypy_cache", ".pytest_cache", ".tox", "eggs", ".eggs",
+}
+_IGNORED_EXTS = {".pyc", ".pyo", ".so", ".dylib", ".dll"}
+
+
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+def _load_store() -> dict:
+    try:
+        os.makedirs(os.path.dirname(_PROJECTS_STORE), exist_ok=True)
+        if os.path.isfile(_PROJECTS_STORE):
+            with open(_PROJECTS_STORE, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+    except Exception as exc:
+        _log.warning("Could not load projects store: %s", exc)
+    return {"projects": {}, "active": None}
+
+
+def _save_store(store: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(_PROJECTS_STORE), exist_ok=True)
+        with open(_PROJECTS_STORE, "w", encoding="utf-8") as fh:
+            json.dump(store, fh, indent=2)
+    except Exception as exc:
+        _log.warning("Could not save projects store: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Project registry
+# ---------------------------------------------------------------------------
+
+def list_projects() -> list[dict]:
+    with _store_lock:
+        store = _load_store()
+    projects = list(store.get("projects", {}).values())
+    projects.sort(key=lambda p: p.get("name", "").lower())
+    return projects
+
+
+def get_active_project() -> dict | None:
+    with _store_lock:
+        store = _load_store()
+    active_id = store.get("active")
+    if active_id:
+        return store.get("projects", {}).get(active_id)
+    projects = list(store.get("projects", {}).values())
+    return projects[0] if projects else None
+
+
+def set_active_project(project_id: str) -> bool:
+    with _store_lock:
+        store = _load_store()
+        if project_id not in store.get("projects", {}):
+            return False
+        store["active"] = project_id
+        _save_store(store)
+    return True
+
+
+def add_project(path: str, name: str = "") -> dict:
+    path = os.path.abspath(path)
+    if not os.path.isdir(path):
+        raise ValueError(f"Directory does not exist: {path}")
+    project_id = _path_to_id(path)
+    display_name = name.strip() or os.path.basename(path)
+    git_remote = _detect_git_remote(path)
+    entry = {
+        "id": project_id,
+        "name": display_name,
+        "path": path,
+        "git_remote": git_remote,
+        "added_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    with _store_lock:
+        store = _load_store()
+        store.setdefault("projects", {})[project_id] = entry
+        if store.get("active") is None:
+            store["active"] = project_id
+        _save_store(store)
+    return entry
+
+
+def remove_project(project_id: str) -> bool:
+    with _store_lock:
+        store = _load_store()
+        if project_id not in store.get("projects", {}):
+            return False
+        del store["projects"][project_id]
+        if store.get("active") == project_id:
+            remaining = list(store.get("projects", {}).keys())
+            store["active"] = remaining[0] if remaining else None
+        _save_store(store)
+    return True
+
+
+def _path_to_id(path: str) -> str:
+    import hashlib
+    return hashlib.md5(path.encode()).hexdigest()[:12]
+
+
+def _detect_git_remote(path: str) -> str:
+    try:
+        out = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=path, capture_output=True, text=True, timeout=5,
+        )
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# File tree
+# ---------------------------------------------------------------------------
+
+def read_file_tree(path: str, depth: int = 0) -> list[dict]:
+    """Return a recursive file tree for the given directory."""
+    if depth > _MAX_TREE_DEPTH:
+        return []
+    result: list[dict] = []
+    try:
+        entries = sorted(os.scandir(path), key=lambda e: (not e.is_dir(), e.name.lower()))
+        for entry in entries:
+            if entry.name.startswith(".") and entry.name != ".env.example":
+                if entry.name in {".gitignore", ".env.example", ".editorconfig"}:
+                    pass
+                else:
+                    continue
+            if entry.name in _IGNORED_DIRS:
+                continue
+            _, ext = os.path.splitext(entry.name)
+            if ext in _IGNORED_EXTS:
+                continue
+            node: dict[str, Any] = {
+                "name": entry.name,
+                "path": entry.path,
+                "type": "dir" if entry.is_dir() else "file",
+            }
+            if entry.is_dir():
+                node["children"] = read_file_tree(entry.path, depth + 1)
+            else:
+                node["size"] = entry.stat().st_size
+            result.append(node)
+    except PermissionError:
+        pass
+    return result
+
+
+def read_file_content(file_path: str, project_root: str = "") -> dict:
+    """Read a file's content with size guard and binary detection."""
+    abs_path = os.path.abspath(file_path)
+    if project_root:
+        root = os.path.abspath(project_root)
+        if not abs_path.startswith(root):
+            return {"ok": False, "error": "Path is outside project root"}
+    try:
+        size = os.path.getsize(abs_path)
+        if size > _MAX_FILE_SIZE:
+            return {"ok": False, "error": f"File too large ({size // 1024} KB). Limit is {_MAX_FILE_SIZE // 1024} KB."}
+        with open(abs_path, "rb") as fh:
+            raw = fh.read()
+        try:
+            content = raw.decode("utf-8")
+            return {"ok": True, "content": content, "encoding": "utf-8", "size": size, "path": abs_path}
+        except UnicodeDecodeError:
+            return {"ok": False, "error": "Binary file — cannot display as text"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "File not found"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+# ---------------------------------------------------------------------------
+# Shell execution
+# ---------------------------------------------------------------------------
+
+def run_shell(command: str, cwd: str, timeout: int = 30) -> dict:
+    """Run a shell command in the given directory. Returns stdout, stderr, exit code."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "TERM": "dumb"},
+        )
+        return {
+            "ok": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "returncode": result.returncode,
+            "command": command,
+            "cwd": cwd,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "stdout": "", "stderr": f"Command timed out after {timeout}s", "returncode": -1, "command": command, "cwd": cwd}
+    except Exception as exc:
+        return {"ok": False, "stdout": "", "stderr": str(exc), "returncode": -1, "command": command, "cwd": cwd}
+
+
+# ---------------------------------------------------------------------------
+# Git operations
+# ---------------------------------------------------------------------------
+
+def git_status(project_path: str) -> dict:
+    """Return a structured git status for the project."""
+    def _run(cmd: list[str]) -> str:
+        try:
+            r = subprocess.run(cmd, cwd=project_path, capture_output=True, text=True, timeout=10)
+            return r.stdout.strip()
+        except Exception:
+            return ""
+
+    if not os.path.isdir(os.path.join(project_path, ".git")):
+        return {"ok": False, "error": "Not a git repository", "is_git": False}
+
+    branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    remote = _run(["git", "remote", "get-url", "origin"])
+    short_status = _run(["git", "status", "--short"])
+    last_commit = _run(["git", "log", "-1", "--oneline"])
+    ahead_behind_raw = _run(["git", "rev-list", "--left-right", "--count", f"{branch}...origin/{branch}"])
+    ahead, behind = 0, 0
+    if "\t" in ahead_behind_raw:
+        parts = ahead_behind_raw.split("\t")
+        try:
+            ahead, behind = int(parts[0]), int(parts[1])
+        except Exception:
+            pass
+
+    changed: list[str] = []
+    staged: list[str] = []
+    untracked: list[str] = []
+    for line in short_status.splitlines():
+        if not line:
+            continue
+        xy = line[:2]
+        fname = line[3:]
+        if xy.startswith("?"):
+            untracked.append(fname)
+        elif xy[0] != " ":
+            staged.append(fname)
+        elif xy[1] != " ":
+            changed.append(fname)
+
+    return {
+        "ok": True,
+        "is_git": True,
+        "branch": branch,
+        "remote": remote,
+        "last_commit": last_commit,
+        "ahead": ahead,
+        "behind": behind,
+        "changed": changed,
+        "staged": staged,
+        "untracked": untracked,
+        "clean": not changed and not staged and not untracked,
+        "raw_status": short_status,
+    }
+
+
+def git_pull(project_path: str) -> dict:
+    return run_shell("git pull", project_path, timeout=60)
+
+
+def git_push(project_path: str, force: bool = False) -> dict:
+    cmd = "git push --force" if force else "git push"
+    return run_shell(cmd, project_path, timeout=60)
+
+
+def git_add_all(project_path: str) -> dict:
+    return run_shell("git add -A", project_path)
+
+
+def git_commit(project_path: str, message: str) -> dict:
+    safe_msg = message.replace('"', '\\"')
+    return run_shell(f'git commit -m "{safe_msg}"', project_path)
+
+
+def git_commit_and_push(project_path: str, message: str) -> dict:
+    add = git_add_all(project_path)
+    if not add["ok"] and add["returncode"] != 0:
+        return add
+    commit = git_commit(project_path, message)
+    push = git_push(project_path)
+    return {
+        "ok": push["ok"],
+        "add": add,
+        "commit": commit,
+        "push": push,
+        "stdout": "\n".join([add["stdout"], commit["stdout"], push["stdout"]]).strip(),
+        "stderr": "\n".join([add["stderr"], commit["stderr"], push["stderr"]]).strip(),
+    }
+
+
+def git_clone(url: str, dest_parent: str, name: str = "") -> dict:
+    dest_parent = os.path.abspath(dest_parent)
+    os.makedirs(dest_parent, exist_ok=True)
+    cmd = f"git clone {url}" + (f" {name}" if name else "")
+    result = run_shell(cmd, dest_parent, timeout=120)
+    if result["ok"]:
+        clone_name = name or url.rstrip("/").split("/")[-1].replace(".git", "")
+        cloned_path = os.path.join(dest_parent, clone_name)
+        if os.path.isdir(cloned_path):
+            entry = add_project(cloned_path)
+            result["project"] = entry
+    return result
+
+
+def git_branches(project_path: str) -> dict:
+    result = run_shell("git branch -a", project_path)
+    branches = [b.strip().lstrip("* ") for b in result["stdout"].splitlines() if b.strip()]
+    current = next((b.lstrip("* ") for b in result["stdout"].splitlines() if b.strip().startswith("*")), "")
+    return {"ok": result["ok"], "branches": branches, "current": current}
+
+
+def git_checkout(project_path: str, branch: str) -> dict:
+    safe = branch.replace('"', '')
+    return run_shell(f'git checkout "{safe}"', project_path)

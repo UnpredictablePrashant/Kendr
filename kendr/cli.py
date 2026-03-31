@@ -2122,6 +2122,37 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     generate_parser.add_argument("--json", action="store_true", help="Emit final state as JSON.")
     generate_parser.add_argument("--quiet", action="store_true", help="Suppress live progress messages.")
 
+    project_parser = subparsers.add_parser(
+        "project",
+        help="Manage coding projects: file tree, shell, GitHub, agent chat.",
+    )
+    command_parsers["project"] = project_parser
+    project_sub = project_parser.add_subparsers(dest="project_action", required=True)
+
+    project_sub.add_parser("list", help="List all registered projects.")
+
+    proj_add = project_sub.add_parser("add", help="Register a directory as a project.")
+    proj_add.add_argument("path", help="Absolute or relative path to the project directory.")
+    proj_add.add_argument("--name", default="", help="Display name for the project.")
+
+    proj_open = project_sub.add_parser("open", help="Set the active project and optionally open the UI.")
+    proj_open.add_argument("path_or_id", help="Project path or ID.")
+    proj_open.add_argument("--ui", action="store_true", help="Open the browser at the projects page.")
+
+    proj_rm = project_sub.add_parser("remove", help="Remove a project from the registry (does not delete files).")
+    proj_rm.add_argument("path_or_id", help="Project path or ID.")
+
+    proj_shell = project_sub.add_parser("shell", help="Run a shell command inside the active project.")
+    proj_shell.add_argument("command", nargs="+", help="Shell command to run.")
+    proj_shell.add_argument("--project", default="", help="Project path or ID (defaults to active).")
+
+    proj_git = project_sub.add_parser("git", help="Git operations on the active project.")
+    proj_git.add_argument("git_args", nargs="+", help="Git sub-command (status | pull | push | commit -m MSG | clone URL).")
+    proj_git.add_argument("--project", default="", help="Project path or ID (defaults to active).")
+
+    proj_status = project_sub.add_parser("status", help="Show active project info and git status.")
+    proj_status.add_argument("--project", default="", help="Project path or ID (defaults to active).")
+
     research_parser = subparsers.add_parser(
         "research",
         help="Run a multi-source research pipeline and generate a document.",
@@ -2499,6 +2530,174 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         _emit_status(args, style.ok(f"[generate] project output: {built_root}"))
 
     return 0
+
+
+def _cmd_project(args: argparse.Namespace) -> int:
+    style = _style_from_args(args)
+    action = args.project_action
+
+    try:
+        from kendr.project_manager import (
+            list_projects, get_active_project, set_active_project,
+            add_project, remove_project, git_status, git_pull, git_push,
+            git_commit, git_commit_and_push, git_clone, run_shell,
+        )
+    except ImportError as exc:
+        print(style.fail(f"Project manager not available: {exc}"))
+        return 1
+
+    def _resolve_project(path_or_id: str = "") -> dict | None:
+        projects = list_projects()
+        if not path_or_id:
+            return get_active_project()
+        # Try by ID first, then by path prefix
+        for p in projects:
+            if p["id"] == path_or_id or os.path.abspath(path_or_id) == p["path"]:
+                return p
+        # Try adding it on the fly if it's a valid path
+        if os.path.isdir(path_or_id):
+            return add_project(path_or_id)
+        return None
+
+    if action == "list":
+        projects = list_projects()
+        active = get_active_project()
+        active_id = active["id"] if active else None
+        if not projects:
+            print(style.muted("No projects registered. Use: kendr project add <path>"))
+            return 0
+        print(style.heading(f"{'NAME':<30} {'PATH':<45} {'ID'}"))
+        for p in projects:
+            marker = "* " if p["id"] == active_id else "  "
+            name = (marker + p["name"])[:30]
+            path = p["path"][:45]
+            print(f"{style.ok(name) if p['id']==active_id else name:<30} {path:<45} {p['id']}")
+        return 0
+
+    if action == "add":
+        path = os.path.abspath(args.path)
+        try:
+            entry = add_project(path, args.name)
+            print(style.ok(f"Added project: {entry['name']}"))
+            print(style.muted(f"  Path: {entry['path']}"))
+            print(style.muted(f"  ID:   {entry['id']}"))
+        except Exception as exc:
+            print(style.fail(f"Error: {exc}"))
+            return 1
+        return 0
+
+    if action == "open":
+        proj = _resolve_project(args.path_or_id)
+        if not proj:
+            path = os.path.abspath(args.path_or_id)
+            if os.path.isdir(path):
+                proj = add_project(path)
+            else:
+                print(style.fail(f"Project not found: {args.path_or_id}"))
+                return 1
+        set_active_project(proj["id"])
+        print(style.ok(f"Active project: {proj['name']}  ({proj['path']})"))
+        if getattr(args, "ui", False):
+            ui_port = int(os.getenv("KENDR_UI_PORT", "2151"))
+            url = f"http://localhost:{ui_port}/projects"
+            import webbrowser
+            webbrowser.open(url)
+            print(style.muted(f"Opening: {url}"))
+        return 0
+
+    if action == "remove":
+        proj = _resolve_project(args.path_or_id)
+        if not proj:
+            print(style.fail(f"Project not found: {args.path_or_id}"))
+            return 1
+        remove_project(proj["id"])
+        print(style.ok(f"Removed: {proj['name']}"))
+        return 0
+
+    if action == "status":
+        proj_arg = getattr(args, "project", "")
+        proj = _resolve_project(proj_arg)
+        if not proj:
+            print(style.fail("No active project. Use: kendr project add <path>"))
+            return 1
+        print(style.heading(f"Project: {proj['name']}"))
+        print(style.muted(f"  Path: {proj['path']}"))
+        print(style.muted(f"  ID:   {proj['id']}"))
+        s = git_status(proj["path"])
+        if not s.get("is_git"):
+            print(style.muted("  Git: not a git repository"))
+            return 0
+        print(style.ok(f"  Branch: {s.get('branch', '?')}"))
+        print(style.muted(f"  Remote: {s.get('remote') or 'none'}"))
+        print(style.muted(f"  Last commit: {s.get('last_commit') or 'none'}"))
+        if s.get("clean"):
+            print(style.ok("  Status: clean"))
+        else:
+            if s.get("changed"):
+                print(style.warn(f"  Modified: {', '.join(s['changed'][:8])}"))
+            if s.get("staged"):
+                print(style.ok(f"  Staged: {', '.join(s['staged'][:8])}"))
+            if s.get("untracked"):
+                print(style.muted(f"  Untracked: {', '.join(s['untracked'][:8])}"))
+        return 0
+
+    if action == "shell":
+        proj_arg = getattr(args, "project", "")
+        proj = _resolve_project(proj_arg)
+        if not proj:
+            print(style.fail("No active project. Use: kendr project add <path>"))
+            return 1
+        command = " ".join(args.command)
+        result = run_shell(command, proj["path"])
+        if result["stdout"]:
+            print(result["stdout"], end="")
+        if result["stderr"]:
+            print(style.fail(result["stderr"]), end="", file=sys.stderr)
+        return result["returncode"]
+
+    if action == "git":
+        proj_arg = getattr(args, "project", "")
+        proj = _resolve_project(proj_arg)
+        if not proj:
+            print(style.fail("No active project. Use: kendr project add <path>"))
+            return 1
+        git_cmd = " ".join(args.git_args)
+        # Handle shorthand actions
+        if git_cmd.startswith("status"):
+            s = git_status(proj["path"])
+            if not s.get("is_git"):
+                print(style.fail("Not a git repository"))
+                return 1
+            print(style.ok(f"Branch: {s.get('branch','?')}  |  Remote: {s.get('remote') or 'none'}"))
+            print(f"  Last commit: {s.get('last_commit','none')}")
+            if s.get("clean"):
+                print(style.ok("  Working tree clean"))
+            else:
+                for f in (s.get("changed") or []):
+                    print(style.warn(f"  M  {f}"))
+                for f in (s.get("staged") or []):
+                    print(style.ok(f"  S  {f}"))
+                for f in (s.get("untracked") or []):
+                    print(style.muted(f"  ?  {f}"))
+            return 0
+        elif git_cmd == "pull":
+            result = git_pull(proj["path"])
+        elif git_cmd == "push":
+            result = git_push(proj["path"])
+        elif git_cmd.startswith("commit "):
+            msg = git_cmd[len("commit "):].strip().lstrip("-m").strip().strip('"\'')
+            result = git_commit(proj["path"], msg)
+        else:
+            # Pass raw git command
+            result = run_shell(f"git {git_cmd}", proj["path"])
+        if result.get("stdout"):
+            print(result["stdout"], end="")
+        if result.get("stderr"):
+            print(result["stderr"], end="", file=sys.stderr)
+        return 0 if result.get("ok") else 1
+
+    print(style.fail(f"Unknown project action: {action}"))
+    return 1
 
 
 def _cmd_research(args: argparse.Namespace) -> int:
@@ -4585,6 +4784,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_run(args)
         if args.command == "generate":
             return _cmd_generate(args)
+        if args.command == "project":
+            return _cmd_project(args)
         if args.command == "research":
             return _cmd_research(args)
         if args.command == "agents":
