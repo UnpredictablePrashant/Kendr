@@ -889,6 +889,57 @@ class AgentRuntime:
         )
         return any(marker in text for marker in markers)
 
+    def _is_github_request(self, state: dict) -> bool:
+        """Return True when the query is a clear GitHub / git repository intent.
+
+        Checks explicit state keys first, then applies keyword matching against
+        the user query and current objective.  Excludes generic project-build
+        requests so they continue through the normal blueprint/dev-pipeline flow.
+        """
+        if any(state.get(k) for k in ("github_repo", "github_owner", "github_task")):
+            return True
+
+        text = " ".join(
+            [
+                str(state.get("user_query", "")),
+                str(state.get("current_objective", "")),
+            ]
+        ).lower()
+        if not text.strip():
+            return False
+
+        strong_markers = (
+            "open a pr",
+            "open a pull request",
+            "create a pull request",
+            "create a pr",
+            "merge the pr",
+            "merge pr",
+            "clone the repo",
+            "clone the repository",
+            "git clone",
+            "push to github",
+            "push to the repo",
+            "list github issues",
+            "list open issues on",
+            "github issues",
+            "create github issue",
+            "open github issue",
+            "fork the repo",
+            "fork repo",
+        )
+        if any(m in text for m in strong_markers):
+            return True
+
+        repo_pattern_present = bool(
+            __import__("re").search(r"\bgithub\.com/[\w.-]+/[\w.-]+", text)
+            or __import__("re").search(r"\b[\w.-]+/[\w.-]+\s+repo(sitory)?\b", text)
+        )
+        if repo_pattern_present:
+            return True
+
+        return False
+
     def _is_long_document_request(self, state: dict) -> bool:
         if bool(state.get("long_document_mode", False)):
             return True
@@ -1449,6 +1500,33 @@ class AgentRuntime:
                     intent="local-command-dispatch",
                     content=objective,
                     state_updates={"current_objective": objective},
+                ),
+            )
+            return state
+
+        if (
+            not state.get("plan_steps")
+            and state.get("last_agent") != "github_agent"
+            and self._is_agent_available(state, "github_agent")
+            and self._is_github_request(state)
+            and not self._is_project_build_request(state)
+        ):
+            reason = (
+                "The request is a GitHub / git repository workflow (PR, issue, clone, push, etc.). "
+                "Route to github_agent for direct, deterministic execution."
+            )
+            objective = state.get("current_objective") or state.get("user_query", "")
+            state["orchestrator_reason"] = reason
+            state["next_agent"] = "github_agent"
+            state["github_task"] = state.get("github_task") or objective
+            state = append_task(
+                state,
+                make_task(
+                    sender="orchestrator_agent",
+                    recipient="github_agent",
+                    intent="github-operation",
+                    content=objective,
+                    state_updates={"github_task": state["github_task"]},
                 ),
             )
             return state
@@ -2114,6 +2192,7 @@ Rules:
 - If gateway_message exists but channel_session is missing, prefer session_router_agent before other work.
 - If the user asks for an unavailable integration, use worker_agent to explain the missing setup unless agent_factory_agent is better suited.
 - For end-to-end software build requests that need detailed architecture, project planning, and delegated implementation/setup, prefer master_coding_agent first.
+- For GitHub / git repository operations (clone, PR, issue, push, branch, commit, fork, diff), prefer github_agent directly — do not route through the generic planner.
 - Finish when the current state already contains a good final answer.
 - Never use any agent for exploitation, credential attacks, service disruption, or unauthorized access.
 - If the reviewer already requested a retry, follow that instruction rather than inventing a different reroute.

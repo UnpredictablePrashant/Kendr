@@ -187,20 +187,33 @@ def _fallback_operations(task: str) -> list[dict]:
 
     Used when the LLM plan produces zero operations so the agent always performs
     something meaningful rather than returning an empty success.
+
+    PR precondition rule: create_pr is only emitted after commit+push have been
+    scheduled in the same sequence.  This prevents opening a PR with an un-pushed
+    branch, which would fail at the GitHub API level.
     """
     lower = task.lower()
     ops: list[dict] = []
 
-    if any(w in lower for w in ["clone", "fix", "edit", "change", "update", "write", "commit", "push", "pr", "pull request"]):
+    wants_edit = any(w in lower for w in ["fix", "edit", "change", "update", "write"])
+    wants_pr = any(w in lower for w in ["pr", "pull request", "open a pr"])
+    wants_code_action = any(w in lower for w in [
+        "clone", "fix", "edit", "change", "update", "write", "commit", "push", "pr", "pull request",
+    ])
+
+    if wants_code_action:
         ops.append({"op": "clone_repo", "params": {}})
-        if any(w in lower for w in ["fix", "edit", "change", "update", "write"]):
+        if wants_edit or wants_pr:
             branch_name = "kendr/fix"
             ops.append({"op": "create_branch", "params": {"branch": branch_name}})
-        if any(w in lower for w in ["pr", "pull request", "open a pr"]):
+        if wants_pr:
+            ops.append({"op": "commit", "params": {"message": "kendr: automated changes"}})
+            ops.append({"op": "push", "params": {}})
             ops.append({"op": "create_pr", "params": {}})
 
     if any(w in lower for w in ["issue", "bug", "error", "problem", "fail"]):
-        ops.append({"op": "list_issues", "params": {"state": "open"}})
+        if not any(o["op"] == "list_issues" for o in ops):
+            ops.append({"op": "list_issues", "params": {"state": "open"}})
 
     if not ops:
         ops.append({"op": "list_issues", "params": {"state": "open"}})
@@ -454,11 +467,26 @@ def github_agent(state):
         report_parts += ["", "--- Issues ---", issues_text[:2000]]
     write_text_file("github_agent_output.txt", "\n".join(report_parts))
 
+    result = {
+        "schema_version": "github_agent/v1",
+        "task": task[:400],
+        "plan_summary": plan_summary,
+        "repo": f"{resolved_owner}/{resolved_repo}",
+        "operations_executed": len(log_lines),
+        "operations_log": log_lines,
+        "pr_url": pr_url or None,
+        "diff_excerpt": diff_text[:4000] if diff_text else None,
+        "issues": issues if issues else None,
+        "summary": summary,
+    }
+    result_json = json.dumps(result, indent=2, ensure_ascii=False)
+    write_text_file("github_agent_result.json", result_json)
+
     publish_agent_output(
         state,
         "github_agent",
         summary,
-        "github_agent_result.txt",
-        kind="text",
+        "github_agent_result.json",
+        kind="json",
     )
     return state

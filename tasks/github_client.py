@@ -1,4 +1,14 @@
-"""GitHub REST API client and local git operation wrapper for kendr's github_agent."""
+"""GitHub REST API client and local git operation wrapper for kendr's github_agent.
+
+Design note — synchronous implementation:
+    kendr is a fully synchronous multi-agent runtime (no asyncio event loop).
+    All agents, tools, and infra helpers use blocking I/O throughout.
+    This client intentionally mirrors that contract: urllib.request for HTTP
+    and subprocess.run for git.  Wrapping it in asyncio would require thread
+    executors or a separate event loop and would add complexity with no benefit
+    in the kendr context.  If kendr ever migrates to an async runtime this
+    module should be ported to httpx/asyncio at that time.
+"""
 
 from __future__ import annotations
 
