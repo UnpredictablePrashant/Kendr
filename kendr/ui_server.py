@@ -1048,6 +1048,9 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         if path == "/runs":
             self._html(200, _RUNS_HTML)
             return
+        if path == "/api/health":
+            self._json(200, {"service": "kendr-ui", "status": "ok"})
+            return
         if path == "/api/gateway/status":
             working_dir = os.getenv("KENDR_WORKING_DIR", "").strip()
             self._json(200, {

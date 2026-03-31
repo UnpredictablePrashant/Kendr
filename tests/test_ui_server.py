@@ -151,6 +151,31 @@ class TestUIServerRawValuesStripped(unittest.TestCase):
                             "Plaintext secret must not appear in response")
 
 
+class TestHealthEndpoint(unittest.TestCase):
+    def test_health_returns_kendr_ui_service(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+        _, port = srv.server_address
+
+        t = threading.Thread(target=srv.handle_request, daemon=True)
+        t.start()
+        try:
+            conn = HTTPConnection("127.0.0.1", port, timeout=3)
+            conn.request("GET", "/api/health")
+            resp = conn.getresponse()
+            body = json.loads(resp.read())
+            conn.close()
+        finally:
+            srv.server_close()
+            t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body.get("service"), "kendr-ui")
+        self.assertEqual(body.get("status"), "ok")
+
+
 class TestStreamAlias(unittest.TestCase):
     def test_stream_alias_rejects_missing_run_id(self):
         from kendr.ui_server import KendrUIHandler
