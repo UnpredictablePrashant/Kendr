@@ -226,6 +226,7 @@ def _register_mcp_tools(registry: Registry) -> None:
             _server_type_captured = server_type
             _server_name_captured = server_name
             _auth_token_captured = auth_token
+            _tool_schema_captured = tool.get("schema", {})
 
             def _make_handler(
                 tname: str,
@@ -233,6 +234,7 @@ def _register_mcp_tools(registry: Registry) -> None:
                 stype: str,
                 sname: str,
                 tok: str,
+                schema: dict,
             ):
                 def _mcp_tool_handler(state: dict) -> dict:
                     import asyncio as _asyncio
@@ -246,7 +248,27 @@ def _register_mcp_tools(registry: Registry) -> None:
 
                     tool_input: dict = state.get(f"mcp_input_{tname}", state.get("mcp_tool_input", {}))
                     if not isinstance(tool_input, dict):
-                        tool_input = {}
+                        try:
+                            tool_input = _json.loads(tool_input) if tool_input else {}
+                        except Exception:
+                            tool_input = {}
+
+                    if not tool_input and isinstance(schema, dict):
+                        props = schema.get("properties") or {}
+                        candidate: dict = {}
+                        for prop_name in props:
+                            for key in (
+                                prop_name,
+                                f"mcp_{prop_name}",
+                                f"{tname}_{prop_name}",
+                                f"{sname}_{prop_name}",
+                            ):
+                                val = state.get(key)
+                                if val is not None:
+                                    candidate[prop_name] = val
+                                    break
+                        if candidate:
+                            tool_input = candidate
 
                     async def _call():
                         client_kwargs: dict = {}
@@ -283,6 +305,7 @@ def _register_mcp_tools(registry: Registry) -> None:
                 _server_type_captured,
                 _server_name_captured,
                 _auth_token_captured,
+                _tool_schema_captured,
             )
 
             skills = [tool_slug, server_slug, "mcp"]

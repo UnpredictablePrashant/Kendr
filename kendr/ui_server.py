@@ -4326,7 +4326,11 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             entry = _mcp_add_server(name, connection, server_type, description, auth_token)
             server_id = entry["id"]
             result = _mcp_discover_tools(server_id)
-            result["server"] = _mcp_get_server(server_id)
+            srv = _mcp_get_server(server_id) or {}
+            if srv.get("auth_token"):
+                srv = dict(srv)
+                srv["auth_token"] = "****"
+            result["server"] = srv
             self._json(200, result)
         except Exception as exc:
             self._json(500, {"error": str(exc)})
