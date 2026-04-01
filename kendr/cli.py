@@ -2520,9 +2520,19 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     command_parsers["mcp"] = mcp_parser
     mcp_sub = mcp_parser.add_subparsers(dest="mcp_action", metavar="ACTION")
 
-    mcp_add = mcp_sub.add_parser("add", help="Register a new MCP server.")
-    mcp_add.add_argument("name", help="Human-readable server name.")
-    mcp_add.add_argument("connection", help="HTTP endpoint (http://host:port/mcp) or stdio shell command.")
+    mcp_add = mcp_sub.add_parser(
+        "add",
+        help="Register a new MCP server.",
+        description=(
+            "Register a new MCP server.\n\n"
+            "Usage (positional):  kendr mcp add <name> <connection>\n"
+            "Usage (flags):       kendr mcp add --name <name> --url <connection>"
+        ),
+    )
+    mcp_add.add_argument("name", nargs="?", default=None, help="Human-readable server name (or use --name).")
+    mcp_add.add_argument("connection", nargs="?", default=None, help="HTTP endpoint or stdio command (or use --url).")
+    mcp_add.add_argument("--name", dest="name_flag", default=None, metavar="NAME", help="Server name (overrides positional).")
+    mcp_add.add_argument("--url", dest="url_flag", default=None, metavar="URL", help="HTTP endpoint or stdio command (overrides positional).")
     mcp_add.add_argument(
         "--type", dest="server_type", default="http", choices=["http", "stdio"],
         help="Connection type: 'http' (default) or 'stdio'.",
@@ -2765,8 +2775,8 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
         return 0
 
     if action == "add":
-        name = str(getattr(args, "name", "")).strip()
-        connection = str(getattr(args, "connection", "")).strip()
+        name = str(getattr(args, "name_flag", None) or getattr(args, "name", "") or "").strip()
+        connection = str(getattr(args, "url_flag", None) or getattr(args, "connection", "") or "").strip()
         server_type = str(getattr(args, "server_type", "http"))
         description = str(getattr(args, "description", ""))
         auth_token = str(getattr(args, "auth_token", ""))

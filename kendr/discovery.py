@@ -206,6 +206,7 @@ def _register_mcp_tools(registry: Registry) -> None:
         server_id = server.get("id", "")
         connection = server.get("connection", "")
         server_type = server.get("type", "http")
+        auth_token = server.get("auth_token", "")
 
         for tool in tools:
             tool_name = str(tool.get("name", "")).strip()
@@ -224,12 +225,14 @@ def _register_mcp_tools(registry: Registry) -> None:
             _connection_captured = connection
             _server_type_captured = server_type
             _server_name_captured = server_name
+            _auth_token_captured = auth_token
 
             def _make_handler(
                 tname: str,
                 conn: str,
                 stype: str,
                 sname: str,
+                tok: str,
             ):
                 def _mcp_tool_handler(state: dict) -> dict:
                     import asyncio as _asyncio
@@ -246,7 +249,10 @@ def _register_mcp_tools(registry: Registry) -> None:
                         tool_input = {}
 
                     async def _call():
-                        async with _MCPClient(conn, timeout=30) as client:
+                        client_kwargs: dict = {}
+                        if stype != "stdio" and tok:
+                            client_kwargs = {"headers": {"Authorization": f"Bearer {tok}"}}
+                        async with _MCPClient(conn, timeout=30, **client_kwargs) as client:
                             return await client.call_tool(tname, tool_input)
 
                     try:
@@ -276,6 +282,7 @@ def _register_mcp_tools(registry: Registry) -> None:
                 _connection_captured,
                 _server_type_captured,
                 _server_name_captured,
+                _auth_token_captured,
             )
 
             skills = [tool_slug, server_slug, "mcp"]

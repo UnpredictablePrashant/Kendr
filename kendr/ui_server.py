@@ -74,7 +74,7 @@ _UI_HOST = os.getenv("KENDR_UI_HOST", "127.0.0.1")
 
 try:
     from kendr.mcp_manager import (
-        list_servers as _mcp_list_servers,
+        list_servers_safe as _mcp_list_servers,
         get_server as _mcp_get_server,
         add_server as _mcp_add_server,
         remove_server as _mcp_remove_server,

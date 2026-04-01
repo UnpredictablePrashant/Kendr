@@ -56,12 +56,24 @@ def _save_registry(reg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def list_servers() -> list[dict]:
-    """Return all registered MCP servers (sorted by name)."""
+    """Return all registered MCP servers (sorted by name) — includes auth_token (internal use)."""
     with _store_lock:
         reg = _load_registry()
     servers = list(reg.get("servers", {}).values())
     servers.sort(key=lambda s: s.get("name", "").lower())
     return servers
+
+
+def list_servers_safe() -> list[dict]:
+    """Return all registered MCP servers with auth_token redacted — safe for API responses."""
+    servers = list_servers()
+    result = []
+    for s in servers:
+        entry = dict(s)
+        if entry.get("auth_token"):
+            entry["auth_token"] = "****"
+        result.append(entry)
+    return result
 
 
 def get_server(server_id: str) -> dict | None:
