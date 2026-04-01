@@ -2153,6 +2153,73 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     proj_status = project_sub.add_parser("status", help="Show active project info and git status.")
     proj_status.add_argument("--project", default="", help="Project path or ID (defaults to active).")
 
+    rag_parser = subparsers.add_parser("rag", help="Manage Super-RAG knowledge bases: vector store, sources, reranker, agents.")
+    command_parsers["rag"] = rag_parser
+    rag_sub = rag_parser.add_subparsers(dest="rag_action", required=True)
+
+    rag_sub.add_parser("list", help="List all knowledge bases.")
+
+    rag_create = rag_sub.add_parser("create", help="Create a new knowledge base.")
+    rag_create.add_argument("name", help="KB name.")
+    rag_create.add_argument("--description", default="", help="Optional description.")
+
+    rag_status = rag_sub.add_parser("status", help="Show status of a KB (vector backend, stats, sources).")
+    rag_status.add_argument("--kb", default="", help="KB name or ID (defaults to active).")
+
+    rag_add_src = rag_sub.add_parser("add-source", help="Add a source to a knowledge base.")
+    rag_add_src.add_argument("--kb", default="", help="KB name or ID (defaults to active).")
+    rag_add_src.add_argument("--type", dest="source_type", default="folder",
+                             choices=["folder", "file", "url", "database", "onedrive"],
+                             help="Source type.")
+    rag_add_src.add_argument("--path", default="", help="File or folder path (for folder/file types).")
+    rag_add_src.add_argument("--url", default="", help="URL to crawl (for url type).")
+    rag_add_src.add_argument("--db-url", default="", help="Database connection URL (for database type).")
+    rag_add_src.add_argument("--label", default="", help="Friendly name for the source.")
+    rag_add_src.add_argument("--recursive", action="store_true", default=True, help="Recurse into subdirectories.")
+    rag_add_src.add_argument("--max-files", type=int, default=300, help="Max files to ingest (folder type).")
+    rag_add_src.add_argument("--max-pages", type=int, default=20, help="Max pages to crawl (url type).")
+    rag_add_src.add_argument("--extensions", default="", help="Comma-separated file extensions to include.")
+    rag_add_src.add_argument("--tables", default="", help="Comma-separated table names (database type).")
+
+    rag_index = rag_sub.add_parser("index", help="Trigger indexing of all (or specific) sources.")
+    rag_index.add_argument("--kb", default="", help="KB name or ID (defaults to active).")
+    rag_index.add_argument("--wait", action="store_true", help="Wait for indexing to complete.")
+
+    rag_query = rag_sub.add_parser("query", help="Search the knowledge base.")
+    rag_query.add_argument("query", nargs="+", help="Search query.")
+    rag_query.add_argument("--kb", default="", help="KB name or ID (defaults to active).")
+    rag_query.add_argument("--top-k", type=int, default=8, help="Number of results.")
+    rag_query.add_argument("--ai", action="store_true", help="Generate an AI answer from retrieved chunks.")
+
+    rag_cfg_vec = rag_sub.add_parser("config-vector", help="Configure vector store backend.")
+    rag_cfg_vec.add_argument("--kb", default="", help="KB name or ID.")
+    rag_cfg_vec.add_argument("--backend", choices=["chromadb", "qdrant", "pgvector"], help="Vector backend.")
+    rag_cfg_vec.add_argument("--qdrant-url", default="", help="Qdrant server URL.")
+    rag_cfg_vec.add_argument("--pgvector-url", default="", help="PostgreSQL URL for pgvector.")
+    rag_cfg_vec.add_argument("--embedding-model", default="", help="Embedding model (e.g. openai:text-embedding-3-small).")
+
+    rag_cfg_rr = rag_sub.add_parser("config-reranker", help="Configure reranking algorithm.")
+    rag_cfg_rr.add_argument("--kb", default="", help="KB name or ID.")
+    rag_cfg_rr.add_argument("--algorithm", choices=["none", "keyword", "rrf", "cross_encoder", "cohere"],
+                            help="Reranking algorithm.")
+    rag_cfg_rr.add_argument("--top-k", type=int, default=0, help="Number of results to return (0=keep current).")
+    rag_cfg_rr.add_argument("--keyword-weight", type=float, default=0.0, help="Keyword weight for 'keyword' algorithm (0-1).")
+    rag_cfg_rr.add_argument("--cohere-api-key", default="", help="Cohere API key.")
+
+    rag_enable_agent = rag_sub.add_parser("enable-agent", help="Enable an agent to access this KB (Super-RAG).")
+    rag_enable_agent.add_argument("agent", help="Agent name (e.g. superrag_agent).")
+    rag_enable_agent.add_argument("--kb", default="", help="KB name or ID.")
+
+    rag_disable_agent = rag_sub.add_parser("disable-agent", help="Disable an agent from accessing this KB.")
+    rag_disable_agent.add_argument("agent", help="Agent name.")
+    rag_disable_agent.add_argument("--kb", default="", help="KB name or ID.")
+
+    rag_activate = rag_sub.add_parser("activate", help="Set a KB as the active knowledge base.")
+    rag_activate.add_argument("name_or_id", help="KB name or ID.")
+
+    rag_delete = rag_sub.add_parser("delete", help="Delete a knowledge base (config only, not vector data).")
+    rag_delete.add_argument("name_or_id", help="KB name or ID.")
+
     research_parser = subparsers.add_parser(
         "research",
         help="Run a multi-source research pipeline and generate a document.",
@@ -2697,6 +2764,266 @@ def _cmd_project(args: argparse.Namespace) -> int:
         return 0 if result.get("ok") else 1
 
     print(style.fail(f"Unknown project action: {action}"))
+    return 1
+
+
+def _cmd_rag(args: argparse.Namespace) -> int:
+    style = _style_from_args(args)
+    action = args.rag_action
+
+    try:
+        from kendr.rag_manager import (
+            list_kbs, get_kb, get_active_kb, set_active_kb,
+            create_kb, delete_kb, add_source, update_vector_config,
+            update_reranker_config, toggle_agent, index_kb, get_index_job,
+            query_kb, generate_answer, kb_status,
+        )
+    except ImportError as exc:
+        print(style.fail(f"RAG manager not available: {exc}"))
+        return 1
+
+    def _resolve_kb(name_or_id: str = "") -> dict | None:
+        kbs = list_kbs()
+        if not name_or_id:
+            return get_active_kb()
+        for kb in kbs:
+            if kb["id"] == name_or_id or kb["name"].lower() == name_or_id.lower():
+                return kb
+        return None
+
+    if action == "list":
+        kbs = list_kbs()
+        active = get_active_kb()
+        active_id = active["id"] if active else None
+        if not kbs:
+            print(style.muted("No knowledge bases. Use: kendr rag create <name>"))
+            return 0
+        print(style.heading(f"{'NAME':<28} {'STATUS':<10} {'CHUNKS':>7} {'SOURCES':>8}  {'ID'}"))
+        for kb in kbs:
+            marker = "★ " if kb["id"] == active_id else "  "
+            name = (marker + kb["name"])[:28]
+            s = kb.get("stats", {})
+            status = kb.get("status", "empty")
+            line = f"{name:<28} {status:<10} {s.get('total_chunks',0):>7} {len(kb.get('sources',[{'':[]}])):>8}  {kb['id']}"
+            if kb["id"] == active_id:
+                print(style.ok(line))
+            else:
+                print(line)
+        return 0
+
+    if action == "create":
+        try:
+            kb = create_kb(args.name, description=getattr(args, "description", ""))
+            print(style.ok(f"Created KB: {kb['name']}"))
+            print(style.muted(f"  ID: {kb['id']}"))
+            print(style.muted(f"  Collection: {kb['collection_name']}"))
+        except Exception as exc:
+            print(style.fail(f"Error: {exc}"))
+            return 1
+        return 0
+
+    if action == "delete":
+        kb = _resolve_kb(args.name_or_id)
+        if not kb:
+            print(style.fail(f"KB not found: {args.name_or_id}"))
+            return 1
+        ans = input(f"Delete '{kb['name']}'? [y/N] ")
+        if ans.strip().lower() != "y":
+            print("Cancelled.")
+            return 0
+        delete_kb(kb["id"])
+        print(style.ok(f"Deleted: {kb['name']}"))
+        return 0
+
+    if action == "activate":
+        kb = _resolve_kb(args.name_or_id)
+        if not kb:
+            print(style.fail(f"KB not found: {args.name_or_id}"))
+            return 1
+        set_active_kb(kb["id"])
+        print(style.ok(f"Active KB: {kb['name']}"))
+        return 0
+
+    if action == "status":
+        kb = _resolve_kb(getattr(args, "kb", ""))
+        if not kb:
+            print(style.fail("No KB found. Use: kendr rag create <name>"))
+            return 1
+        s = kb_status(kb["id"])
+        print(style.heading(f"KB: {kb['name']}  ({kb['id']})"))
+        print(style.muted(f"  Status:    {s.get('status','empty')}"))
+        print(style.muted(f"  Backend:   {s.get('vector_backend','chromadb')} ({'✓' if s.get('backend_ok') else '✗'})"))
+        print(style.muted(f"  Embedding: {s.get('embedding_model','')}"))
+        print(style.muted(f"  Reranker:  {s.get('reranker','')}"))
+        stats = s.get("stats", {})
+        print(style.muted(f"  Chunks:    {stats.get('total_chunks',0)}"))
+        print(style.muted(f"  Items:     {stats.get('total_items',0)}"))
+        print(style.muted(f"  Agents:    {', '.join(s.get('enabled_agents',[]) or ['none'])}"))
+        sources = kb.get("sources", [])
+        if sources:
+            print(style.heading("\n  Sources:"))
+            for src in sources:
+                dot = "✓" if src.get("status") == "indexed" else ("⚡" if src.get("status") == "indexing" else "○")
+                print(style.muted(f"    {dot} [{src['type']}] {src['label']}  ({src.get('stats',{}).get('chunks',0)} chunks)"))
+        return 0
+
+    if action == "add-source":
+        kb = _resolve_kb(getattr(args, "kb", ""))
+        if not kb:
+            print(style.fail("No KB found."))
+            return 1
+        try:
+            src = add_source(
+                kb["id"],
+                args.source_type,
+                label=args.label,
+                path=getattr(args, "path", ""),
+                url=getattr(args, "url", ""),
+                db_url=getattr(args, "db_url", ""),
+                recursive=getattr(args, "recursive", True),
+                max_files=getattr(args, "max_files", 300),
+                max_pages=getattr(args, "max_pages", 20),
+                extensions=getattr(args, "extensions", ""),
+                tables=getattr(args, "tables", ""),
+            )
+            print(style.ok(f"Added source: {src['label']}  [{src['type']}]  ID: {src['source_id']}"))
+        except Exception as exc:
+            print(style.fail(f"Error: {exc}"))
+            return 1
+        return 0
+
+    if action == "index":
+        kb = _resolve_kb(getattr(args, "kb", ""))
+        if not kb:
+            print(style.fail("No KB found."))
+            return 1
+        print(style.muted(f"Starting indexing for '{kb['name']}'…"))
+        job = index_kb(kb["id"])
+        print(style.ok(f"Indexing started. Status: {job.get('status','running')}"))
+        if getattr(args, "wait", False):
+            import time
+            print(style.muted("Waiting for completion (Ctrl+C to stop waiting)…"))
+            try:
+                while True:
+                    time.sleep(2)
+                    j = get_index_job(kb["id"])
+                    if not j:
+                        break
+                    status = j.get("status", "running")
+                    done = j.get("sources_done", 0)
+                    total = j.get("sources_total", 0)
+                    chunks = j.get("chunks_indexed", 0)
+                    print(f"\r  {status}  {done}/{total} sources  {chunks} chunks indexed", end="", flush=True)
+                    if status != "running":
+                        print()
+                        break
+            except KeyboardInterrupt:
+                print()
+        return 0
+
+    if action == "query":
+        kb = _resolve_kb(getattr(args, "kb", ""))
+        if not kb:
+            print(style.fail("No KB found."))
+            return 1
+        query_str = " ".join(args.query)
+        top_k = getattr(args, "top_k", 8)
+        with_ai = getattr(args, "ai", False)
+        print(style.muted(f"Searching '{kb['name']}'…"))
+        try:
+            if with_ai:
+                result = generate_answer(kb["id"], query_str, top_k=top_k)
+                answer = result.get("answer", "")
+                print(style.heading("\nAnswer:"))
+                print(answer)
+            else:
+                result = query_kb(kb["id"], query_str, top_k=top_k)
+            hits = result.get("hits", [])
+            print(style.heading(f"\nRetrieved {len(hits)} chunks  (reranker: {result.get('algorithm','none')}):"))
+            for i, hit in enumerate(hits, start=1):
+                source = hit.get("source", "?")
+                score = hit.get("score")
+                score_str = f"{score:.4f}" if score is not None else "?"
+                text = str(hit.get("text", ""))[:200].replace("\n", " ")
+                print(style.ok(f"[{i}] score={score_str}  source={source}"))
+                print(style.muted(f"    {text}"))
+        except Exception as exc:
+            print(style.fail(f"Error: {exc}"))
+            return 1
+        return 0
+
+    if action == "config-vector":
+        kb = _resolve_kb(getattr(args, "kb", ""))
+        if not kb:
+            print(style.fail("No KB found."))
+            return 1
+        cfg = {}
+        if getattr(args, "backend", None):
+            cfg["backend"] = args.backend
+        if getattr(args, "qdrant_url", ""):
+            cfg["qdrant_url"] = args.qdrant_url
+        if getattr(args, "pgvector_url", ""):
+            cfg["pgvector_url"] = args.pgvector_url
+        if getattr(args, "embedding_model", ""):
+            cfg["embedding_model"] = args.embedding_model
+        if not cfg:
+            vc = kb.get("vector_config", {})
+            print(style.heading("Current vector config:"))
+            for k, v in vc.items():
+                print(style.muted(f"  {k}: {v}"))
+            return 0
+        try:
+            update_vector_config(kb["id"], cfg)
+            print(style.ok("Vector config updated."))
+        except Exception as exc:
+            print(style.fail(f"Error: {exc}"))
+            return 1
+        return 0
+
+    if action == "config-reranker":
+        kb = _resolve_kb(getattr(args, "kb", ""))
+        if not kb:
+            print(style.fail("No KB found."))
+            return 1
+        cfg = {}
+        if getattr(args, "algorithm", None):
+            cfg["algorithm"] = args.algorithm
+        if getattr(args, "top_k", 0):
+            cfg["top_k"] = args.top_k
+        if getattr(args, "keyword_weight", 0.0):
+            cfg["keyword_weight"] = args.keyword_weight
+        if getattr(args, "cohere_api_key", ""):
+            cfg["cohere_api_key"] = args.cohere_api_key
+        if not cfg:
+            rc = kb.get("reranker_config", {})
+            print(style.heading("Current reranker config:"))
+            for k, v in rc.items():
+                print(style.muted(f"  {k}: {v}"))
+            return 0
+        try:
+            update_reranker_config(kb["id"], cfg)
+            print(style.ok("Reranker config updated."))
+        except Exception as exc:
+            print(style.fail(f"Error: {exc}"))
+            return 1
+        return 0
+
+    if action in ("enable-agent", "disable-agent"):
+        kb = _resolve_kb(getattr(args, "kb", ""))
+        if not kb:
+            print(style.fail("No KB found."))
+            return 1
+        enabled = action == "enable-agent"
+        try:
+            toggle_agent(kb["id"], args.agent, enabled)
+            verb = "Enabled" if enabled else "Disabled"
+            print(style.ok(f"{verb} agent '{args.agent}' for KB '{kb['name']}'."))
+        except Exception as exc:
+            print(style.fail(f"Error: {exc}"))
+            return 1
+        return 0
+
+    print(style.fail(f"Unknown rag action: {action}"))
     return 1
 
 
@@ -4786,6 +5113,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_generate(args)
         if args.command == "project":
             return _cmd_project(args)
+        if args.command == "rag":
+            return _cmd_rag(args)
         if args.command == "research":
             return _cmd_research(args)
         if args.command == "agents":

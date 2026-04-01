@@ -112,6 +112,33 @@ except Exception as _pm_import_exc:
     _HAS_PROJECT_MANAGER = False
     _log.warning("Project manager not available: %s", _pm_import_exc)
 
+try:
+    from kendr.rag_manager import (
+        list_kbs as _rag_list_kbs,
+        get_kb as _rag_get_kb,
+        get_active_kb as _rag_get_active_kb,
+        set_active_kb as _rag_set_active_kb,
+        create_kb as _rag_create_kb,
+        delete_kb as _rag_delete_kb,
+        update_kb_field as _rag_update_kb,
+        add_source as _rag_add_source,
+        remove_source as _rag_remove_source,
+        upload_file_to_kb as _rag_upload_file,
+        update_vector_config as _rag_update_vector,
+        update_reranker_config as _rag_update_reranker,
+        toggle_agent as _rag_toggle_agent,
+        index_kb as _rag_index_kb,
+        get_index_job as _rag_get_index_job,
+        query_kb as _rag_query_kb,
+        generate_answer as _rag_generate_answer,
+        kb_status as _rag_kb_status,
+        get_supported_agents as _rag_get_agents,
+    )
+    _HAS_RAG = True
+except Exception as _rag_import_exc:
+    _HAS_RAG = False
+    _log.warning("RAG manager not available: %s", _rag_import_exc)
+
 _GATEWAY_HOST = os.getenv("GATEWAY_HOST", "127.0.0.1")
 _GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8790"))
 
@@ -346,6 +373,7 @@ a:hover { text-decoration: underline; }
     <a href="/" class="nav-btn active"><span class="icon">💬</span> Chat</a>
     <a href="/setup" class="nav-btn"><span class="icon">⚙️</span> Setup & Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">📋</span> Run History</a>
+    <a href="/rag" class="nav-btn"><span class="icon">🧠</span> Super-RAG</a>
     <a href="/mcp" class="nav-btn"><span class="icon">🧩</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">📁</span> Projects</a>
   </div>
@@ -780,6 +808,7 @@ a { color: var(--teal); }
     <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
     <a href="/setup" class="nav-btn active"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/rag" class="nav-btn"><span class="icon">&#x1F9E0;</span> Super-RAG</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -1121,6 +1150,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
     <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/rag" class="nav-btn"><span class="icon">&#x1F9E0;</span> Super-RAG</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn active"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -1591,6 +1621,770 @@ function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;'
 </html>"""
 
 
+_RAG_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>kendr · Super-RAG</title>
+<style>
+:root{--teal:#00C9A7;--amber:#FFB347;--crimson:#FF4757;--purple:#A78BFA;--blue:#58A6FF;--green:#3FB950;--bg:#0d0f14;--surface:#161b22;--surface2:#1e2530;--surface3:#252d3a;--border:#2a3140;--text:#e6edf3;--muted:#7d8590;--sidebar-w:220px;--kb-panel-w:260px;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;display:flex;height:100vh;overflow:hidden;}
+/* Nav sidebar */
+.nav-sidebar{width:var(--sidebar-w);min-width:var(--sidebar-w);background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;position:fixed;top:0;bottom:0;left:0;z-index:10;}
+.nav-header{padding:18px 14px 12px;border-bottom:1px solid var(--border);}
+.logo{font-size:20px;font-weight:800;color:var(--teal);}
+.logo span{color:var(--amber);}
+.tagline{font-size:10px;color:var(--muted);margin-top:2px;}
+.nav-links{padding:10px 8px;display:flex;flex-direction:column;gap:3px;}
+.nav-btn{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:6px;text-decoration:none;color:var(--muted);font-size:13px;transition:all .15s;}
+.nav-btn:hover{background:var(--surface2);color:var(--text);}
+.nav-btn.active{background:rgba(0,201,167,.12);color:var(--teal);font-weight:600;}
+.icon{font-size:15px;width:18px;text-align:center;}
+/* KB panel */
+.kb-panel{width:var(--kb-panel-w);min-width:var(--kb-panel-w);background:var(--surface);border-right:1px solid var(--border);position:fixed;top:0;bottom:0;left:var(--sidebar-w);display:flex;flex-direction:column;}
+.kb-panel-head{padding:14px 12px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;}
+.kb-panel-title{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
+.btn-xs{background:var(--surface2);border:1px solid var(--border);color:var(--teal);border-radius:5px;padding:4px 10px;font-size:11px;cursor:pointer;transition:all .15s;}
+.btn-xs:hover{background:rgba(0,201,167,.12);}
+.kb-list{flex:1;overflow-y:auto;padding:6px;}
+.kb-item{padding:9px 10px;border-radius:6px;cursor:pointer;border:1px solid transparent;margin-bottom:3px;transition:all .15s;}
+.kb-item:hover{background:var(--surface2);}
+.kb-item.active{background:rgba(0,201,167,.1);border-color:rgba(0,201,167,.3);}
+.kb-item-name{font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.kb-item-meta{font-size:10px;color:var(--muted);margin-top:2px;}
+.kb-badge{display:inline-block;font-size:9px;padding:1px 5px;border-radius:3px;margin-left:4px;font-weight:600;}
+.badge-indexed{background:rgba(63,185,80,.15);color:var(--green);}
+.badge-empty{background:rgba(125,133,144,.12);color:var(--muted);}
+.badge-running{background:rgba(255,179,71,.15);color:var(--amber);animation:pulse 1.2s infinite;}
+.badge-error{background:rgba(255,71,87,.12);color:var(--crimson);}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+/* Workspace */
+.workspace{margin-left:calc(var(--sidebar-w) + var(--kb-panel-w));flex:1;display:flex;flex-direction:column;height:100vh;overflow:hidden;}
+.ws-head{padding:14px 20px 10px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-shrink:0;}
+.ws-title{font-size:16px;font-weight:700;color:var(--text);}
+.ws-meta{font-size:11px;color:var(--muted);}
+.tab-bar{display:flex;gap:2px;padding:0 20px;border-bottom:1px solid var(--border);flex-shrink:0;}
+.tab{padding:10px 16px;font-size:13px;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;transition:all .15s;}
+.tab.active{color:var(--teal);border-bottom-color:var(--teal);}
+.tab:hover:not(.active){color:var(--text);}
+.ws-body{flex:1;overflow-y:auto;padding:20px;}
+/* Form styles */
+.section{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:14px;}
+.section-title{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:12px;}
+.form-row{margin-bottom:12px;}
+.form-row label{display:block;font-size:12px;color:var(--muted);margin-bottom:4px;}
+.form-row input,.form-row select,.form-row textarea{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:5px;color:var(--text);padding:7px 10px;font-size:13px;outline:none;}
+.form-row input:focus,.form-row select:focus,.form-row textarea:focus{border-color:var(--teal);}
+.form-row select option{background:var(--surface2);}
+.form-row textarea{resize:vertical;min-height:60px;}
+.form-hint{font-size:11px;color:var(--muted);margin-top:3px;}
+.btn{padding:8px 18px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:600;transition:all .15s;}
+.btn-primary{background:var(--teal);color:#000;}
+.btn-primary:hover{filter:brightness(1.1);}
+.btn-secondary{background:var(--surface2);border:1px solid var(--border);color:var(--text);}
+.btn-secondary:hover{background:var(--surface3);}
+.btn-danger{background:rgba(255,71,87,.15);border:1px solid rgba(255,71,87,.3);color:var(--crimson);}
+.btn-danger:hover{background:rgba(255,71,87,.25);}
+.btn-sm{padding:5px 12px;font-size:12px;}
+.row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;}
+/* Source list */
+.source-list{display:flex;flex-direction:column;gap:8px;margin-top:12px;}
+.source-item{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 12px;display:flex;align-items:flex-start;gap:10px;}
+.source-icon{font-size:18px;flex-shrink:0;margin-top:1px;}
+.source-info{flex:1;min-width:0;}
+.source-label{font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.source-type{font-size:10px;color:var(--muted);text-transform:uppercase;margin-top:1px;}
+.source-stat{font-size:11px;color:var(--muted);margin-top:3px;}
+.source-actions{display:flex;gap:6px;flex-shrink:0;}
+.dot-status{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;}
+.dot-indexed{background:var(--green);}
+.dot-pending{background:var(--muted);}
+.dot-indexing{background:var(--amber);animation:pulse 1s infinite;}
+.dot-error{background:var(--crimson);}
+/* Query tab */
+.query-box{display:flex;gap:8px;margin-bottom:14px;}
+.query-box input{flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:10px 14px;font-size:14px;outline:none;}
+.query-box input:focus{border-color:var(--teal);}
+.results{display:flex;flex-direction:column;gap:10px;}
+.result-card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:14px;}
+.result-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;}
+.result-source{font-size:12px;color:var(--blue);word-break:break-all;}
+.result-score{font-size:11px;color:var(--teal);font-weight:700;}
+.result-text{font-size:13px;color:var(--muted);line-height:1.5;}
+.answer-box{background:var(--surface);border:1px solid var(--border);border-left:3px solid var(--teal);border-radius:8px;padding:16px;margin-bottom:14px;line-height:1.6;}
+.agent-list{display:flex;flex-direction:column;gap:8px;}
+.agent-item{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:10px 14px;display:flex;align-items:center;justify-content:space-between;}
+.agent-name{font-size:13px;font-weight:600;}
+.toggle{position:relative;display:inline-block;width:40px;height:22px;}
+.toggle input{opacity:0;width:0;height:0;}
+.slider{position:absolute;inset:0;background:var(--border);border-radius:22px;cursor:pointer;transition:.2s;}
+.slider:before{position:absolute;content:"";height:16px;width:16px;left:3px;bottom:3px;background:white;border-radius:50%;transition:.2s;}
+input:checked + .slider{background:var(--teal);}
+input:checked + .slider:before{transform:translateX(18px);}
+.upload-zone{border:2px dashed var(--border);border-radius:8px;padding:24px;text-align:center;cursor:pointer;transition:all .15s;}
+.upload-zone:hover,.upload-zone.drag{border-color:var(--teal);background:rgba(0,201,167,.05);}
+.upload-zone input{display:none;}
+.index-log{background:var(--surface2);border-radius:6px;padding:10px;font-size:11px;font-family:monospace;color:var(--muted);max-height:180px;overflow-y:auto;margin-top:10px;white-space:pre-wrap;}
+.alert{padding:10px 14px;border-radius:6px;font-size:13px;margin-bottom:10px;}
+.alert-info{background:rgba(88,166,255,.1);border:1px solid rgba(88,166,255,.25);color:var(--blue);}
+.alert-success{background:rgba(63,185,80,.1);border:1px solid rgba(63,185,80,.25);color:var(--green);}
+.alert-error{background:rgba(255,71,87,.1);border:1px solid rgba(255,71,87,.25);color:var(--crimson);}
+.hidden{display:none!important;}
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100;display:flex;align-items:center;justify-content:center;}
+.modal{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:24px;min-width:380px;max-width:520px;width:90%;}
+.modal-title{font-size:16px;font-weight:700;margin-bottom:16px;}
+.modal-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:20px;}
+</style>
+</head>
+<body>
+
+<!-- Nav sidebar -->
+<div class="nav-sidebar">
+  <div class="nav-header"><div class="logo">kendr<span>.</span></div><div class="tagline">Multi-agent intelligence runtime</div></div>
+  <div class="nav-links">
+    <a href="/chat" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
+    <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
+    <a href="/runs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Run History</a>
+    <a href="/rag" class="nav-btn active"><span class="icon">&#x1F9E0;</span> Super-RAG</a>
+    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+  </div>
+</div>
+
+<!-- KB panel -->
+<div class="kb-panel">
+  <div class="kb-panel-head">
+    <span class="kb-panel-title">Knowledge Bases</span>
+    <button class="btn-xs" onclick="showCreateModal()">+ New</button>
+  </div>
+  <div class="kb-list" id="kbList"></div>
+</div>
+
+<!-- Workspace -->
+<div class="workspace">
+  <div class="ws-head">
+    <div>
+      <div class="ws-title" id="wsTitle">Select a knowledge base</div>
+      <div class="ws-meta" id="wsMeta">Create or select a KB from the left panel to get started.</div>
+    </div>
+    <div style="margin-left:auto;display:flex;gap:8px;align-items:center;">
+      <button class="btn btn-primary btn-sm hidden" id="btnIndex" onclick="triggerIndex()">&#x26A1; Index All Sources</button>
+      <button class="btn btn-danger btn-sm hidden" id="btnDeleteKb" onclick="deleteKb()">Delete KB</button>
+    </div>
+  </div>
+
+  <div class="tab-bar">
+    <div class="tab active" id="tab-sources" onclick="switchTab('sources')">&#x1F4C2; Sources</div>
+    <div class="tab" id="tab-vector" onclick="switchTab('vector')">&#x1F5C4; Vector DB</div>
+    <div class="tab" id="tab-reranker" onclick="switchTab('reranker')">&#x1F3AF; Reranker</div>
+    <div class="tab" id="tab-agents" onclick="switchTab('agents')">&#x1F916; Agents</div>
+    <div class="tab" id="tab-query" onclick="switchTab('query')">&#x1F50D; Query / Test</div>
+  </div>
+
+  <div class="ws-body">
+
+    <!-- SOURCES TAB -->
+    <div id="pane-sources">
+      <div class="alert alert-info" id="noKbAlert">Select or create a knowledge base to manage sources.</div>
+
+      <div class="hidden" id="sourcesContent">
+        <!-- Index status bar -->
+        <div id="indexStatus" class="section hidden" style="padding:12px 16px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <span id="indexStatusText" style="font-size:13px;font-weight:600;"></span>
+            <button class="btn-xs" onclick="refreshIndexStatus()">Refresh</button>
+          </div>
+          <div class="index-log" id="indexLog"></div>
+        </div>
+
+        <!-- Add source -->
+        <div class="section">
+          <div class="section-title">Add Source</div>
+          <div class="form-row">
+            <label>Source Type</label>
+            <select id="srcType" onchange="updateSourceForm()">
+              <option value="folder">📂 Local Folder</option>
+              <option value="file">📄 Single File</option>
+              <option value="url">🌐 URL / Website</option>
+              <option value="database">🗄️ Database</option>
+              <option value="onedrive">☁️ OneDrive</option>
+            </select>
+          </div>
+          <!-- Folder / File fields -->
+          <div id="src-folder-fields">
+            <div class="form-row"><label>Path on this machine</label><input type="text" id="srcPath" placeholder="/home/user/documents or /path/to/file.pdf"></div>
+            <div class="row">
+              <div class="form-row" style="flex:1"><label>Max files</label><input type="number" id="srcMaxFiles" value="300" min="1" max="3000"></div>
+              <div class="form-row" style="flex:1"><label>Extensions (comma-sep, blank=all)</label><input type="text" id="srcExtensions" placeholder=".pdf,.md,.txt"></div>
+              <div class="form-row" style="flex:0;white-space:nowrap;padding-bottom:1px"><label>&nbsp;</label>
+                <label style="display:flex;align-items:center;gap:6px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="srcRecursive" checked> Recursive</label>
+              </div>
+            </div>
+            <!-- Upload zone (for file type) -->
+            <div id="uploadZone" class="upload-zone hidden" onclick="document.getElementById('fileUploadInput').click()">
+              <input type="file" id="fileUploadInput" onchange="handleFileUpload()" multiple>
+              <div style="font-size:24px;margin-bottom:6px;">📁</div>
+              <div style="font-size:13px;color:var(--muted)">Drop files here or click to upload</div>
+              <div style="font-size:11px;color:var(--muted);margin-top:4px">PDF, DOCX, TXT, MD, XLSX, CSV, PPTX supported</div>
+            </div>
+          </div>
+          <!-- URL fields -->
+          <div id="src-url-fields" class="hidden">
+            <div class="form-row"><label>URL</label><input type="text" id="srcUrl" placeholder="https://docs.example.com"></div>
+            <div class="row">
+              <div class="form-row" style="flex:1"><label>Max pages to crawl</label><input type="number" id="srcMaxPages" value="20" min="1" max="200"></div>
+              <div class="form-row" style="flex:0;white-space:nowrap;padding-bottom:1px"><label>&nbsp;</label>
+                <label style="display:flex;align-items:center;gap:6px;padding:8px 0;cursor:pointer;"><input type="checkbox" id="srcSameDomain" checked> Same domain only</label>
+              </div>
+            </div>
+          </div>
+          <!-- DB fields -->
+          <div id="src-db-fields" class="hidden">
+            <div class="form-row"><label>Database URL</label><input type="text" id="srcDbUrl" placeholder="postgresql://user:pass@host:5432/dbname"></div>
+            <div class="row">
+              <div class="form-row" style="flex:1"><label>Tables (comma-sep, blank=all)</label><input type="text" id="srcTables" placeholder="users, orders, products"></div>
+              <div class="form-row" style="flex:1"><label>Schema (optional)</label><input type="text" id="srcSchema" placeholder="public"></div>
+            </div>
+          </div>
+          <!-- OneDrive fields -->
+          <div id="src-onedrive-fields" class="hidden">
+            <div class="form-row"><label>OneDrive path (blank = root)</label><input type="text" id="srcOnedrivePath" placeholder="Documents/Reports"></div>
+            <div class="alert alert-info" style="margin-top:6px">Requires Microsoft integration to be configured in Setup.</div>
+          </div>
+          <div class="form-row"><label>Label (optional)</label><input type="text" id="srcLabel" placeholder="Friendly name for this source"></div>
+          <button class="btn btn-primary" onclick="addSource()">Add Source</button>
+        </div>
+
+        <!-- Source list -->
+        <div class="section">
+          <div class="section-title" style="display:flex;justify-content:space-between;align-items:center;">
+            <span>Indexed Sources</span>
+            <button class="btn-xs" onclick="loadSources()">Refresh</button>
+          </div>
+          <div class="source-list" id="sourceList"><div style="color:var(--muted);font-size:12px">No sources yet.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- VECTOR DB TAB -->
+    <div id="pane-vector" class="hidden">
+      <div class="section">
+        <div class="section-title">Vector Store Backend</div>
+        <div class="form-row">
+          <label>Backend</label>
+          <select id="vecBackend" onchange="updateVectorForm()">
+            <option value="chromadb">ChromaDB (local, default)</option>
+            <option value="qdrant">Qdrant (local or cloud)</option>
+            <option value="pgvector">pgvector (PostgreSQL)</option>
+          </select>
+          <div class="form-hint">ChromaDB runs locally with no setup. Qdrant and pgvector support remote deployments.</div>
+        </div>
+        <div id="vec-chroma-fields">
+          <div class="form-row"><label>ChromaDB persist path</label><input type="text" id="vecChromaPath" placeholder="~/.kendr/chroma"></div>
+        </div>
+        <div id="vec-qdrant-fields" class="hidden">
+          <div class="form-row"><label>Qdrant URL</label><input type="text" id="vecQdrantUrl" placeholder="http://localhost:6333"></div>
+          <div class="form-row"><label>API Key (Qdrant Cloud)</label><input type="text" id="vecQdrantKey" placeholder="optional"></div>
+        </div>
+        <div id="vec-pgvector-fields" class="hidden">
+          <div class="form-row"><label>PostgreSQL URL (with pgvector)</label><input type="text" id="vecPgUrl" placeholder="postgresql://user:pass@host/dbname"></div>
+        </div>
+        <div class="form-row" style="margin-top:12px">
+          <label>Embedding Model</label>
+          <select id="vecEmbedModel">
+            <option value="openai:text-embedding-3-small">OpenAI text-embedding-3-small (default)</option>
+            <option value="openai:text-embedding-3-large">OpenAI text-embedding-3-large</option>
+            <option value="openai:text-embedding-ada-002">OpenAI text-embedding-ada-002</option>
+          </select>
+          <div class="form-hint">OpenAI embeddings require OPENAI_API_KEY to be configured.</div>
+        </div>
+        <button class="btn btn-primary" onclick="saveVectorConfig()">Save Vector Config</button>
+      </div>
+      <div class="section" style="padding:12px 16px">
+        <div class="section-title">Backend Status</div>
+        <div id="vecStatus" style="color:var(--muted);font-size:12px">Load a KB to see status.</div>
+      </div>
+    </div>
+
+    <!-- RERANKER TAB -->
+    <div id="pane-reranker" class="hidden">
+      <div class="section">
+        <div class="section-title">Reranking Algorithm</div>
+        <div class="form-row">
+          <label>Algorithm</label>
+          <select id="rerankerAlgo" onchange="updateRerankerForm()">
+            <option value="none">None (raw vector similarity)</option>
+            <option value="keyword">Keyword Boost (vector + keyword overlap)</option>
+            <option value="rrf">RRF — Reciprocal Rank Fusion</option>
+            <option value="cross_encoder">Cross-Encoder (requires sentence-transformers)</option>
+            <option value="cohere">Cohere Rerank API</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>Top-K results to return</label>
+          <input type="number" id="rerankerTopK" value="8" min="1" max="50">
+        </div>
+        <div class="form-row">
+          <label>Fetch K (candidates before reranking)</label>
+          <input type="number" id="rerankerFetchK" value="20" min="1" max="100">
+          <div class="form-hint">Fetch this many from the vector store, then rerank down to Top-K.</div>
+        </div>
+        <!-- Keyword boost option -->
+        <div id="rr-keyword-fields" class="hidden">
+          <div class="form-row">
+            <label>Keyword weight (0 = pure vector, 1 = pure keyword)</label>
+            <input type="range" id="rerankerKeywordWeight" min="0" max="1" step="0.05" value="0.3" oninput="document.getElementById('kwWeightLabel').textContent=this.value">
+            <span id="kwWeightLabel" style="font-size:12px;color:var(--teal);margin-left:6px">0.3</span>
+          </div>
+        </div>
+        <!-- Cross-encoder options -->
+        <div id="rr-crossenc-fields" class="hidden">
+          <div class="form-row">
+            <label>Cross-encoder model</label>
+            <input type="text" id="rerankerCEModel" value="cross-encoder/ms-marco-MiniLM-L-6-v2">
+          </div>
+          <div class="alert alert-info">Install sentence-transformers: <code>pip install sentence-transformers</code></div>
+        </div>
+        <!-- Cohere options -->
+        <div id="rr-cohere-fields" class="hidden">
+          <div class="form-row">
+            <label>Cohere API Key</label>
+            <input type="text" id="rerankerCohereKey" placeholder="or set COHERE_API_KEY env var">
+          </div>
+        </div>
+        <button class="btn btn-primary" onclick="saveRerankerConfig()">Save Reranker Config</button>
+      </div>
+    </div>
+
+    <!-- AGENTS TAB -->
+    <div id="pane-agents" class="hidden">
+      <div class="section">
+        <div class="section-title">Agent Connections (Super-RAG)</div>
+        <div class="form-hint" style="margin-bottom:14px">Enable agents to automatically query this knowledge base when answering tasks. This transforms kendr into a Super-RAG — every enabled agent can retrieve context from this KB.</div>
+        <div class="agent-list" id="agentList"></div>
+      </div>
+      <div class="section">
+        <div class="section-title">Active KB used by agents</div>
+        <div style="font-size:13px;color:var(--muted);">Enabled agents will use the <strong>active KB</strong> (marked with ★ in the left panel). Switch the active KB to change which knowledge base agents access.</div>
+        <button class="btn btn-secondary btn-sm" style="margin-top:10px" onclick="setActiveKb()">★ Set this KB as Active</button>
+      </div>
+    </div>
+
+    <!-- QUERY TAB -->
+    <div id="pane-query" class="hidden">
+      <div class="query-box">
+        <input type="text" id="queryInput" placeholder="Ask a question about your knowledge base…" onkeydown="if(event.key==='Enter')runQuery()">
+        <button class="btn btn-secondary" onclick="runQuery(false)" style="white-space:nowrap">&#x1F50D; Search</button>
+        <button class="btn btn-primary" onclick="runQuery(true)" style="white-space:nowrap">&#x1F916; Ask AI</button>
+      </div>
+      <div id="queryStatus" style="font-size:12px;color:var(--muted);margin-bottom:10px"></div>
+      <div id="answerSection" class="hidden">
+        <div class="section-title" style="margin-bottom:8px">AI Answer</div>
+        <div class="answer-box" id="answerBox"></div>
+      </div>
+      <div id="resultsSection" class="hidden">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+          <div class="section-title" style="margin-bottom:0">Retrieved Chunks</div>
+          <span id="resultsMeta" style="font-size:11px;color:var(--muted)"></span>
+        </div>
+        <div class="results" id="resultsList"></div>
+      </div>
+    </div>
+
+  </div><!-- ws-body -->
+</div><!-- workspace -->
+
+<!-- Create KB Modal -->
+<div class="modal-overlay hidden" id="createModal">
+  <div class="modal">
+    <div class="modal-title">Create Knowledge Base</div>
+    <div class="form-row"><label>Name</label><input type="text" id="newKbName" placeholder="My Documentation KB"></div>
+    <div class="form-row"><label>Description (optional)</label><input type="text" id="newKbDesc" placeholder="What this KB contains…"></div>
+    <div class="modal-actions">
+      <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="createKb()">Create</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+let _activeKbId = null;
+let _currentTab = 'sources';
+let _indexPollTimer = null;
+const SOURCE_ICONS = {folder:'📂',file:'📄',url:'🌐',database:'🗄️',onedrive:'☁️'};
+
+// ── Bootstrap ──────────────────────────────────────────────────────────────
+async function init() {
+  await loadKbList();
+}
+
+// ── KB List ────────────────────────────────────────────────────────────────
+async function loadKbList() {
+  const r = await fetch(API + '/api/rag/kbs').then(r => r.json()).catch(() => []);
+  const el = document.getElementById('kbList');
+  el.innerHTML = '';
+  if (!r.length) {
+    el.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:12px">No knowledge bases yet. Click + New to create one.</div>';
+    return;
+  }
+  for (const kb of r) {
+    const isActive = kb.id === _activeKbId;
+    const status = kb.status || 'empty';
+    const d = document.createElement('div');
+    d.className = 'kb-item' + (isActive ? ' active' : '');
+    d.onclick = () => selectKb(kb.id);
+    const badgeCls = status === 'indexed' ? 'badge-indexed' : status === 'empty' ? 'badge-empty' : 'badge-running';
+    d.innerHTML = `<div class="kb-item-name">${kb.name}</div>
+      <div class="kb-item-meta"><span class="kb-badge ${badgeCls}">${status}</span> ${kb.stats?.total_chunks||0} chunks · ${(kb.sources||[]).length} sources</div>`;
+    el.appendChild(d);
+  }
+}
+
+async function selectKb(kbId) {
+  _activeKbId = kbId;
+  await loadKbList();
+  await renderKb();
+  switchTab(_currentTab);
+}
+
+async function renderKb() {
+  if (!_activeKbId) return;
+  const kb = await fetch(API + '/api/rag/kbs/' + _activeKbId).then(r => r.json()).catch(() => null);
+  if (!kb || kb.error) return;
+  document.getElementById('wsTitle').textContent = kb.name;
+  document.getElementById('wsMeta').textContent = (kb.description || '') + ' · ' + (kb.stats?.total_chunks||0) + ' chunks · ' + (kb.sources?.length||0) + ' sources';
+  document.getElementById('noKbAlert').classList.add('hidden');
+  document.getElementById('sourcesContent').classList.remove('hidden');
+  document.getElementById('btnIndex').classList.remove('hidden');
+  document.getElementById('btnDeleteKb').classList.remove('hidden');
+  loadSources(kb);
+  loadVectorConfig(kb);
+  loadRerankerConfig(kb);
+  loadAgents(kb);
+  checkIndexJob();
+}
+
+// ── Sources tab ────────────────────────────────────────────────────────────
+function updateSourceForm() {
+  const t = document.getElementById('srcType').value;
+  document.getElementById('src-folder-fields').classList.toggle('hidden', t === 'url' || t === 'database' || t === 'onedrive');
+  document.getElementById('uploadZone').classList.toggle('hidden', t !== 'file');
+  document.getElementById('src-url-fields').classList.toggle('hidden', t !== 'url');
+  document.getElementById('src-db-fields').classList.toggle('hidden', t !== 'database');
+  document.getElementById('src-onedrive-fields').classList.toggle('hidden', t !== 'onedrive');
+  document.getElementById('srcPath').placeholder = t === 'folder' ? '/home/user/documents' : '/path/to/file.pdf';
+}
+
+async function addSource() {
+  if (!_activeKbId) { alert('No KB selected'); return; }
+  const type = document.getElementById('srcType').value;
+  const body = { type, label: document.getElementById('srcLabel').value.trim() };
+  if (type === 'folder') {
+    body.path = document.getElementById('srcPath').value.trim();
+    body.recursive = document.getElementById('srcRecursive').checked;
+    body.max_files = parseInt(document.getElementById('srcMaxFiles').value);
+    body.extensions = document.getElementById('srcExtensions').value.trim();
+  } else if (type === 'file') {
+    body.path = document.getElementById('srcPath').value.trim();
+  } else if (type === 'url') {
+    body.url = document.getElementById('srcUrl').value.trim();
+    body.max_pages = parseInt(document.getElementById('srcMaxPages').value);
+    body.same_domain = document.getElementById('srcSameDomain').checked;
+  } else if (type === 'database') {
+    body.db_url = document.getElementById('srcDbUrl').value.trim();
+    body.tables = document.getElementById('srcTables').value.trim();
+    body.schema = document.getElementById('srcSchema').value.trim();
+  } else if (type === 'onedrive') {
+    body.onedrive_path = document.getElementById('srcOnedrivePath').value.trim();
+  }
+  const r = await fetch(API + '/api/rag/kbs/' + _activeKbId + '/sources', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body)
+  }).then(r => r.json()).catch(() => ({error:'network error'}));
+  if (r.error) { alert('Error: ' + r.error); return; }
+  document.getElementById('srcLabel').value = '';
+  document.getElementById('srcPath').value = '';
+  document.getElementById('srcUrl').value = '';
+  document.getElementById('srcDbUrl').value = '';
+  await loadSources();
+}
+
+async function handleFileUpload() {
+  if (!_activeKbId) { alert('No KB selected'); return; }
+  const inp = document.getElementById('fileUploadInput');
+  for (const file of inp.files) {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('kb_id', _activeKbId);
+    const r = await fetch(API + '/api/rag/upload', { method: 'POST', body: fd }).then(r => r.json()).catch(() => ({error:'upload failed'}));
+    if (r.error) { alert('Upload error: ' + r.error); }
+  }
+  inp.value = '';
+  await loadSources();
+}
+
+async function loadSources(kb) {
+  if (!kb) kb = await fetch(API + '/api/rag/kbs/' + _activeKbId).then(r => r.json()).catch(() => null);
+  if (!kb) return;
+  const el = document.getElementById('sourceList');
+  const sources = kb.sources || [];
+  if (!sources.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">No sources yet. Add a folder, URL, or database above.</div>'; return; }
+  el.innerHTML = sources.map(s => {
+    const dotCls = 'dot-' + (s.status || 'pending');
+    const statText = s.status === 'indexed' ? `${s.stats?.items||0} items · ${s.stats?.chunks||0} chunks` : (s.error || s.status || 'pending');
+    return `<div class="source-item">
+      <div class="source-icon">${SOURCE_ICONS[s.type]||'📄'}</div>
+      <div class="source-info">
+        <div class="source-label">${escHtml(s.label||s.source_id)}</div>
+        <div class="source-type">${s.type}</div>
+        <div class="source-stat"><span class="dot-status ${dotCls}"></span>${escHtml(statText)}</div>
+      </div>
+      <div class="source-actions">
+        <button class="btn btn-danger btn-sm" onclick="removeSource('${s.source_id}')">✕</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+async function removeSource(sourceId) {
+  if (!confirm('Remove this source?')) return;
+  await fetch(API + '/api/rag/kbs/' + _activeKbId + '/sources/' + sourceId, { method: 'DELETE' }).then(r => r.json()).catch(() => null);
+  await loadSources();
+}
+
+// ── Index ──────────────────────────────────────────────────────────────────
+async function triggerIndex() {
+  if (!_activeKbId) return;
+  await fetch(API + '/api/rag/kbs/' + _activeKbId + '/index', { method: 'POST' });
+  document.getElementById('indexStatus').classList.remove('hidden');
+  document.getElementById('indexStatusText').textContent = 'Indexing started…';
+  startIndexPoll();
+}
+
+function startIndexPoll() {
+  if (_indexPollTimer) clearInterval(_indexPollTimer);
+  _indexPollTimer = setInterval(checkIndexJob, 2500);
+}
+
+async function checkIndexJob() {
+  if (!_activeKbId) return;
+  const job = await fetch(API + '/api/rag/kbs/' + _activeKbId + '/index/status').then(r => r.json()).catch(() => null);
+  if (!job || !job.status) return;
+  document.getElementById('indexStatus').classList.remove('hidden');
+  const statusText = {running:'⚡ Indexing in progress…', done:'✅ Indexing complete', done_with_errors:'⚠️ Done with errors', error:'❌ Indexing failed'}[job.status] || job.status;
+  document.getElementById('indexStatusText').textContent = statusText + ` (${job.chunks_indexed||0} chunks, ${job.sources_done||0}/${job.sources_total||0} sources)`;
+  document.getElementById('indexLog').textContent = (job.log || []).join('\n');
+  if (job.status !== 'running') {
+    if (_indexPollTimer) { clearInterval(_indexPollTimer); _indexPollTimer = null; }
+    await loadKbList();
+    await loadSources();
+  }
+}
+
+async function refreshIndexStatus() { await checkIndexJob(); }
+
+// ── Vector config ──────────────────────────────────────────────────────────
+function updateVectorForm() {
+  const b = document.getElementById('vecBackend').value;
+  document.getElementById('vec-chroma-fields').classList.toggle('hidden', b !== 'chromadb');
+  document.getElementById('vec-qdrant-fields').classList.toggle('hidden', b !== 'qdrant');
+  document.getElementById('vec-pgvector-fields').classList.toggle('hidden', b !== 'pgvector');
+}
+
+async function loadVectorConfig(kb) {
+  const vc = kb?.vector_config || {};
+  document.getElementById('vecBackend').value = vc.backend || 'chromadb';
+  document.getElementById('vecChromaPath').value = vc.chromadb_path || '';
+  document.getElementById('vecQdrantUrl').value = vc.qdrant_url || '';
+  document.getElementById('vecQdrantKey').value = vc.qdrant_api_key || '';
+  document.getElementById('vecPgUrl').value = vc.pgvector_url || '';
+  document.getElementById('vecEmbedModel').value = vc.embedding_model || 'openai:text-embedding-3-small';
+  updateVectorForm();
+  // Show status
+  const s = await fetch(API + '/api/rag/kbs/' + _activeKbId + '/status').then(r => r.json()).catch(() => null);
+  if (s) {
+    const color = s.backend_ok ? 'var(--green)' : 'var(--crimson)';
+    document.getElementById('vecStatus').innerHTML = `<span style="color:${color}">${s.backend_ok ? '✅' : '❌'} Backend (${s.vector_backend})</span><br><span style="color:var(--muted)">${s.backend_note || ''}</span>`;
+  }
+}
+
+async function saveVectorConfig() {
+  if (!_activeKbId) return;
+  const cfg = {
+    backend: document.getElementById('vecBackend').value,
+    chromadb_path: document.getElementById('vecChromaPath').value.trim(),
+    qdrant_url: document.getElementById('vecQdrantUrl').value.trim(),
+    qdrant_api_key: document.getElementById('vecQdrantKey').value.trim(),
+    pgvector_url: document.getElementById('vecPgUrl').value.trim(),
+    embedding_model: document.getElementById('vecEmbedModel').value,
+  };
+  const r = await fetch(API + '/api/rag/kbs/' + _activeKbId + '/vector', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg)
+  }).then(r => r.json()).catch(() => ({error:'failed'}));
+  if (r.error) { alert('Error: ' + r.error); return; }
+  alert('Vector config saved.');
+}
+
+// ── Reranker config ────────────────────────────────────────────────────────
+function updateRerankerForm() {
+  const a = document.getElementById('rerankerAlgo').value;
+  document.getElementById('rr-keyword-fields').classList.toggle('hidden', a !== 'keyword');
+  document.getElementById('rr-crossenc-fields').classList.toggle('hidden', a !== 'cross_encoder');
+  document.getElementById('rr-cohere-fields').classList.toggle('hidden', a !== 'cohere');
+}
+
+function loadRerankerConfig(kb) {
+  const rc = kb?.reranker_config || {};
+  document.getElementById('rerankerAlgo').value = rc.algorithm || 'none';
+  document.getElementById('rerankerTopK').value = rc.top_k || 8;
+  document.getElementById('rerankerFetchK').value = rc.rerank_top_k || 20;
+  document.getElementById('rerankerKeywordWeight').value = rc.keyword_weight || 0.3;
+  document.getElementById('kwWeightLabel').textContent = rc.keyword_weight || 0.3;
+  document.getElementById('rerankerCEModel').value = rc.cross_encoder_model || 'cross-encoder/ms-marco-MiniLM-L-6-v2';
+  document.getElementById('rerankerCohereKey').value = rc.cohere_api_key || '';
+  updateRerankerForm();
+}
+
+async function saveRerankerConfig() {
+  if (!_activeKbId) return;
+  const cfg = {
+    algorithm: document.getElementById('rerankerAlgo').value,
+    top_k: parseInt(document.getElementById('rerankerTopK').value),
+    rerank_top_k: parseInt(document.getElementById('rerankerFetchK').value),
+    keyword_weight: parseFloat(document.getElementById('rerankerKeywordWeight').value),
+    cross_encoder_model: document.getElementById('rerankerCEModel').value.trim(),
+    cohere_api_key: document.getElementById('rerankerCohereKey').value.trim(),
+  };
+  const r = await fetch(API + '/api/rag/kbs/' + _activeKbId + '/reranker', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(cfg)
+  }).then(r => r.json()).catch(() => ({error:'failed'}));
+  if (r.error) { alert('Error: ' + r.error); return; }
+  alert('Reranker config saved.');
+}
+
+// ── Agents tab ─────────────────────────────────────────────────────────────
+async function loadAgents(kb) {
+  const agents = await fetch(API + '/api/rag/agents').then(r => r.json()).catch(() => []);
+  const enabled = new Set(kb?.enabled_agents || []);
+  const el = document.getElementById('agentList');
+  if (!agents.length) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">No agents discovered.</div>'; return; }
+  el.innerHTML = agents.map(a => `
+    <div class="agent-item">
+      <div>
+        <div class="agent-name">🤖 ${a}</div>
+        <div style="font-size:11px;color:var(--muted)">${a.replace('_agent','').replace('_',' ')}</div>
+      </div>
+      <label class="toggle">
+        <input type="checkbox" ${enabled.has(a)?'checked':''} onchange="toggleAgent('${a}', this.checked)">
+        <span class="slider"></span>
+      </label>
+    </div>`).join('');
+}
+
+async function toggleAgent(agentName, enabled) {
+  if (!_activeKbId) return;
+  await fetch(API + '/api/rag/kbs/' + _activeKbId + '/agents', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({agent: agentName, enabled})
+  }).then(r => r.json()).catch(() => null);
+}
+
+async function setActiveKb() {
+  if (!_activeKbId) return;
+  await fetch(API + '/api/rag/kbs/' + _activeKbId + '/activate', { method: 'POST' }).then(r => r.json()).catch(() => null);
+  await loadKbList();
+  alert('Active KB set to: ' + document.getElementById('wsTitle').textContent);
+}
+
+// ── Query tab ──────────────────────────────────────────────────────────────
+async function runQuery(withAI) {
+  const query = document.getElementById('queryInput').value.trim();
+  if (!query) return;
+  if (!_activeKbId) { alert('No KB selected'); return; }
+  document.getElementById('queryStatus').textContent = withAI ? '🤖 Generating AI answer…' : '🔍 Searching…';
+  document.getElementById('answerSection').classList.add('hidden');
+  document.getElementById('resultsSection').classList.add('hidden');
+  const endpoint = withAI ? '/api/rag/kbs/' + _activeKbId + '/answer' : '/api/rag/kbs/' + _activeKbId + '/query';
+  const r = await fetch(API + endpoint, {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({query})
+  }).then(r => r.json()).catch(() => ({error:'network error'}));
+  document.getElementById('queryStatus').textContent = '';
+  if (r.error) { document.getElementById('queryStatus').textContent = '❌ ' + r.error; return; }
+  if (withAI && r.answer) {
+    document.getElementById('answerSection').classList.remove('hidden');
+    document.getElementById('answerBox').textContent = r.answer;
+  }
+  const hits = r.hits || [];
+  document.getElementById('resultsSection').classList.remove('hidden');
+  document.getElementById('resultsMeta').textContent = `${hits.length} chunks · ${r.algorithm || 'none'} reranking`;
+  document.getElementById('resultsList').innerHTML = hits.map((h,i) => {
+    const source = h.source || (h.metadata||{}).source || '?';
+    const score = h.score != null ? h.score.toFixed(4) : '?';
+    const text = (h.text || '').slice(0, 500);
+    return `<div class="result-card">
+      <div class="result-header">
+        <span class="result-source">[${i+1}] ${escHtml(source)}</span>
+        <span class="result-score">score: ${score}</span>
+      </div>
+      <div class="result-text">${escHtml(text)}${h.text?.length > 500 ? '…' : ''}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── Delete KB ──────────────────────────────────────────────────────────────
+async function deleteKb() {
+  if (!_activeKbId) return;
+  const name = document.getElementById('wsTitle').textContent;
+  if (!confirm(`Delete KB "${name}"? This removes config but does NOT delete vector data.`)) return;
+  await fetch(API + '/api/rag/kbs/' + _activeKbId, { method: 'DELETE' }).then(r => r.json()).catch(() => null);
+  _activeKbId = null;
+  document.getElementById('wsTitle').textContent = 'Select a knowledge base';
+  document.getElementById('wsMeta').textContent = 'Create or select a KB from the left panel to get started.';
+  document.getElementById('noKbAlert').classList.remove('hidden');
+  document.getElementById('sourcesContent').classList.add('hidden');
+  document.getElementById('btnIndex').classList.add('hidden');
+  document.getElementById('btnDeleteKb').classList.add('hidden');
+  await loadKbList();
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  _currentTab = name;
+  ['sources','vector','reranker','agents','query'].forEach(t => {
+    document.getElementById('tab-' + t).classList.toggle('active', t === name);
+    document.getElementById('pane-' + t).classList.toggle('hidden', t !== name);
+  });
+}
+
+// ── Create modal ───────────────────────────────────────────────────────────
+function showCreateModal() { document.getElementById('createModal').classList.remove('hidden'); document.getElementById('newKbName').focus(); }
+function closeModal() { document.getElementById('createModal').classList.add('hidden'); }
+async function createKb() {
+  const name = document.getElementById('newKbName').value.trim();
+  const desc = document.getElementById('newKbDesc').value.trim();
+  if (!name) { alert('Name required'); return; }
+  const r = await fetch(API + '/api/rag/kbs', {
+    method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name, description: desc})
+  }).then(r => r.json()).catch(() => ({error:'failed'}));
+  if (r.error) { alert('Error: ' + r.error); return; }
+  closeModal();
+  document.getElementById('newKbName').value = '';
+  document.getElementById('newKbDesc').value = '';
+  await loadKbList();
+  selectKb(r.id);
+}
+
+// ── Utils ──────────────────────────────────────────────────────────────────
+function escHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+init();
+</script>
+</body>
+</html>"""
+
+
 _MCP_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -1677,6 +2471,7 @@ input:checked + .slider:before { transform: translateX(14px); }
     <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
     <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/rag" class="nav-btn"><span class="icon">&#x1F9E0;</span> Super-RAG</a>
     <a href="/mcp" class="nav-btn active"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -1942,6 +2737,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
     <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
     <a href="/runs" class="nav-btn active"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/rag" class="nav-btn"><span class="icon">&#x1F9E0;</span> Super-RAG</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -2035,11 +2831,38 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         if path == "/runs":
             self._html(200, _RUNS_HTML)
             return
+        if path == "/rag":
+            self._html(200, _RAG_HTML)
+            return
         if path == "/mcp":
             self._html(200, _MCP_HTML)
             return
         if path == "/projects":
             self._html(200, _PROJECTS_HTML)
+            return
+        if path == "/api/rag/kbs":
+            self._handle_rag_list_kbs()
+            return
+        if path.startswith("/api/rag/kbs/") and path.endswith("/sources"):
+            kb_id = path[len("/api/rag/kbs/"):-len("/sources")]
+            self._handle_rag_list_sources(kb_id)
+            return
+        if path.startswith("/api/rag/kbs/") and path.endswith("/index/status"):
+            kb_id = path[len("/api/rag/kbs/"):-len("/index/status")]
+            self._handle_rag_index_status(kb_id)
+            return
+        if path.startswith("/api/rag/kbs/") and path.endswith("/status"):
+            kb_id = path[len("/api/rag/kbs/"):-len("/status")]
+            self._handle_rag_kb_status(kb_id)
+            return
+        if path.startswith("/api/rag/kbs/") and not path.endswith("/"):
+            # Single KB detail: /api/rag/kbs/<id>
+            parts = path[len("/api/rag/kbs/"):].split("/")
+            if len(parts) == 1:
+                self._handle_rag_get_kb(parts[0])
+                return
+        if path == "/api/rag/agents":
+            self._handle_rag_list_agents()
             return
         if path == "/api/health":
             self._json(200, {"service": "kendr-ui", "status": "ok"})
@@ -2281,6 +3104,46 @@ class KendrUIHandler(BaseHTTPRequestHandler):
                 self._handle_mcp_toggle(server_id, body)
             else:
                 self._json(404, {"error": "not_found"})
+            return
+        # ── RAG routes ──────────────────────────────────────────────────────
+        if path == "/api/rag/kbs":
+            self._handle_rag_create_kb(body)
+            return
+        if path == "/api/rag/upload":
+            # multipart handled separately; body is empty here — handled in do_POST via raw read
+            self._handle_rag_upload(body)
+            return
+        if path.startswith("/api/rag/kbs/"):
+            rest = path[len("/api/rag/kbs/"):]
+            if rest.endswith("/sources"):
+                kb_id = rest[:-len("/sources")]
+                self._handle_rag_add_source(kb_id, body)
+            elif rest.endswith("/index"):
+                kb_id = rest[:-len("/index")]
+                self._handle_rag_trigger_index(kb_id, body)
+            elif rest.endswith("/vector"):
+                kb_id = rest[:-len("/vector")]
+                self._handle_rag_update_vector(kb_id, body)
+            elif rest.endswith("/reranker"):
+                kb_id = rest[:-len("/reranker")]
+                self._handle_rag_update_reranker(kb_id, body)
+            elif rest.endswith("/agents"):
+                kb_id = rest[:-len("/agents")]
+                self._handle_rag_toggle_agent(kb_id, body)
+            elif rest.endswith("/activate"):
+                kb_id = rest[:-len("/activate")]
+                self._handle_rag_activate(kb_id)
+            elif rest.endswith("/query"):
+                kb_id = rest[:-len("/query")]
+                self._handle_rag_query(kb_id, body, with_answer=False)
+            elif rest.endswith("/answer"):
+                kb_id = rest[:-len("/answer")]
+                self._handle_rag_query(kb_id, body, with_answer=True)
+            else:
+                self._json(404, {"error": "not_found"})
+            return
+        if path.startswith("/api/rag/kbs") and body.get("_method") == "DELETE":
+            self._json(405, {"error": "use DELETE method"})
             return
         self._json(404, {"error": "not_found"})
 
@@ -2728,6 +3591,226 @@ class KendrUIHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": False, "error": str(exc)})
         else:
             self._json(200, {"ok": False, "error": f"No connection test available for '{comp_id}'."})
+
+    # ── RAG handler methods ────────────────────────────────────────────────
+    def _rag_check(self) -> bool:
+        if not _HAS_RAG:
+            self._json(503, {"error": "RAG manager not available"})
+            return False
+        return True
+
+    def _handle_rag_list_kbs(self) -> None:
+        if not self._rag_check():
+            return
+        try:
+            self._json(200, _rag_list_kbs())
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_get_kb(self, kb_id: str) -> None:
+        if not self._rag_check():
+            return
+        try:
+            kb = _rag_get_kb(kb_id)
+            if not kb:
+                self._json(404, {"error": "KB not found"})
+                return
+            self._json(200, kb)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_list_sources(self, kb_id: str) -> None:
+        if not self._rag_check():
+            return
+        try:
+            kb = _rag_get_kb(kb_id)
+            if not kb:
+                self._json(404, {"error": "KB not found"})
+                return
+            self._json(200, kb.get("sources", []))
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_kb_status(self, kb_id: str) -> None:
+        if not self._rag_check():
+            return
+        try:
+            self._json(200, _rag_kb_status(kb_id))
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_index_status(self, kb_id: str) -> None:
+        if not self._rag_check():
+            return
+        try:
+            job = _rag_get_index_job(kb_id)
+            self._json(200, job or {"status": "idle"})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_list_agents(self) -> None:
+        if not self._rag_check():
+            return
+        try:
+            self._json(200, _rag_get_agents())
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_create_kb(self, body: dict) -> None:
+        if not self._rag_check():
+            return
+        name = str(body.get("name") or "").strip()
+        if not name:
+            self._json(400, {"error": "name is required"})
+            return
+        try:
+            kb = _rag_create_kb(name, description=str(body.get("description") or ""))
+            self._json(200, kb)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_add_source(self, kb_id: str, body: dict) -> None:
+        if not self._rag_check():
+            return
+        source_type = str(body.get("type") or "").strip()
+        if not source_type:
+            self._json(400, {"error": "type is required"})
+            return
+        try:
+            source = _rag_add_source(
+                kb_id,
+                source_type,
+                label=str(body.get("label") or ""),
+                path=str(body.get("path") or ""),
+                url=str(body.get("url") or ""),
+                db_url=str(body.get("db_url") or ""),
+                recursive=bool(body.get("recursive", True)),
+                max_files=int(body.get("max_files") or 300),
+                max_pages=int(body.get("max_pages") or 20),
+                extensions=str(body.get("extensions") or ""),
+                tables=str(body.get("tables") or ""),
+                schema=str(body.get("schema") or ""),
+                same_domain=bool(body.get("same_domain", False)),
+                onedrive_path=str(body.get("onedrive_path") or ""),
+            )
+            self._json(200, source)
+        except Exception as exc:
+            self._json(400, {"error": str(exc)})
+
+    def _handle_rag_trigger_index(self, kb_id: str, body: dict) -> None:
+        if not self._rag_check():
+            return
+        try:
+            source_ids = body.get("source_ids") or None
+            job = _rag_index_kb(kb_id, source_ids=source_ids)
+            self._json(200, job)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_update_vector(self, kb_id: str, body: dict) -> None:
+        if not self._rag_check():
+            return
+        try:
+            kb = _rag_update_vector(kb_id, body)
+            if not kb:
+                self._json(404, {"error": "KB not found"})
+                return
+            self._json(200, {"ok": True, "vector_config": kb.get("vector_config", {})})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_update_reranker(self, kb_id: str, body: dict) -> None:
+        if not self._rag_check():
+            return
+        try:
+            kb = _rag_update_reranker(kb_id, body)
+            if not kb:
+                self._json(404, {"error": "KB not found"})
+                return
+            self._json(200, {"ok": True, "reranker_config": kb.get("reranker_config", {})})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_toggle_agent(self, kb_id: str, body: dict) -> None:
+        if not self._rag_check():
+            return
+        agent = str(body.get("agent") or "").strip()
+        enabled = bool(body.get("enabled", True))
+        if not agent:
+            self._json(400, {"error": "agent is required"})
+            return
+        try:
+            kb = _rag_toggle_agent(kb_id, agent, enabled)
+            if not kb:
+                self._json(404, {"error": "KB not found"})
+                return
+            self._json(200, {"ok": True, "enabled_agents": kb.get("enabled_agents", [])})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_activate(self, kb_id: str) -> None:
+        if not self._rag_check():
+            return
+        try:
+            _rag_set_active_kb(kb_id)
+            self._json(200, {"ok": True, "active_kb_id": kb_id})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_query(self, kb_id: str, body: dict, with_answer: bool) -> None:
+        if not self._rag_check():
+            return
+        query = str(body.get("query") or "").strip()
+        if not query:
+            self._json(400, {"error": "query is required"})
+            return
+        top_k = int(body.get("top_k") or 0) or None
+        try:
+            if with_answer:
+                result = _rag_generate_answer(kb_id, query, top_k=top_k or 8)
+            else:
+                result = _rag_query_kb(kb_id, query, top_k=top_k)
+            self._json(200, result)
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_upload(self, body: dict) -> None:
+        if not self._rag_check():
+            return
+        self._json(400, {"error": "Use multipart/form-data POST to /api/rag/upload with fields: file, kb_id"})
+
+    def _handle_rag_delete_kb(self, kb_id: str) -> None:
+        if not self._rag_check():
+            return
+        try:
+            ok = _rag_delete_kb(kb_id)
+            self._json(200, {"ok": ok})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_rag_remove_source(self, kb_id: str, source_id: str) -> None:
+        if not self._rag_check():
+            return
+        try:
+            ok = __import__("kendr.rag_manager", fromlist=["remove_source"]).remove_source(kb_id, source_id)
+            self._json(200, {"ok": ok})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        # RAG KB delete
+        if path.startswith("/api/rag/kbs/"):
+            rest = path[len("/api/rag/kbs/"):]
+            parts = rest.split("/")
+            if len(parts) == 1 and parts[0]:
+                self._handle_rag_delete_kb(parts[0])
+                return
+            if len(parts) == 3 and parts[1] == "sources" and parts[2]:
+                self._handle_rag_remove_source(parts[0], parts[2])
+                return
+        self._json(404, {"error": "not_found"})
 
 
 def main() -> None:

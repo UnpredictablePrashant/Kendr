@@ -237,3 +237,39 @@ Registered for `whatsapp_send_message_agent`, `whatsapp_list_messages_agent`, `c
 `kendr gateway start/stop/status/restart` — fully functional on-demand gateway control.
 Gateway auto-starts on first `kendr run` if not already running.
 Explicit management: `kendr gateway start` (pre-launch) / `kendr gateway stop` (clean shutdown).
+
+## Task #15: Super-RAG System
+
+`kendr/rag_manager.py` — Named Knowledge Base (KB) registry with full lifecycle management.
+
+### Components
+- **`kendr/rag_manager.py`** — KB registry at `~/.kendr/rag_config.json`; uploads at `~/.kendr/rag_uploads/`
+  - `create_kb / delete_kb / list_kbs / get_kb / get_active_kb / set_active_kb`
+  - `add_source` — folder, file, URL, database, OneDrive
+  - `update_vector_config` — backend: chromadb (default), qdrant, pgvector
+  - `update_reranker_config` — algorithm: none, keyword, rrf, cross_encoder, cohere
+  - `toggle_agent` — enable/disable agent access to a KB
+  - `index_kb / get_index_job` — threaded async indexing
+  - `query_kb / generate_answer` — RAG query + LLM answer generation
+  - `kb_status` — full health report per KB
+
+- **`kendr/ui_server.py`** — `/rag` page: 5-tab workspace (Sources · Vector DB · Reranker · Agents · Query/Test), left KB panel with list+create+delete; 12 REST API routes wired
+
+### CLI: `kendr rag`
+11 subcommands: `list` · `create` · `status` · `add-source` · `index` · `query` · `config-vector` · `config-reranker` · `enable-agent` · `disable-agent` · `activate` · `delete`
+
+### Vector backends
+- ChromaDB (default, local, no server needed)
+- Qdrant (requires running Qdrant server, `--qdrant-url`)
+- pgvector (requires PostgreSQL + pgvector extension, `--pgvector-url`)
+
+### Rerankers
+- `none` — cosine similarity only
+- `keyword` — BM25-style keyword boost (configurable weight)
+- `rrf` — Reciprocal Rank Fusion (hybrid)
+- `cross_encoder` — cross-encoder reranking (requires sentence-transformers)
+- `cohere` — Cohere Rerank API (requires API key)
+
+### Embedding
+Default: `openai:text-embedding-3-small` (requires `OPENAI_API_KEY`).
+Local fallback uses existing `tasks/research_infra.py` chunking utilities.
