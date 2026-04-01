@@ -5,235 +5,261 @@
   </picture>
 </p>
 
+<p align="center">
+  <a href="https://github.com/kendr-ai/kendr/releases"><img src="https://img.shields.io/badge/version-0.2.0-teal" alt="Version"></a>
+  <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+</p>
+
 # Kendr
 
-> Open-source multi-agent intelligence CLI for evidence-driven research, knowledge management, and software project generation.
+> Open-source multi-agent intelligence platform — Web UI + CLI for research, project management, and software automation.
 
-Kendr is a terminal-first Python runtime that combines specialized agents, web and local evidence, durable memory, and structured run artifacts. It is built for intelligence work that needs traceability, synthesis, and reusable context — all from the command line.
+Kendr is a Python runtime that combines specialized AI agents, a web-based chat and project UI, multi-source research, durable memory, and structured run artifacts. Use it from the browser or the terminal.
 
 [Quickstart](docs/quickstart.md) · [CLI Reference](docs/cli.md) · [Configuration](docs/configuration.md) · [Integrations](docs/integrations.md) · [Examples](SampleTasks.md)
 
 ---
 
-## What You Can Do With Kendr
+## Install
 
-Kendr provides five distinct capability areas, each accessible as a CLI command:
+### Requirements
 
-| # | Capability | Command | Status |
-|---|---|---|---|
-| 1 | **Deep research with document generation** | `kendr run` / `kendr research` | Stable |
-| 2 | **Multi-agent software project generation** | `kendr generate` | Beta |
-| 3 | **Zero-config SuperRAG knowledge engine** | `kendr run --superrag-mode` | Stable |
-| 4 | **Local command execution with auto-install** | `kendr run --os-command` / `--dev` | Beta |
-| 5 | **Unified communication suite** | `kendr run --communication-authorized` | Beta |
-
-Everything is CLI-based. There is no web dashboard.
+- **Python 3.10 or newer** — [python.org/downloads](https://python.org/downloads)
+- **Git** — [git-scm.com](https://git-scm.com)
+- An **OpenAI API key** (or Anthropic / Google / local Ollama — see [LLM Providers](#llm-providers) below)
 
 ---
 
-## Quickstart
-
-**1. Install:**
+### macOS / Linux — one command
 
 ```bash
 git clone https://github.com/kendr-ai/kendr.git
 cd kendr
+./scripts/install.sh
+```
+
+After it finishes, reload your shell and run `kendr --help` to confirm the install:
+
+```bash
+source ~/.zshrc     # zsh (macOS default)
+# or
+source ~/.bashrc    # bash (Linux default)
+
+kendr --help
+```
+
+---
+
+### Windows — PowerShell
+
+Open **PowerShell** (not CMD) and run:
+
+```powershell
+git clone https://github.com/kendr-ai/kendr.git
+cd kendr
+powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
+```
+
+Open a **new terminal** after the script finishes, then verify:
+
+```powershell
+kendr --help
+```
+
+---
+
+### Manual install (any platform)
+
+If you prefer to control the environment yourself:
+
+```bash
+git clone https://github.com/kendr-ai/kendr.git
+cd kendr
+
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate       # macOS/Linux
+# .venv\Scripts\activate        # Windows PowerShell
+
+# Install kendr
 pip install -e .
+
+# Verify
+kendr --help
 ```
 
-**2. Set the two required variables:**
+---
+
+### Install with pip (no git clone)
+
+If you just want the package without cloning the repo:
 
 ```bash
+pip install kendr-runtime
+kendr --help
+```
+
+> **Note:** Running `kendr ui` from a pip install requires the repo to be present for the HTML assets. Clone + install is recommended for the full experience.
+
+---
+
+## LLM Providers
+
+Kendr ships with **OpenAI** by default. Install optional packages to add more providers:
+
+| Provider | Install command | Models |
+|---|---|---|
+| **OpenAI** *(default)* | included | GPT-4o, GPT-4o-mini, o1, o3 |
+| **Anthropic Claude** | `pip install 'kendr-runtime[anthropic]'` | claude-3-5-sonnet, claude-opus |
+| **Google Gemini** | `pip install 'kendr-runtime[google]'` | gemini-2.0-flash, gemini-1.5-pro |
+| **Local Ollama** | `pip install 'kendr-runtime[ollama]'` | llama3, mistral, phi3, … |
+| **All of the above** | `pip install 'kendr-runtime[full]'` | everything |
+
+Or use the install script with `--full`:
+
+```bash
+./scripts/install.sh --full          # macOS/Linux
+.\scripts\install.ps1 -Full         # Windows
+```
+
+---
+
+## First-Time Setup
+
+After installing, set two required values:
+
+```bash
+# Your LLM API key
 kendr setup set openai OPENAI_API_KEY sk-...
-kendr setup set core_runtime KENDR_WORKING_DIR /absolute/path/to/workdir
-```
 
-Or set them in `.env` (copy from `.env.example`).
+# Where kendr writes output files
+kendr setup set core_runtime KENDR_WORKING_DIR ~/kendr-work
 
-**3. Start the gateway:**
-
-```bash
-kendr gateway start
-```
-
-The gateway is required before `kendr run`, `kendr research`, or `kendr generate`. Start it once — it stays running in the background.
-
-**4. Check setup:**
-
-```bash
+# Check everything is configured
 kendr setup status
 ```
 
-**5. Run your first query:**
-
-```bash
-kendr run --current-folder \
-  "Create an intelligence brief on Stripe: business model, products, competitors, recent strategy moves, and top risks."
-```
-
-See [Quickstart](docs/quickstart.md) for a full walkthrough including what output to expect.
+Or copy `.env.example` to `.env` and fill in the values manually.
 
 ---
 
-## Install and Verify
-
-Linux or macOS:
+## Launch the Web UI
 
 ```bash
-./scripts/install.sh
-python scripts/verify.py
+kendr ui
 ```
 
-Windows PowerShell:
+Opens the web interface at **http://localhost:5000** with:
 
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
-python .\scripts\verify.py
-```
+- **Chat** — multi-agent chat with streaming output and plan cards
+- **Projects** — open any local code project, chat with an AI that understands your codebase, manage files, run terminal commands, view git status
+- **Setup & Config** — configure API keys and LLM providers in the browser
+- **Run History** — browse every past run and its output artifacts
+- **LLM Models** — view and switch between available models
 
-Manual:
+---
+
+## CLI Quick Reference
 
 ```bash
-pip install -e ".[dev]"
-python scripts/bootstrap_local_state.py
-python scripts/verify.py smoke
+# Research
+kendr run "Analyse the AI chip market: key players, supply chain, investment outlook."
+kendr research --sources arxiv,web --pages 15 "Advances in LLM reasoning 2024"
+
+# Software project generation
+kendr generate --stack fastapi_postgres "Task management API with auth and tests."
+kendr generate --stack nextjs_prisma_postgres "Blog platform with markdown and auth."
+
+# SuperRAG knowledge sessions
+kendr run --superrag-mode build --superrag-new-session --superrag-session-title "docs" \
+  --superrag-path ./docs "Index my documentation."
+kendr run --superrag-mode chat --superrag-session docs "What are the install requirements?"
+
+# Shell command execution (with approval gate)
+kendr run --os-command "df -h" --os-shell bash --privileged-approved "Check disk usage."
+
+# Gateway (required for communication integrations and REST API)
+kendr gateway start
+kendr gateway status
+kendr gateway stop
 ```
 
 ---
 
-## Capability Highlights
+## What You Can Do
 
-### 1. Deep Research and Document Generation
-
-Multi-source research that synthesizes web, academic, patent, and local evidence into structured reports.
-
-```bash
-# Research brief
-kendr run --current-folder "Analyze the AI chip market: key players, supply chain, and investment outlook."
-
-# Select specific sources
-kendr run --sources arxiv,web,reddit --pages 20 "AI safety research landscape 2024"
-
-# Via the dedicated research command
-kendr research --sources arxiv,web --pages 15 --title "Quantum ML Survey" \
-  "Advances in quantum machine learning"
-
-# Long-form staged document (50+ pages)
-kendr run --long-document --long-document-pages 50 --long-document-sections 10 \
-  --long-document-title "Global Gold Market Intelligence Dossier" \
-  "Produce an exhaustive investment-grade global gold market report."
-```
-
-### 2. Multi-Agent Software Project Generation
-
-Blueprint → scaffold → build → test → verify → zip export, fully automated.
-
-```bash
-# Generate a project with a specific stack
-kendr generate --stack fastapi_postgres \
-  "A task management REST API with user auth, tests, and Docker deployment."
-
-# Full-stack web app
-kendr generate --stack fastapi_react_postgres \
-  "SaaS starter with billing, admin dashboard, and CI/CD."
-
-# Via run with --dev flag
-kendr run --dev --stack nextjs_prisma_postgres \
-  "A blog platform with markdown, auth, and CDN image handling."
-```
-
-Available stacks: `fastapi_postgres`, `fastapi_react_postgres`, `nextjs_prisma_postgres`, `express_prisma_postgres`, `mern_microservices_mongodb`, `pern_postgres`, `nextjs_static_site`, `django_react_postgres`, `custom_freeform`.
-
-### 3. Zero-Config SuperRAG Knowledge Engine
-
-Index local files, URLs, databases, and OneDrive content into a persistent knowledge session. ChromaDB is the default vector backend — no setup required.
-
-```bash
-# Build a knowledge session
-kendr run \
-  --superrag-mode build \
-  --superrag-new-session \
-  --superrag-session-title "product_docs" \
-  --superrag-path ./docs \
-  --superrag-url https://example.com/help \
-  "Index our product documentation."
-
-# Chat with the session
-kendr run \
-  --superrag-mode chat \
-  --superrag-session product_docs \
-  --superrag-chat "What are the installation requirements?"
-
-# Index a database
-kendr run \
-  --superrag-mode build \
-  --superrag-session ops_db \
-  --superrag-db-url "postgresql://user:pass@host/db" \
-  "Scan and index this database."
-```
-
-For production use with shared persistence, opt in to Qdrant by setting `QDRANT_URL`.
-
-### 4. Local Command Execution and Dev Pipeline
-
-Controlled shell execution with audit trails, approval gates, and optional auto-install of missing tools.
-
-```bash
-# Execute a shell command with approval
-kendr run --current-folder \
-  --os-command "df -h" --os-shell bash \
-  --privileged-approved --privileged-approval-note "OPS-42 approved" \
-  "Check disk usage."
-
-# Full dev pipeline mode
-kendr run --dev --stack fastapi_postgres \
-  "Build a production-ready FastAPI application."
-```
-
-### 5. Unified Communication Suite
-
-Fetch and summarize messages from all configured channels in a single briefing.
-
-```bash
-# Morning digest across all channels
-kendr run \
-  --communication-authorized \
-  "Summarize my communications across all channels from the last 24 hours."
-
-# Custom lookback window
-kendr run \
-  --communication-authorized \
-  --communication-lookback-hours 8 \
-  "What did I miss on Slack and Gmail in the last 8 hours?"
-
-# Send a WhatsApp message
-kendr run \
-  --communication-authorized \
-  --whatsapp-to "+15551234567" \
-  --whatsapp-message "Your briefing is ready." \
-  "Send a WhatsApp notification."
-```
+| # | Capability | Entry point | Status |
+|---|---|---|---|
+| 1 | **Web UI** — chat, projects, config, history | `kendr ui` | Stable |
+| 2 | **Deep research + document generation** | `kendr run` / `kendr research` | Stable |
+| 3 | **Multi-agent project generation** | `kendr generate` | Beta |
+| 4 | **SuperRAG knowledge engine** | `kendr run --superrag-mode` | Stable |
+| 5 | **Local command execution** | `kendr run --os-command` | Beta |
+| 6 | **Unified communication suite** | `kendr run --communication-authorized` | Beta |
 
 ---
 
 ## Feature Status Matrix
 
-| Status | Areas | What It Means |
-|---|---|---|
-| **Stable** | Core CLI and runtime, setup-aware routing, local-drive intelligence, report synthesis, SuperRAG knowledge sessions | Best place for new users to start |
-| **Beta** | OpenAI deep research, long-document generation, multi-agent project generation, gateway HTTP surface, unified communication suite, AWS workflows, authorized security workflows | Implemented and usable; more sensitive to environment and configuration |
-| **Experimental** | Dynamic agent factory, generated agents, voice/audio workflows | Present or scaffolded; not part of the primary product promise |
+| Status | Areas |
+|---|---|
+| **Stable** | Web UI, core CLI, setup-aware routing, SuperRAG sessions, research synthesis, local-drive intelligence |
+| **Beta** | Project generation, long-document pipeline, gateway HTTP surface, communication suite, AWS workflows |
+| **Experimental** | Dynamic agent factory, generated agents, voice/audio workflows |
 
 ---
 
-## Gateway Lifecycle
+## Capability Highlights
 
-The HTTP gateway (`kendr gateway start`) is **on-demand only**. It is never auto-started by `kendr run`, `kendr research`, or `kendr generate`. Start it explicitly when you need the REST API surface or session routing for communication channels.
+### Web UI and Project Workspace
 
 ```bash
-kendr gateway start
-kendr gateway status
-kendr gateway stop
+kendr ui
+# → http://localhost:5000
+```
+
+The web interface gives you a full project workspace:
+- Open any local Git repository and chat with the AI about your code
+- Auto-generates a `kendr.md` project context file if one doesn't exist
+- Model selector and live context-window usage bar in the chat input
+- File browser, integrated terminal, and git status panel
+- Recent chat history per project
+
+### Deep Research and Document Generation
+
+Multi-source research that synthesises web, academic, patent, and local evidence into structured reports.
+
+```bash
+kendr run --current-folder \
+  "Create an intelligence brief on Stripe: business model, competitors, strategy, risks."
+
+kendr run --long-document --long-document-pages 50 \
+  "Produce an exhaustive global gold market investment report."
+```
+
+### Multi-Agent Software Project Generation
+
+Blueprint → scaffold → build → test → verify → zip export, fully automated.
+
+```bash
+kendr generate --stack fastapi_react_postgres \
+  "SaaS starter with billing, admin dashboard, and CI/CD."
+```
+
+Available stacks: `fastapi_postgres`, `fastapi_react_postgres`, `nextjs_prisma_postgres`, `express_prisma_postgres`, `mern_microservices_mongodb`, `pern_postgres`, `nextjs_static_site`, `django_react_postgres`, `custom_freeform`.
+
+### SuperRAG Knowledge Engine
+
+Zero-config vector search over local files, URLs, databases, and OneDrive content.
+
+```bash
+kendr run --superrag-mode build --superrag-new-session \
+  --superrag-session-title "product_docs" --superrag-path ./docs \
+  "Index our documentation."
+
+kendr run --superrag-mode chat --superrag-session product_docs \
+  --superrag-chat "What are the installation requirements?"
 ```
 
 ---
@@ -242,8 +268,8 @@ kendr gateway stop
 
 - [Quickstart](docs/quickstart.md) — install, configure, first run
 - [CLI Reference](docs/cli.md) — every subcommand and flag
-- [Configuration](docs/configuration.md) — every env var with defaults and examples
-- [Integrations](docs/integrations.md) — vector backends (ChromaDB / Qdrant), communication providers, security tools
+- [Configuration](docs/configuration.md) — every environment variable
+- [Integrations](docs/integrations.md) — vector backends, communication providers, security tools
 - [Agents](docs/agents.md) — workflow families and the full agent inventory
 - [Architecture](docs/architecture.md) — runtime flow, discovery, persistence
 - [Security](docs/security.md) — safety boundaries and privileged controls
@@ -260,9 +286,8 @@ kendr gateway stop
 - [SECURITY.md](SECURITY.md)
 
 Contribution baseline:
-
 - keep changes grounded in real code and verified workflows
-- preserve setup-aware gating and runtime behavior unless fixing a bug
+- preserve setup-aware gating and runtime behaviour unless fixing a bug
 - update tests and docs with user-facing changes
 - run `python scripts/verify.py` before opening a PR
 
@@ -271,9 +296,12 @@ Contribution baseline:
 ## Under the Hood
 
 - multi-agent orchestration runtime in [`kendr/runtime.py`](kendr/runtime.py)
-- dynamic agent registry and discovery in [`kendr/discovery.py`](kendr/discovery.py)
+- web UI server (chat + project workspace) in [`kendr/ui_server.py`](kendr/ui_server.py)
 - CLI entrypoint in [`kendr/cli.py`](kendr/cli.py)
-- rich terminal output and spinners in [`kendr/cli_output.py`](kendr/cli_output.py)
+- dynamic agent registry and discovery in [`kendr/discovery.py`](kendr/discovery.py)
+- multi-provider LLM routing in [`kendr/llm_router.py`](kendr/llm_router.py)
+- project context management in [`kendr/project_context.py`](kendr/project_context.py)
+- rich terminal output in [`kendr/cli_output.py`](kendr/cli_output.py)
 - setup and integration catalog in [`kendr/setup/`](kendr/setup)
 - durable SQLite persistence in [`kendr/persistence/`](kendr/persistence)
 - multi-source research infrastructure in [`tasks/research_infra.py`](tasks/research_infra.py)

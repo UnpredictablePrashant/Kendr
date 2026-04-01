@@ -1,0 +1,19 @@
+include README.md
+include LICENSE
+include CHANGELOG.md
+include CONTRIBUTING.md
+include SECURITY.md
+include .env.example
+include requirements.txt
+recursive-include docs *.md *.txt *.rst
+recursive-include kendr *.json *.yaml *.yml *.md
+recursive-include tasks *.json *.yaml
+recursive-include mcp_servers *.json *.yaml *.md
+recursive-include plugin_templates *.json *.yaml *.py *.md
+recursive-include scripts *.sh *.ps1 *.py
+exclude .env
+exclude output
+exclude logs
+prune tests/__pycache__
+prune kendr/__pycache__
+prune tasks/__pycache__

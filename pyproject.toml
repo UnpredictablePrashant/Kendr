@@ -4,33 +4,98 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kendr-runtime"
-version = "0.1.0"
-description = "Plugin-driven multi-agent runtime and orchestration CLI"
+version = "0.2.0"
+description = "Open-source multi-agent intelligence runtime with Web UI, CLI, and project workspace"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
+keywords = [
+  "multi-agent", "ai", "llm", "research", "cli", "orchestration",
+  "langchain", "langgraph", "rag", "automation", "web-ui"
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+
 dependencies = [
-  "langgraph",
-  "langchain",
-  "langchain-openai",
-  "openai",
+  # Core orchestration
+  "langgraph>=0.2",
+  "langchain>=0.3",
+  "langchain-core>=0.3",
+  "langchain-openai>=0.2",
+  "openai>=1.40",
+  # HTTP and parsing
+  "requests>=2.31",
   "charset-normalizer>=3,<4",
-  "python-dotenv",
-  "beautifulsoup4",
-  "pypdf",
-  "python-docx",
-  "sqlalchemy",
-  "qdrant-client",
-  "chromadb",
-  "fastmcp",
-  "telethon",
-  "boto3",
-  "playwright",
+  "beautifulsoup4>=4.12",
+  # Document handling
+  "pypdf>=4.0",
+  "python-docx>=1.1",
+  # Environment and config
+  "python-dotenv>=1.0",
+  # Database persistence
+  "sqlalchemy>=2.0",
+  # Vector search (default ChromaDB, no server required)
+  "chromadb>=0.5",
+  # MCP protocol
+  "fastmcp>=0.9",
+  # Terminal output
+  "rich>=13.0",
 ]
 
 [project.optional-dependencies]
+# LLM provider add-ons
+anthropic = ["langchain-anthropic>=0.2"]
+google    = ["langchain-google-genai>=2.0"]
+ollama    = ["langchain-ollama>=0.2"]
+
+# Vector store add-ons
+qdrant = ["qdrant-client>=1.9"]
+
+# Cloud / infrastructure
+aws    = ["boto3>=1.34"]
+cloud  = ["boto3>=1.34"]
+
+# Browser automation
+browser = ["playwright>=1.44"]
+
+# Communication integrations
+telegram = ["telethon>=1.36"]
+
+# All optional providers bundled
+full = [
+  "langchain-anthropic>=0.2",
+  "langchain-google-genai>=2.0",
+  "langchain-ollama>=0.2",
+  "qdrant-client>=1.9",
+  "boto3>=1.34",
+  "playwright>=1.44",
+  "telethon>=1.36",
+]
+
+# Development and testing
 dev = [
   "pytest>=8,<9",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.4",
 ]
+
+[project.urls]
+Homepage      = "https://github.com/kendr-ai/kendr"
+Documentation = "https://github.com/kendr-ai/kendr/tree/main/docs"
+Repository    = "https://github.com/kendr-ai/kendr"
+"Bug Tracker" = "https://github.com/kendr-ai/kendr/issues"
+Changelog     = "https://github.com/kendr-ai/kendr/blob/main/CHANGELOG.md"
 
 [project.scripts]
 kendr = "kendr.cli:main"
@@ -41,3 +106,11 @@ include-package-data = true
 [tool.setuptools.packages.find]
 include = ["kendr*", "tasks*", "mcp_servers*", "plugin_templates*"]
 exclude = ["tests", "docs", "output", "logs"]
+
+[tool.setuptools.package-data]
+"kendr" = ["**/*.json", "**/*.yaml", "**/*.yml", "**/*.md", "**/*.txt"]
+"tasks" = ["**/*.json", "**/*.yaml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
