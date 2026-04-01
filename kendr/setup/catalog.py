@@ -10,6 +10,7 @@ class SetupField:
     description: str
     secret: bool = False
     required: bool = False
+    default: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,8 +62,8 @@ class RequirementRule:
     description: str
 
 
-def _field(key: str, label: str, description: str, *, secret: bool = False, required: bool = False) -> SetupField:
-    return SetupField(key=key, label=label, description=description, secret=secret, required=required)
+def _field(key: str, label: str, description: str, *, secret: bool = False, required: bool = False, default: str = "") -> SetupField:
+    return SetupField(key=key, label=label, description=description, secret=secret, required=required, default=default)
 
 
 INTEGRATION_DEFINITIONS: tuple[IntegrationDefinition, ...] = (
@@ -604,11 +605,11 @@ def setup_component_catalog() -> list[dict]:
             "category": "Core",
             "description": "Base runtime behavior, working directory, output paths, and plugin discovery.",
             "fields": [
-                asdict(_field("KENDR_HOME", "Kendr Home", "Home directory for plugin and config files.")),
+                asdict(_field("KENDR_HOME", "Kendr Home", "Home directory for plugin and config files.", default="~/.kendr")),
                 asdict(_field("KENDR_PLUGIN_PATHS", "Plugin Paths", "OS path-separated plugin paths.")),
-                asdict(_field("OUTPUT_DIR", "Output Directory", "Output folder for runs and setup artifacts.")),
-                asdict(_field("KENDR_WORKING_DIR", "Working Folder", "Required base folder for task runs, artifacts, and outputs.", required=True)),
-                asdict(_field("RESEARCH_USER_AGENT", "Research User Agent", "User-Agent string for research HTTP fetches.")),
+                asdict(_field("OUTPUT_DIR", "Output Directory", "Output folder for runs and setup artifacts.", default="./output")),
+                asdict(_field("KENDR_WORKING_DIR", "Working Folder", "Base folder for task runs, artifacts, and outputs.", required=True)),
+                asdict(_field("RESEARCH_USER_AGENT", "Research User Agent", "User-Agent string for research HTTP fetches.", default="kendr-research/1.0")),
             ],
             "docs_path": "docs/install.md",
         },
@@ -618,8 +619,8 @@ def setup_component_catalog() -> list[dict]:
             "category": "Runtime",
             "description": "HTTP ingest and dashboard server settings.",
             "fields": [
-                asdict(_field("GATEWAY_HOST", "Host", "Gateway bind host.")),
-                asdict(_field("GATEWAY_PORT", "Port", "Gateway bind port.")),
+                asdict(_field("GATEWAY_HOST", "Host", "Gateway bind host.", default="127.0.0.1")),
+                asdict(_field("GATEWAY_PORT", "Port", "Gateway bind port.", default="8790")),
             ],
             "docs_path": "docs/install.md",
         },
@@ -629,8 +630,8 @@ def setup_component_catalog() -> list[dict]:
             "category": "Runtime",
             "description": "Configuration web UI bind settings.",
             "fields": [
-                asdict(_field("SETUP_UI_HOST", "Host", "Setup UI bind host.")),
-                asdict(_field("SETUP_UI_PORT", "Port", "Setup UI bind port.")),
+                asdict(_field("SETUP_UI_HOST", "Host", "Setup UI bind host.", default="127.0.0.1")),
+                asdict(_field("SETUP_UI_PORT", "Port", "Setup UI bind port.", default="8787")),
             ],
             "docs_path": "docs/install.md",
         },
@@ -640,8 +641,8 @@ def setup_component_catalog() -> list[dict]:
             "category": "Runtime",
             "description": "Always-on monitor daemon intervals.",
             "fields": [
-                asdict(_field("DAEMON_POLL_INTERVAL", "Poll Interval", "Main daemon poll interval in seconds.")),
-                asdict(_field("DAEMON_HEARTBEAT_INTERVAL", "Heartbeat Interval", "Heartbeat interval in seconds.")),
+                asdict(_field("DAEMON_POLL_INTERVAL", "Poll Interval", "Main daemon poll interval in seconds.", default="30")),
+                asdict(_field("DAEMON_HEARTBEAT_INTERVAL", "Heartbeat Interval", "Heartbeat interval in seconds.", default="300")),
             ],
             "docs_path": "docs/install.md",
         },
@@ -651,8 +652,8 @@ def setup_component_catalog() -> list[dict]:
             "category": "Security",
             "description": "Scan profile and optional local security tooling settings.",
             "fields": [
-                asdict(_field("SECURITY_SCAN_PROFILE", "Default Scan Profile", "Security scan depth default: baseline, standard, deep, or extensive.")),
-                asdict(_field("SECURITY_AUTO_INSTALL_TOOLS", "Auto Install Security Tools", "If true, CLI attempts to install missing security tools for authorized runs.")),
+                asdict(_field("SECURITY_SCAN_PROFILE", "Default Scan Profile", "Security scan depth: baseline, standard, deep, or extensive.", default="standard")),
+                asdict(_field("SECURITY_AUTO_INSTALL_TOOLS", "Auto Install Security Tools", "If true, CLI attempts to install missing security tools.", default="true")),
             ],
             "docs_path": "docs/integrations.md#security-tools",
         },
@@ -662,8 +663,8 @@ def setup_component_catalog() -> list[dict]:
             "category": "MCP",
             "description": "Research MCP server bind settings.",
             "fields": [
-                asdict(_field("MCP_RESEARCH_HOST", "Host", "Host for research MCP.")),
-                asdict(_field("MCP_RESEARCH_PORT", "Port", "Port for research MCP.")),
+                asdict(_field("MCP_RESEARCH_HOST", "Host", "Host for research MCP.", default="127.0.0.1")),
+                asdict(_field("MCP_RESEARCH_PORT", "Port", "Port for research MCP.", default="9100")),
             ],
             "docs_path": "docs/integrations.md#mcp-servers",
         },
@@ -673,8 +674,8 @@ def setup_component_catalog() -> list[dict]:
             "category": "MCP",
             "description": "Vector MCP server bind settings.",
             "fields": [
-                asdict(_field("MCP_VECTOR_HOST", "Host", "Host for vector MCP.")),
-                asdict(_field("MCP_VECTOR_PORT", "Port", "Port for vector MCP.")),
+                asdict(_field("MCP_VECTOR_HOST", "Host", "Host for vector MCP.", default="127.0.0.1")),
+                asdict(_field("MCP_VECTOR_PORT", "Port", "Port for vector MCP.", default="9101")),
             ],
             "docs_path": "docs/integrations.md#mcp-servers",
         },
@@ -684,12 +685,12 @@ def setup_component_catalog() -> list[dict]:
             "category": "MCP",
             "description": "Shared settings for security MCP servers.",
             "fields": [
-                asdict(_field("MCP_SECURITY_HOST", "Host", "Host for security MCP services.")),
-                asdict(_field("MCP_NMAP_PORT", "Nmap Port", "Nmap MCP port.")),
-                asdict(_field("MCP_ZAP_PORT", "ZAP Port", "ZAP MCP port.")),
-                asdict(_field("MCP_SCREENSHOT_PORT", "Screenshot Port", "Screenshot MCP port.")),
-                asdict(_field("MCP_HTTP_FUZZING_PORT", "HTTP Fuzzing Port", "HTTP fuzzing MCP port.")),
-                asdict(_field("MCP_CVE_PORT", "CVE Port", "CVE MCP port.")),
+                asdict(_field("MCP_SECURITY_HOST", "Host", "Host for security MCP services.", default="127.0.0.1")),
+                asdict(_field("MCP_NMAP_PORT", "Nmap Port", "Nmap MCP port.", default="9110")),
+                asdict(_field("MCP_ZAP_PORT", "ZAP Port", "ZAP MCP port.", default="9111")),
+                asdict(_field("MCP_SCREENSHOT_PORT", "Screenshot Port", "Screenshot MCP port.", default="9112")),
+                asdict(_field("MCP_HTTP_FUZZING_PORT", "HTTP Fuzzing Port", "HTTP fuzzing MCP port.", default="9113")),
+                asdict(_field("MCP_CVE_PORT", "CVE Port", "CVE MCP port.", default="9114")),
             ],
             "docs_path": "docs/integrations.md#mcp-servers",
         },

@@ -88,13 +88,20 @@ def get_setup_component_snapshot(component_id: str) -> dict:
     values = get_component_values(component_id, include_secrets=True)
     current = {item["config_key"]: item["config_value"] for item in values}
     masked = {}
+    defaults = {}
     secrets = _field_secret_map(component)
     filled = 0
+    defaulted = 0
     for field in component.get("fields", []):
         key = field["key"]
-        raw_value = current.get(key, "")
+        raw_value = current.get(key, "") or os.getenv(key, "")
+        field_default = str(field.get("default", "")).strip()
+        if field_default:
+            defaults[key] = field_default
         if raw_value:
             filled += 1
+        elif field_default:
+            defaulted += 1
         if secrets.get(key, False):
             masked[key] = "********" if raw_value else ""
         else:
@@ -107,7 +114,9 @@ def get_setup_component_snapshot(component_id: str) -> dict:
         "updated_at": state.get("updated_at", "") if state else "",
         "values": masked,
         "raw_values": current,
+        "defaults": defaults,
         "filled_fields": filled,
+        "defaulted_fields": defaulted,
         "total_fields": len(component.get("fields", [])),
     }
 
@@ -132,7 +141,9 @@ def setup_overview() -> dict:
                 "description": component.get("description", ""),
                 "enabled": row.get("enabled", True if component_id not in states else bool(states[component_id].get("enabled", 1))),
                 "filled_fields": row.get("filled_fields", 0),
+                "defaulted_fields": row.get("defaulted_fields", 0),
                 "total_fields": row.get("total_fields", 0),
+                "defaults": row.get("defaults", {}),
                 "env_status": env_status,
             }
         )

@@ -1359,9 +1359,9 @@ async function loadSetup() {
     allComponents = d.components || [];
     let configured = 0, partial = 0, missing = 0;
     allComponents.forEach(c => {
-      const t = c.total_fields || 0, f = c.filled_fields || 0;
-      if (t === 0 || f === t) configured++;
-      else if (f > 0) partial++;
+      const t = c.total_fields || 0, f = c.filled_fields || 0, d = c.defaulted_fields || 0;
+      if (t === 0 || f + d >= t) configured++;
+      else if (f > 0 || d > 0) partial++;
       else missing++;
     });
     document.getElementById('statConfigured').textContent = configured;
@@ -1407,15 +1407,17 @@ function renderIntegrations(components) {
 }
 
 function makeCard(comp) {
-  const total = comp.total_fields || 0, filled = comp.filled_fields || 0;
+  const total = comp.total_fields || 0, filled = comp.filled_fields || 0, defaulted = comp.defaulted_fields || 0;
   const isConfigured = total === 0 || filled === total;
-  const isPartial = filled > 0 && filled < total;
+  const isDefaulted = !isConfigured && filled + defaulted >= total;
+  const isPartial = !isConfigured && !isDefaulted && (filled > 0 || defaulted > 0);
   const enabled = comp.enabled !== false;
   const div = document.createElement('div');
-  div.className = 'int-card' + (isConfigured ? ' configured' : '');
+  div.className = 'int-card' + (isConfigured || isDefaulted ? ' configured' : '');
   div.id = 'card-' + comp.id;
   let statusBadge = total === 0 ? '<span class="badge ok">\u2713 Ready</span>' :
     isConfigured ? '<span class="badge ok">\u2713 Configured</span>' :
+    isDefaulted ? '<span class="badge ok" title="Using built-in defaults. Override via .env or edit here.">\u2713 Has Defaults</span>' :
     isPartial ? '<span class="badge warn">\u26A1 Partial</span>' :
     '<span class="badge err">\u25CB Not set</span>';
   div.innerHTML = '<div class="card-header" onclick="toggleCard(\'' + esc(comp.id) + '\')">' +
@@ -1443,16 +1445,20 @@ async function toggleCard(compId) {
 function renderCardBody(body, snapshot, compId) {
   const fields = (snapshot.component || {}).fields || [];
   const values = snapshot.values || {};
+  const defaults = snapshot.defaults || {};
   const oauthPath = (snapshot.component || {}).oauth_start_path || '';
   let html = '';
   if (fields.length > 0) {
     fields.forEach(f => {
       const val = values[f.key] || '';
+      const fieldDefault = f.default || defaults[f.key] || '';
       const type = f.secret ? 'password' : 'text';
+      const placeholder = fieldDefault ? 'default: ' + fieldDefault : f.key;
+      const defaultHint = (!val && fieldDefault) ? '<span style="font-size:10px;color:var(--teal);opacity:0.7;margin-left:6px">(default: ' + esc(fieldDefault) + ')</span>' : '';
       const badges = [f.secret ? '<span class="secret-badge">SECRET</span>' : '', f.required ? '<span class="required-badge">REQUIRED</span>' : ''].filter(Boolean).join(' ');
-      html += '<div class="field-row"><div class="field-label">' + esc(f.label) + ' ' + badges + '</div>' +
+      html += '<div class="field-row"><div class="field-label">' + esc(f.label) + defaultHint + ' ' + badges + '</div>' +
         (f.description ? '<div class="field-desc">' + esc(f.description) + '</div>' : '') +
-        '<input class="field-input" type="' + type + '" id="fld-' + esc(compId) + '-' + esc(f.key) + '" value="' + esc(val) + '" placeholder="' + esc(f.key) + '" autocomplete="off"></div>';
+        '<input class="field-input" type="' + type + '" id="fld-' + esc(compId) + '-' + esc(f.key) + '" value="' + esc(val) + '" placeholder="' + esc(placeholder) + '" autocomplete="off"></div>';
     });
   } else {
     html = '<div style="font-size:12px;color:var(--muted);margin-bottom:12px">No configurable fields.</div>';
