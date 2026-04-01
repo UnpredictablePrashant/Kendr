@@ -249,11 +249,15 @@ def _start_run_background(run_id: str, payload: dict) -> None:
             result["artifacts"] = db_artifacts
             result["artifact_files"] = file_list
             test_report = None
-            for art in db_artifacts:
-                if art.get("kind") == "test_report" or "test_report" in str(art.get("name", "")):
-                    test_report = art.get("data") or art.get("payload") or art.get("content")
-            if not test_report and isinstance(result.get("test_report"), dict):
+            if isinstance(result.get("test_report"), dict):
                 test_report = result["test_report"]
+            if not test_report:
+                for art in db_artifacts:
+                    if art.get("kind") == "test_report" or "test_report" in str(art.get("name", "")):
+                        candidate = art.get("data") or art.get("payload") or art.get("content")
+                        if isinstance(candidate, dict):
+                            test_report = candidate
+                            break
             if test_report:
                 result["test_report"] = test_report
             with _pending_lock:
