@@ -193,6 +193,20 @@ class ProjectGenerationOrchestrator:
             payload.update(extra)
         self._cb(json.dumps(payload))
 
+    def _safe_path(self, rel: str) -> Path | None:
+        """Resolve *rel* relative to project_root and reject path-traversal escapes.
+
+        Returns the resolved ``Path`` if safe, or ``None`` if the path escapes
+        the project root (e.g. ``../secret``).  Every LLM-provided path MUST
+        pass through this guard before any filesystem write.
+        """
+        try:
+            resolved = (self.project_root / rel).resolve()
+            resolved.relative_to(self.project_root.resolve())
+            return resolved
+        except (ValueError, Exception):
+            return None
+
     def _derive_name(self, given: str) -> str:
         if given.strip():
             return given.strip().lower().replace(" ", "-")
@@ -481,7 +495,11 @@ Rules:
         root = self.project_root
         root.mkdir(parents=True, exist_ok=True)
         tech_stack = self._blueprint.get("tech_stack", {})
-        directory_structure = self._blueprint.get("directory_structure", [])
+        raw_structure = self._blueprint.get("directory_structure", [])
+        directory_structure = [
+            entry for entry in raw_structure
+            if self._safe_path(entry.rstrip("/")) is not None
+        ]
         env_vars = self._blueprint.get("env_vars", [])
         created: list[str] = []
 
@@ -537,18 +555,132 @@ Rules:
 
         return created
 
+    def _stack_coder_strategy(self) -> str:
+        """Return stack-specific coding instructions for the coder prompt.
+
+        Each supported stack has an explicit coder strategy that overrides the
+        generic instructions.  This implements the per-stack coder-agent concept
+        inside the orchestrator without requiring separate agent classes.
+        """
+        tech = self._blueprint.get("tech_stack", {})
+        fw = str(tech.get("framework", "")).lower()
+        lang = str(tech.get("language", "")).lower()
+        orm = str(tech.get("orm", "")).lower()
+        auth = str(tech.get("auth", "")).lower()
+        db = str(tech.get("database", "")).lower()
+
+        strategies: dict[str, str] = {
+            "nextjs": (
+                "Stack: Next.js 14+ App Router with TypeScript.\n"
+                "- Use Server Components by default; Client Components only when needed (use 'use client').\n"
+                "- Route handlers go in app/api/<path>/route.ts (export GET/POST/etc.).\n"
+                "- Use Prisma ORM with PostgreSQL. Define schema in prisma/schema.prisma.\n"
+                "- Use next-auth or jose for JWT/session auth. Protect routes via middleware.ts.\n"
+                "- Use Tailwind CSS for styling. No inline styles."
+            ),
+            "react": (
+                "Stack: React + Vite + TypeScript + Tailwind.\n"
+                "- Use functional components and hooks. No class components.\n"
+                "- State management: React Context or Zustand (no Redux unless explicitly required).\n"
+                "- API calls via fetch or axios with async/await. Wrap in custom hooks.\n"
+                "- Router: react-router-dom v6 with createBrowserRouter.\n"
+                "- Tailwind for all styling. Use shadcn/ui patterns where applicable."
+            ),
+            "fastapi": (
+                "Stack: FastAPI + SQLAlchemy + PostgreSQL.\n"
+                "- Use async def endpoints with asyncpg/databases or sqlalchemy[asyncio].\n"
+                "- Pydantic v2 schemas for request/response validation.\n"
+                "- Alembic for migrations. Define models in models.py, schemas in schemas.py.\n"
+                "- JWT auth via python-jose or authlib. Dependency injection for current_user.\n"
+                "- Pytest + httpx for tests."
+            ),
+            "express": (
+                "Stack: Express.js + Prisma + PostgreSQL + TypeScript.\n"
+                "- Use express Router, typed with @types/express.\n"
+                "- Prisma for database access. Define schema in prisma/schema.prisma.\n"
+                "- Middleware: helmet, cors, express-validator for input validation.\n"
+                "- JWT auth via jsonwebtoken. Middleware for protected routes.\n"
+                "- Jest or supertest for API tests."
+            ),
+            "django": (
+                "Stack: Django REST Framework + React frontend + PostgreSQL.\n"
+                "- Use class-based views (APIView / ModelViewSet).\n"
+                "- Django ORM models with __str__ and Meta class.\n"
+                "- DRF serializers for request/response. Use JWT via djangorestframework-simplejwt.\n"
+                "- CORS via django-cors-headers. Pytest-django for tests."
+            ),
+            "flutter": (
+                "Stack: Flutter + Dart.\n"
+                "- Use StatelessWidget + StatefulWidget appropriately. Prefer Provider/Riverpod.\n"
+                "- HTTP via http or dio package. Define API service classes.\n"
+                "- Navigator 2.0 or go_router for routing.\n"
+                "- Separate UI/logic: widgets in lib/widgets, screens in lib/screens, services in lib/services.\n"
+                "- Write flutter_test widget tests."
+            ),
+            "mern": (
+                "Stack: MongoDB + Express + React + Node.js (MERN) with TypeScript.\n"
+                "- Mongoose models with TypeScript interfaces.\n"
+                "- Express REST API with JWT auth (jsonwebtoken).\n"
+                "- React front-end with React Query for server state.\n"
+                "- Separate monorepo: packages/api and packages/web."
+            ),
+            "pern": (
+                "Stack: PostgreSQL + Express + React + Node.js (PERN) with TypeScript.\n"
+                "- pg or Prisma for database. Prisma preferred for type safety.\n"
+                "- Express API with TypeScript, helmet, cors, zod for validation.\n"
+                "- React frontend with React Query and React Router v6.\n"
+                "- Vitest for frontend tests, Jest + supertest for backend."
+            ),
+        }
+
+        if "nextjs" in fw or "next.js" in fw:
+            return strategies["nextjs"]
+        if "react" in fw and "next" not in fw:
+            return strategies["react"]
+        if "fastapi" in fw:
+            return strategies["fastapi"]
+        if "express" in fw:
+            return strategies["express"]
+        if "django" in fw:
+            return strategies["django"]
+        if "flutter" in fw or lang == "dart":
+            return strategies["flutter"]
+        if "mern" in fw:
+            return strategies["mern"]
+        if "pern" in fw:
+            return strategies["pern"]
+
+        generic = []
+        if "python" in lang:
+            generic.append("Write idiomatic Python 3.10+. Use type hints throughout.")
+        if "typescript" in lang:
+            generic.append("Write idiomatic TypeScript. No 'any' types.")
+        if orm == "prisma":
+            generic.append("Use Prisma ORM. Import from @prisma/client.")
+        if orm == "sqlalchemy":
+            generic.append("Use SQLAlchemy 2.x with async sessions.")
+        if auth == "jwt":
+            generic.append("Implement JWT auth. Include token creation and verification.")
+        if "postgres" in db or "postgresql" in db:
+            generic.append("Use PostgreSQL. Connection via DATABASE_URL env var.")
+        return "\n".join(generic) if generic else "Write production-quality, idiomatic code."
+
     def _build_module_prompt(self, module: dict, context_summary: str) -> str:
         tech = self._blueprint.get("tech_stack", {})
         deps = self._blueprint.get("dependencies", {})
         api = self._blueprint.get("api_design", {})
         schema = self._blueprint.get("database_schema", {})
+        stack_strategy = self._stack_coder_strategy()
         return f"""
 You are a senior engineer implementing a production-quality module.
 
 Project: {self._blueprint.get("project_name", self.project_name)}
 Description: {self._blueprint.get("description", self.description)}
 
-Tech stack:
+Stack-specific coder instructions:
+{stack_strategy}
+
+Tech stack (reference):
 {json.dumps(tech, indent=2)}
 
 Dependencies (runtime):
@@ -585,7 +717,10 @@ Instructions:
             file_rel = module.get("file", "")
             if not file_rel:
                 continue
-            target = self.project_root / file_rel
+            target = self._safe_path(file_rel)
+            if target is None:
+                self._log(f"  [coder] rejected path-traversal module: {file_rel}")
+                continue
             self._log(f"  [coder] {i}/{len(modules_sorted)} {file_rel}")
             context_summary = "\n".join(context_summary_parts[-6:])
             prompt = self._build_module_prompt(module, context_summary)
