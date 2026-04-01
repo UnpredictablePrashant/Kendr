@@ -2,6 +2,7 @@ from .core import DB_PATH, initialize_db
 from .run_store import (
     cleanup_stale_runs,
     delete_chat_session,
+    delete_run,
     get_channel_session,
     get_latest_run_checkpoint,
     get_run,
@@ -67,6 +68,7 @@ from .mcp_store import (
 __all__ = [
     "DB_PATH",
     "delete_chat_session",
+    "delete_run",
     "delete_setup_config_value",
     "get_channel_session",
     "get_latest_run_checkpoint",

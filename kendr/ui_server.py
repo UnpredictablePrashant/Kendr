@@ -30,6 +30,7 @@ try:
     from kendr.persistence import (
         cleanup_stale_runs as _db_cleanup_stale_runs,
         delete_chat_session as _db_delete_chat_session,
+        delete_run as _db_delete_run,
         list_agent_executions_for_run as _list_run_steps,
         list_artifacts_for_run as _list_run_artifacts,
         list_run_messages as _db_list_run_messages,
@@ -42,6 +43,8 @@ except Exception:
         return 0
     def _db_delete_chat_session(chat_session_id, **kw):  # type: ignore[misc]
         return {"deleted_runs": [], "deleted_dirs": [], "errors": []}
+    def _db_delete_run(run_id, **kw):  # type: ignore[misc]
+        return {"ok": True, "deleted_run": run_id, "errors": []}
     def _list_run_steps(run_id):  # type: ignore[misc]
         return []
     def _list_run_artifacts(run_id):  # type: ignore[misc]
@@ -905,6 +908,14 @@ async function loadRuns() {
         : '<span style="width:8px;height:8px;border-radius:50%;display:inline-block;flex-shrink:0;background:' + statusColor + '"></span>';
       const statusLabel = isRunning ? 'running' : status;
       const wdLabel = run.working_directory ? '<span style="color:var(--muted);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px" title="' + esc(run.working_directory) + '">&#x1F4C1; ' + esc(run.working_directory.split('/').pop()) + '</span>' : '';
+      const delBtn = document.createElement('button');
+      delBtn.title = 'Delete this run';
+      delBtn.innerHTML = '&#x1F5D1;';
+      delBtn.style.cssText = 'display:none;background:none;border:none;cursor:pointer;color:var(--muted);font-size:13px;padding:2px 4px;border-radius:4px;flex-shrink:0;line-height:1';
+      delBtn.onmouseenter = () => delBtn.style.color = 'var(--crimson)';
+      delBtn.onmouseleave = () => delBtn.style.color = 'var(--muted)';
+      delBtn.onclick = (e) => { e.stopPropagation(); deleteRun(run.run_id, div); };
+
       div.innerHTML =
         '<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">'
         + statusDot
@@ -914,6 +925,9 @@ async function loadRuns() {
         + '<span style="font-size:10px;color:var(--muted)">' + ts + '</span>'
         + '</div>'
         + (wdLabel ? '<div style="margin-top:2px">' + wdLabel + '</div>' : '');
+      div.appendChild(delBtn);
+      div.onmouseenter = () => delBtn.style.display = 'inline';
+      div.onmouseleave = () => delBtn.style.display = 'none';
       div.onclick = () => loadRun(run.run_id);
       list.appendChild(div);
     });
@@ -1069,6 +1083,38 @@ async function deleteChat() {
 }
 
 function clearChat() { deleteChat(); }
+
+async function deleteRun(runId, itemEl) {
+  if (!confirm('Delete this run? This will permanently remove all messages and output files for this run.')) return;
+  if (itemEl) {
+    itemEl.style.opacity = '0.4';
+    itemEl.style.pointerEvents = 'none';
+  }
+  try {
+    const r = await fetch(API + '/api/runs/delete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ run_id: runId })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      if (currentRunId === runId) {
+        currentRunId = null;
+        clearMessages();
+        document.getElementById('chatTitle').textContent = 'New Chat';
+        document.getElementById('clearChatBtn').style.display = 'none';
+      }
+      if (itemEl) itemEl.remove();
+      loadRuns();
+    } else {
+      if (itemEl) { itemEl.style.opacity = '1'; itemEl.style.pointerEvents = ''; }
+      alert('Failed to delete run: ' + (d.error || 'unknown error'));
+    }
+  } catch(e) {
+    if (itemEl) { itemEl.style.opacity = '1'; itemEl.style.pointerEvents = ''; }
+    alert('Failed to delete run: ' + e);
+  }
+}
 
 function clearMessages() {
   const msgs = document.getElementById('messages');
@@ -5033,6 +5079,17 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             try:
                 result = _db_delete_chat_session(chat_session_id)
                 self._json(200, {"ok": True, **result})
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
+        if path == "/api/runs/delete":
+            run_id = str(body.get("run_id", "")).strip()
+            if not run_id:
+                self._json(400, {"error": "missing_run_id"})
+                return
+            try:
+                result = _db_delete_run(run_id)
+                self._json(200, result)
             except Exception as exc:
                 self._json(500, {"error": str(exc)})
             return

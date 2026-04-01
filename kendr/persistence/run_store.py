@@ -778,3 +778,40 @@ def delete_chat_session(
         "session_key": session_key,
         "errors": errors,
     }
+
+
+def delete_run(
+    run_id: str,
+    db_path: str = DB_PATH,
+) -> dict:
+    """Delete a single run by run_id, including its output directory and all related rows."""
+    initialize_db(db_path)
+    errors: list[str] = []
+
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT run_output_dir FROM runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+
+    run_dir = row["run_output_dir"] if row else None
+    if run_dir:
+        try:
+            p = Path(run_dir)
+            if p.exists() and p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+        except Exception as exc:
+            errors.append(str(exc))
+
+    with _connect(db_path) as conn:
+        for table in ("run_checkpoints", "artifacts", "agent_executions", "messages", "tasks"):
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
+            except Exception:
+                pass
+        try:
+            conn.execute("DELETE FROM task_sessions WHERE run_id = ?", (run_id,))
+        except Exception:
+            pass
+        conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+
+    return {"ok": True, "deleted_run": run_id, "errors": errors}
