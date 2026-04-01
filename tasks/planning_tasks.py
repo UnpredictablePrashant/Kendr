@@ -339,6 +339,7 @@ def _planning_context(state: dict, objective: str) -> str:
         "superrag_urls": state.get("superrag_urls", []),
         "security_target_url": state.get("security_target_url", ""),
         "repo_scan_summary": str(state.get("repo_scan_summary", "")).strip()[:4000],
+        "project_context_md": str(state.get("project_context_md", "")).strip()[:8000],
         "setup_summary": state.get("setup_summary", ""),
         "previous_plan": state.get("plan", ""),
         "revision_feedback": state.get("plan_revision_feedback", ""),

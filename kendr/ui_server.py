@@ -484,6 +484,35 @@ a:hover { text-decoration: underline; }
 .run-badge.running { background: rgba(255,179,71,0.15); color: var(--amber); }
 .new-chat-btn { display: flex; align-items: center; justify-content: center; gap: 8px; margin: 12px 8px 4px; padding: 10px; background: rgba(0,201,167,0.1); border: 1px solid rgba(0,201,167,0.3); color: var(--teal); border-radius: 10px; font-size: 13px; font-weight: 600; cursor: pointer; transition: background 0.15s; }
 .new-chat-btn:hover { background: rgba(0,201,167,0.2); }
+/* Project context panel in chat sidebar */
+.proj-panel { margin: 0 8px 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface2); overflow: hidden; }
+.proj-panel-header { display: flex; align-items: center; gap: 6px; padding: 8px 10px; cursor: pointer; user-select: none; }
+.proj-panel-icon { font-size: 14px; }
+.proj-panel-name { flex: 1; font-size: 11px; font-weight: 700; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.proj-panel-badge { font-size: 9px; font-weight: 700; background: rgba(0,201,167,.15); color: var(--teal); padding: 1px 5px; border-radius: 10px; flex-shrink: 0; }
+.proj-panel-none { font-size: 11px; color: var(--muted); font-style: italic; }
+.proj-panel-body { border-top: 1px solid var(--border); padding: 8px 10px; display: none; }
+.proj-panel.open .proj-panel-body { display: block; }
+.proj-stack { font-size: 10px; color: var(--muted); margin-bottom: 6px; }
+.proj-md-status { font-size: 10px; margin-bottom: 6px; display: flex; align-items: center; gap: 5px; }
+.proj-md-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+.proj-md-dot.green { background: var(--teal); }
+.proj-md-dot.amber { background: var(--amber); }
+.proj-action-row { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 4px; }
+.proj-action-btn { font-size: 10px; font-weight: 600; padding: 3px 8px; border-radius: 5px; border: 1px solid var(--border); background: var(--surface); color: var(--muted); cursor: pointer; white-space: nowrap; }
+.proj-action-btn:hover { background: rgba(0,201,167,.08); color: var(--teal); border-color: rgba(0,201,167,.3); }
+.proj-action-btn.primary { background: rgba(0,201,167,.1); color: var(--teal); border-color: rgba(0,201,167,.3); }
+/* kendr.md editor modal */
+.kdmd-modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.7); z-index: 2000; align-items: center; justify-content: center; }
+.kdmd-box { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; width: 680px; max-height: 85vh; display: flex; flex-direction: column; }
+.kdmd-header { padding: 16px 20px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.kdmd-title { font-size: 14px; font-weight: 700; }
+.kdmd-close { background: none; border: none; color: var(--muted); font-size: 20px; cursor: pointer; }
+.kdmd-textarea { flex: 1; margin: 0; padding: 16px; background: var(--surface2); color: var(--text); border: none; border-radius: 0; font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12px; line-height: 1.6; resize: none; min-height: 380px; outline: none; }
+.kdmd-footer { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; gap: 10px; justify-content: flex-end; }
+.kdmd-save { background: var(--teal); color: #0d1117; border: none; border-radius: 8px; padding: 8px 20px; font-size: 13px; font-weight: 700; cursor: pointer; }
+.kdmd-save:hover { opacity: .85; }
+.kdmd-cancel { background: var(--surface2); border: 1px solid var(--border); color: var(--muted); border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; }
 .chat-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
 .chat-header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; background: var(--surface); }
 .chat-title { font-size: 15px; font-weight: 600; color: var(--text); }
@@ -581,9 +610,46 @@ a:hover { text-decoration: underline; }
     <a href="/projects" class="nav-btn"><span class="icon">📁</span> Projects</a>
   </div>
   <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
+  <!-- Active project context panel -->
+  <div class="proj-panel" id="projPanel">
+    <div class="proj-panel-header" onclick="toggleProjPanel()">
+      <span class="proj-panel-icon">&#x1F4C1;</span>
+      <span class="proj-panel-name" id="projPanelName"><span class="proj-panel-none">No project active</span></span>
+      <span class="proj-panel-badge" id="projPanelBadge" style="display:none">Active</span>
+      <span style="font-size:11px;color:var(--muted)" id="projPanelChevron">&#x25BE;</span>
+    </div>
+    <div class="proj-panel-body" id="projPanelBody">
+      <div class="proj-stack" id="projStack"></div>
+      <div class="proj-md-status" id="projMdStatus">
+        <div class="proj-md-dot amber" id="projMdDot"></div>
+        <span id="projMdText">kendr.md not generated yet</span>
+      </div>
+      <div class="proj-action-row">
+        <button class="proj-action-btn primary" onclick="generateKendrMd()" id="btnGenMd">&#x2728; Generate kendr.md</button>
+        <button class="proj-action-btn" onclick="openKendrMdEditor()" id="btnEditMd">&#x270F; Edit</button>
+        <button class="proj-action-btn" onclick="loadProjContext()">&#x21BB; Refresh</button>
+      </div>
+    </div>
+  </div>
   <div class="sidebar-section">Recent Runs</div>
   <div class="run-list" id="runList"></div>
 </div>
+
+<!-- kendr.md editor modal -->
+<div class="kdmd-modal" id="kdmdModal">
+  <div class="kdmd-box">
+    <div class="kdmd-header">
+      <div class="kdmd-title">&#x1F4DD; Edit kendr.md &mdash; Project Context File</div>
+      <button class="kdmd-close" onclick="closeKendrMdEditor()">&times;</button>
+    </div>
+    <textarea class="kdmd-textarea" id="kdmdTextarea" placeholder="kendr.md content..."></textarea>
+    <div class="kdmd-footer">
+      <button class="kdmd-cancel" onclick="closeKendrMdEditor()">Cancel</button>
+      <button class="kdmd-save" onclick="saveKendrMd()">&#x2714; Save kendr.md</button>
+    </div>
+  </div>
+</div>
+
 <div class="chat-main">
   <div class="chat-header">
     <div>
@@ -628,6 +694,132 @@ let gatewayOnline = false;
 let workingDir = '';
 let activeEvtSource = null;
 let _loadRunToken = 0;
+
+// ── Project context (kendr.md) ────────────────────────────────────────────
+let _projCtx = null;      // last fetched context from /api/projects/active/context
+let _projPanelOpen = false;
+
+async function loadProjContext() {
+  try {
+    const r = await fetch('/api/projects/active/context');
+    const d = await r.json();
+    _projCtx = d;
+    const proj = d.project;
+    const nameEl = document.getElementById('projPanelName');
+    const badgeEl = document.getElementById('projPanelBadge');
+    const stackEl = document.getElementById('projStack');
+    const dotEl = document.getElementById('projMdDot');
+    const txtEl = document.getElementById('projMdText');
+    const genBtn = document.getElementById('btnGenMd');
+    if (!proj || !proj.path) {
+      nameEl.innerHTML = '<span class="proj-panel-none">No project active</span>';
+      badgeEl.style.display = 'none';
+      stackEl.textContent = '';
+      dotEl.className = 'proj-md-dot amber';
+      txtEl.textContent = 'No active project';
+      return;
+    }
+    nameEl.textContent = proj.name || proj.path;
+    badgeEl.style.display = 'inline-flex';
+    stackEl.textContent = d.stack || '';
+    if (d.kendr_md_exists && d.kendr_md) {
+      dotEl.className = 'proj-md-dot green';
+      const lines = (d.kendr_md || '').split('\n').length;
+      txtEl.textContent = 'kendr.md ready (' + lines + ' lines)';
+      genBtn.textContent = '\u2728 Regenerate kendr.md';
+    } else {
+      dotEl.className = 'proj-md-dot amber';
+      txtEl.textContent = 'kendr.md not generated yet';
+      genBtn.textContent = '\u2728 Generate kendr.md';
+    }
+    // Update welcome message if we have a project
+    const welcomeEl = document.getElementById('welcome');
+    if (welcomeEl && proj.name) {
+      const h2 = welcomeEl.querySelector('h2');
+      if (h2 && !h2.dataset.customized) {
+        h2.textContent = 'Working on: ' + proj.name;
+        h2.dataset.customized = '1';
+      }
+    }
+  } catch (e) {
+    // silent - no project system
+  }
+}
+
+function toggleProjPanel() {
+  _projPanelOpen = !_projPanelOpen;
+  const panel = document.getElementById('projPanel');
+  const chevron = document.getElementById('projPanelChevron');
+  if (_projPanelOpen) {
+    panel.classList.add('open');
+    chevron.textContent = '\u25B4';
+  } else {
+    panel.classList.remove('open');
+    chevron.textContent = '\u25BE';
+  }
+}
+
+async function generateKendrMd() {
+  const btn = document.getElementById('btnGenMd');
+  const orig = btn.textContent;
+  btn.textContent = 'Generating...';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/projects/active/context/generate', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'
+    });
+    const d = await r.json();
+    if (d.ok) {
+      await loadProjContext();
+      showProjToast('\u2714 kendr.md generated successfully');
+    } else {
+      showProjToast((d.error || 'Failed'), true);
+    }
+  } catch(e) { showProjToast('Error: ' + e.message, true); }
+  finally { btn.textContent = orig; btn.disabled = false; }
+}
+
+function openKendrMdEditor() {
+  const md = (_projCtx && _projCtx.kendr_md) || '';
+  document.getElementById('kdmdTextarea').value = md;
+  document.getElementById('kdmdModal').style.display = 'flex';
+}
+function closeKendrMdEditor() {
+  document.getElementById('kdmdModal').style.display = 'none';
+}
+async function saveKendrMd() {
+  const content = document.getElementById('kdmdTextarea').value;
+  try {
+    const r = await fetch('/api/projects/active/context/update', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ content })
+    });
+    const d = await r.json();
+    closeKendrMdEditor();
+    if (d.ok) { await loadProjContext(); showProjToast('\u2714 kendr.md saved'); }
+    else { showProjToast(d.error || 'Save failed', true); }
+  } catch(e) { showProjToast('Error: ' + e.message, true); }
+}
+
+let _projToastTimer = null;
+function showProjToast(msg, err) {
+  let t = document.getElementById('projToast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'projToast';
+    t.style.cssText = 'position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:8px 20px;border-radius:8px;font-size:12px;font-weight:700;z-index:3000;transition:opacity .3s';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.style.background = err ? 'var(--crimson)' : 'var(--teal)';
+  t.style.color = err ? '#fff' : '#0d1117';
+  t.style.opacity = '1';
+  clearTimeout(_projToastTimer);
+  _projToastTimer = setTimeout(() => { t.style.opacity = '0'; }, 3000);
+}
+
+// ── End project context ──────────────────────────────────────────────────
 
 function _newChatSessionId() {
   return 'chat-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
@@ -1377,8 +1569,10 @@ async function sendMessage() {
 
 checkGateway();
 loadRuns();
+loadProjContext();
 setInterval(checkGateway, 30000);
 setInterval(loadRuns, 15000);
+setInterval(loadProjContext, 60000);
 
 // ── Reconnect to active run on page load ──────────────────────────────────────
 (async () => {
@@ -4767,6 +4961,9 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         if path == "/api/projects/active":
             self._handle_project_active()
             return
+        if path == "/api/projects/active/context":
+            self._handle_project_context_get()
+            return
         if path == "/api/projects/file":
             params = parse_qs(parsed.query or "")
             file_path = (params.get("path") or [""])[0]
@@ -4838,6 +5035,12 @@ class KendrUIHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, **result})
             except Exception as exc:
                 self._json(500, {"error": str(exc)})
+            return
+        if path == "/api/projects/active/context/generate":
+            self._handle_project_context_generate(body)
+            return
+        if path == "/api/projects/active/context/update":
+            self._handle_project_context_update(body)
             return
         if path == "/api/models/set":
             self._handle_models_set(body)
@@ -4979,6 +5182,21 @@ class KendrUIHandler(BaseHTTPRequestHandler):
                     "github_repo", "auto_approve", "skip_test_agent", "skip_devops_agent"):
             if body.get(key) is not None:
                 payload[key] = body[key]
+        # Auto-inject active project context when caller didn't supply project_root
+        if not payload.get("project_root"):
+            try:
+                active_proj = _pm_get_active()
+                if active_proj:
+                    proj_path = str(active_proj.get("path", "")).strip()
+                    proj_name = str(active_proj.get("name", "")).strip()
+                    if proj_path:
+                        payload["project_root"] = proj_path
+                        if proj_name and not payload.get("project_name"):
+                            payload["project_name"] = proj_name
+                        if not working_directory:
+                            payload.setdefault("working_directory", proj_path)
+            except Exception:
+                pass
         run_id = str(body.get("run_id") or "").strip() or f"ui-{uuid.uuid4().hex[:8]}"
         payload["run_id"] = run_id
 
@@ -5266,6 +5484,70 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         try:
             proj = _pm_get_active()
             self._json(200, proj or {})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_context_get(self) -> None:
+        try:
+            from kendr.project_context import (
+                read_kendr_md, kendr_md_path, ensure_kendr_md, _detect_stack, _file_tree_lines
+            )
+            from pathlib import Path
+            proj = _pm_get_active() if _HAS_PROJECT_MANAGER else None
+            if not proj:
+                self._json(200, {"project": None, "kendr_md": "", "kendr_md_exists": False})
+                return
+            root = str(proj.get("path", "")).strip()
+            name = str(proj.get("name", "")).strip()
+            if not root:
+                self._json(200, {"project": proj, "kendr_md": "", "kendr_md_exists": False})
+                return
+            kpath = kendr_md_path(root)
+            md = read_kendr_md(root)
+            exists = kpath.exists()
+            stack = _detect_stack(Path(root))
+            tree_lines = _file_tree_lines(Path(root))[:80]
+            self._json(200, {
+                "project": proj,
+                "kendr_md": md,
+                "kendr_md_exists": exists,
+                "kendr_md_path": str(kpath),
+                "stack": stack,
+                "file_tree": "\n".join(tree_lines),
+            })
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_context_generate(self, body: dict) -> None:
+        try:
+            from kendr.project_context import generate_kendr_md, write_kendr_md
+            proj = _pm_get_active() if _HAS_PROJECT_MANAGER else None
+            root = str((proj or {}).get("path", "") or body.get("project_root", "")).strip()
+            if not root:
+                self._json(400, {"error": "No active project"})
+                return
+            name = str((proj or {}).get("name", "") or body.get("project_name", "")).strip()
+            extra_notes = str(body.get("notes", "")).strip()
+            content = generate_kendr_md(root, name, extra_notes)
+            write_kendr_md(root, content)
+            self._json(200, {"ok": True, "kendr_md": content, "path": f"{root}/kendr.md"})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_project_context_update(self, body: dict) -> None:
+        try:
+            from kendr.project_context import write_kendr_md, read_kendr_md
+            proj = _pm_get_active() if _HAS_PROJECT_MANAGER else None
+            root = str((proj or {}).get("path", "") or body.get("project_root", "")).strip()
+            if not root:
+                self._json(400, {"error": "No active project"})
+                return
+            content = str(body.get("content", "")).strip()
+            if not content:
+                self._json(400, {"error": "content is required"})
+                return
+            write_kendr_md(root, content)
+            self._json(200, {"ok": True, "kendr_md": content})
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 

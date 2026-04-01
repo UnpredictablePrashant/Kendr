@@ -3254,6 +3254,8 @@ Return ONLY valid JSON in this exact schema:
             "extension_handler_generation_dispatched": False,
             "extension_handler_generation_signature": "",
             "agent_factory_request": "",
+            # Project context (kendr.md)
+            "project_context_md": "",
             # Project builder defaults
             "project_build_mode": False,
             "blueprint_json": {},
@@ -3368,11 +3370,28 @@ Return ONLY valid JSON in this exact schema:
             self._restore_from_resume_checkpoint(initial_state, resume_checkpoint_payload, user_query)
         initial_state = self.apply_runtime_setup(initial_state)
         initial_state["privileged_policy"] = build_privileged_policy(initial_state)
-        if self._is_project_audit_request(initial_state) or bool(initial_state.get("codebase_mode", False)):
+        # Inject project context (kendr.md) for every session with a project root
+        project_root = str(initial_state.get("project_root", "")).strip()
+        if project_root:
             try:
-                working_directory = str(initial_state.get("working_directory", "")).strip()
-                if working_directory:
-                    initial_state["repo_scan_summary"] = self._build_repo_scan_summary(working_directory)
+                from kendr.project_context import get_project_context_blob
+                project_name = str(initial_state.get("project_name", "")).strip()
+                ctx = get_project_context_blob(project_root, project_name)
+                if ctx:
+                    initial_state["project_context_md"] = ctx
+            except Exception:
+                pass
+        # Repo scan: run for audit/codebase requests, or whenever project_root is set
+        do_scan = (
+            self._is_project_audit_request(initial_state)
+            or bool(initial_state.get("codebase_mode", False))
+            or bool(project_root)
+        )
+        if do_scan:
+            try:
+                scan_dir = project_root or str(initial_state.get("working_directory", "")).strip()
+                if scan_dir:
+                    initial_state["repo_scan_summary"] = self._build_repo_scan_summary(scan_dir)
             except Exception as exc:
                 initial_state["repo_scan_summary"] = f"Repository scan failed: {exc}"
         ensure_a2a_state(initial_state, initial_state.get("available_agent_cards") or self._agent_cards())

@@ -51,6 +51,8 @@ class RuntimeState(TypedDict, total=False):
     channel_session_key: str
     parent_run_id: str
     last_error: str
+    # Project context (kendr.md)
+    project_context_md: str
     # Project builder state
     project_build_mode: bool
     blueprint_json: dict[str, Any]

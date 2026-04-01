@@ -8,6 +8,7 @@ def worker_agent(state):
     user_query = task_content or state.get("current_objective") or state["user_query"]
     a2a_context = recent_messages_for_agent(state, "worker_agent")
     repo_scan_summary = state.get("repo_scan_summary", "")
+    project_context_md = state.get("project_context_md", "")
     log_task_update("Worker", f"Draft pass #{state['worker_calls']} started.")
     if feedback:
         logger.info(f"[Worker] Applying reviewer feedback: {feedback}")
@@ -32,6 +33,9 @@ def worker_agent(state):
 
     Recent A2A messages for the worker:
     {a2a_context}
+
+    Project context (kendr.md — permanent memory about this codebase):
+    {project_context_md or "No project context file (kendr.md) is attached to this run."}
 
     Repository scan summary (if available):
     {repo_scan_summary or "No repository scan summary was attached to this run."}
