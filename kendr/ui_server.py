@@ -611,6 +611,7 @@ a:hover { text-decoration: underline; }
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">🧩</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">📁</span> Projects</a>
+    <a href="/docs" class="nav-btn"><span class="icon">📖</span> Docs</a>
   </div>
   <button class="new-chat-btn" onclick="newChat()">+ New Chat</button>
   <!-- Active project context panel -->
@@ -1746,6 +1747,7 @@ a { color: var(--teal); }
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+    <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
   <div class="category-nav" id="categoryNav"></div>
 </div>
@@ -2096,6 +2098,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn active"><span class="icon">&#x1F4C1;</span> Projects</a>
+    <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
   <div class="proj-list-nav">
     <div class="proj-list-label">My Projects</div>
@@ -2920,6 +2923,7 @@ input:checked + .slider:before{transform:translateX(18px);}
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+    <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
 </div>
 
@@ -3645,6 +3649,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
   <a href="/models" class="nav-btn active"><span class="icon">&#x1F916;</span> LLM Models</a>
   <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
   <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+  <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
 </nav>
 
 <main class="main">
@@ -4063,11 +4068,41 @@ input:checked + .slider:before { transform: translateX(14px); }
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn active"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+    <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
 </div>
 <div class="main">
   <div class="page-title">MCP Servers</div>
   <div class="page-subtitle">Connect kendr to any MCP server &mdash; kendr acts as the client, just like Cursor. Tools are auto-discovered.</div>
+
+  <!-- Featured: Zapier -->
+  <div class="section-title">&#x26A1; Featured Integration</div>
+  <div class="card" style="border-color:rgba(255,100,30,0.35);background:linear-gradient(135deg,#1a1208 0%,var(--surface) 100%)">
+    <div class="card-header" style="align-items:flex-start;gap:16px">
+      <div style="font-size:32px;line-height:1">&#x26A1;</div>
+      <div style="flex:1">
+        <div class="server-name" style="font-size:17px">Zapier MCP</div>
+        <div class="server-meta" style="margin-top:4px">Connect 7,000+ apps via Zapier&rsquo;s official MCP server &mdash; Gmail, Slack, Notion, GitHub, Salesforce, and more.</div>
+        <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-primary btn-sm" onclick="openZapierSetup()">&#x26A1; Quick Connect</button>
+          <a href="https://zapier.com/mcp" target="_blank" style="font-size:12px;color:var(--teal);text-decoration:none">Get your MCP URL &#x2197;</a>
+          <span style="font-size:11px;color:var(--muted)">CLI: <code style="color:var(--teal)">kendr mcp zapier &lt;your-url&gt;</code></span>
+        </div>
+      </div>
+    </div>
+    <!-- Zapier setup panel -->
+    <div id="zapierSetupPanel" style="display:none;margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+        1. Visit <a href="https://zapier.com/mcp" target="_blank" style="color:var(--teal)">zapier.com/mcp</a> to get your personal MCP URL.<br>
+        2. Paste it below &mdash; it looks like <code style="color:var(--teal)">https://mcp.zapier.com/api/mcp/s/…/mcp</code>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <input type="text" id="zapierUrl" placeholder="https://mcp.zapier.com/api/mcp/s/your-token/mcp" style="flex:1;min-width:260px">
+        <button class="btn btn-primary btn-sm" onclick="connectZapier()">Connect &amp; Discover</button>
+        <span id="zapierMsg"></span>
+      </div>
+    </div>
+  </div>
 
   <!-- Add server form -->
   <div class="section-title">Connect a New MCP Server</div>
@@ -4288,6 +4323,34 @@ function copyScaffold() {
   });
 }
 
+function openZapierSetup() {
+  const panel = document.getElementById('zapierSetupPanel');
+  panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+  if (panel.style.display !== 'none') document.getElementById('zapierUrl').focus();
+}
+
+async function connectZapier() {
+  const url = document.getElementById('zapierUrl').value.trim();
+  const msg = document.getElementById('zapierMsg');
+  if (!url) { showMsg(msg, 'Paste your Zapier MCP URL first', 'err'); return; }
+  showMsg(msg, '<span class="disc-spinner"></span> Connecting…', 'ok');
+  try {
+    const payload = { name: 'Zapier', type: 'http', connection: url, description: 'Zapier automation tools via MCP' };
+    const r = await fetch(API + '/api/mcp/servers', {
+      method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if (d.ok || d.server_id) {
+      showMsg(msg, '&#x26A1; Connected &mdash; ' + (d.tool_count || 0) + ' tool(s) discovered', 'ok');
+      document.getElementById('zapierUrl').value = '';
+      document.getElementById('zapierSetupPanel').style.display = 'none';
+      await loadServers();
+    } else {
+      showMsg(msg, 'Error: ' + (d.error || JSON.stringify(d)), 'err');
+    }
+  } catch(e) { showMsg(msg, 'Request failed: ' + e, 'err'); }
+}
+
 function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
 loadServers();
@@ -4380,6 +4443,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,san
   <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
   <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+  <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
 </nav>
 <main class="main" style="padding:20px 24px;overflow-y:auto">
   <div class="page-header" style="margin-bottom:14px">
@@ -4783,6 +4847,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+    <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
 </div>
 <div class="main">
@@ -4852,6 +4917,182 @@ class KendrUIHandler(BaseHTTPRequestHandler):
     def _html(self, status: int, content: str) -> None:
         self._send(status, "text/html; charset=utf-8", content.encode("utf-8"), cors=False)
 
+    def _handle_docs(self) -> None:
+        import re, html as _html_mod, pathlib
+        docs_path = pathlib.Path(__file__).parent.parent / "docs" / "cli.md"
+        if not docs_path.exists():
+            self._html(404, "<html><body><h1>docs/cli.md not found</h1></body></html>")
+            return
+        raw = docs_path.read_text(encoding="utf-8")
+
+        def _md_to_html(text: str) -> str:
+            lines = text.split("\n")
+            out = []
+            in_code = False
+            in_table = False
+            code_buf = []
+            para_buf = []
+
+            def flush_para():
+                if para_buf:
+                    joined = " ".join(para_buf).strip()
+                    if joined:
+                        out.append("<p>" + joined + "</p>")
+                    para_buf.clear()
+
+            def flush_table():
+                nonlocal in_table
+                if in_table:
+                    out.append("</tbody></table>")
+                    in_table = False
+
+            def inline(s: str) -> str:
+                s = _html_mod.escape(s)
+                s = re.sub(r"`([^`]+)`", r'<code>\1</code>', s)
+                s = re.sub(r"\*\*([^*]+)\*\*", r'<strong>\1</strong>', s)
+                s = re.sub(r"\*([^*]+)\*", r'<em>\1</em>', s)
+                s = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r'<a href="\2" target="_blank">\1</a>', s)
+                return s
+
+            first_table_row = False
+            for line in lines:
+                if line.startswith("```"):
+                    if not in_code:
+                        flush_para()
+                        flush_table()
+                        lang = line[3:].strip() or "bash"
+                        out.append('<div class="code-block"><div class="code-lang">' + _html_mod.escape(lang) + '</div><pre><code>')
+                        in_code = True
+                    else:
+                        out.append("</code></pre></div>")
+                        in_code = False
+                    continue
+                if in_code:
+                    out.append(_html_mod.escape(line))
+                    continue
+                if line.startswith("# "):
+                    flush_para(); flush_table()
+                    anchor = re.sub(r"[^a-z0-9]+", "-", line[2:].lower()).strip("-")
+                    out.append('<h1 id="' + anchor + '">' + inline(line[2:]) + '</h1>')
+                    continue
+                if line.startswith("## "):
+                    flush_para(); flush_table()
+                    anchor = re.sub(r"[^a-z0-9]+", "-", line[3:].lower()).strip("-")
+                    out.append('<h2 id="' + anchor + '">' + inline(line[3:]) + '</h2>')
+                    continue
+                if line.startswith("### "):
+                    flush_para(); flush_table()
+                    anchor = re.sub(r"[^a-z0-9]+", "-", line[4:].lower()).strip("-")
+                    out.append('<h3 id="' + anchor + '">' + inline(line[4:]) + '</h3>')
+                    continue
+                if re.match(r"^-{3,}$", line.strip()):
+                    flush_para(); flush_table()
+                    out.append("<hr>")
+                    continue
+                if line.startswith("|"):
+                    flush_para()
+                    cells = [c.strip() for c in line.split("|")[1:-1]]
+                    if re.match(r"^[\s\-|:]+$", line):
+                        first_table_row = False
+                        continue
+                    if not in_table:
+                        out.append('<table><thead><tr>' + "".join("<th>" + inline(c) + "</th>" for c in cells) + "</tr></thead><tbody>")
+                        in_table = True
+                        first_table_row = False
+                    else:
+                        out.append("<tr>" + "".join("<td>" + inline(c) + "</td>" for c in cells) + "</tr>")
+                    continue
+                flush_table()
+                if line.strip() == "":
+                    flush_para()
+                    continue
+                para_buf.append(inline(line))
+            flush_para()
+            flush_table()
+            return "\n".join(out)
+
+        body_html = _md_to_html(raw)
+
+        sections = re.findall(r'<h2 id="([^"]+)">([^<]+)</h2>', body_html)
+        toc_items = "".join(
+            '<li><a href="#' + sid + '">' + label + '</a></li>'
+            for sid, label in sections
+        )
+        toc_html = '<nav class="toc"><div class="toc-title">On this page</div><ul>' + toc_items + '</ul></nav>' if toc_items else ""
+
+        page = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kendr &mdash; CLI Reference</title>
+<style>
+:root { --teal: #00C9A7; --amber: #FFB347; --purple: #A78BFA; --bg: #0d0f14; --surface: #161b22; --surface2: #1e2530; --border: #2a3140; --text: #e6edf3; --muted: #7d8590; --sidebar-w: 220px; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; }
+.sidebar { width: var(--sidebar-w); min-width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; bottom: 0; left: 0; overflow-y: auto; }
+.sidebar-header { padding: 20px 16px 12px; border-bottom: 1px solid var(--border); }
+.logo { font-size: 22px; font-weight: 800; color: var(--teal); }
+.logo span { color: var(--amber); }
+.tagline { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.sidebar-nav { padding: 12px 8px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.nav-btn { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer; border: none; background: transparent; width: 100%; text-align: left; text-decoration: none; transition: background 0.15s, color 0.15s; }
+.nav-btn:hover { background: var(--surface2); color: var(--text); }
+.nav-btn.active { background: rgba(167,139,250,0.12); color: var(--purple); }
+.nav-btn .icon { font-size: 16px; width: 20px; text-align: center; }
+.content-wrap { flex: 1; margin-left: var(--sidebar-w); display: flex; }
+.doc-content { flex: 1; padding: 32px 40px; max-width: 860px; min-width: 0; }
+.toc { width: 200px; min-width: 200px; padding: 32px 16px 32px 0; position: sticky; top: 0; height: 100vh; overflow-y: auto; }
+.toc-title { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 10px; }
+.toc ul { list-style: none; }
+.toc li { margin-bottom: 4px; }
+.toc a { font-size: 12px; color: var(--muted); text-decoration: none; display: block; padding: 3px 8px; border-radius: 5px; }
+.toc a:hover { color: var(--teal); background: var(--surface); }
+h1 { font-size: 28px; font-weight: 800; color: var(--text); margin: 0 0 6px; }
+h2 { font-size: 19px; font-weight: 700; color: var(--teal); margin: 40px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+h3 { font-size: 14px; font-weight: 700; color: var(--purple); margin: 22px 0 8px; }
+p { font-size: 13px; color: #c5d0db; line-height: 1.7; margin: 8px 0; }
+hr { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
+code { font-family: "Cascadia Code", "Fira Code", monospace; font-size: 12px; background: var(--surface2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--teal); }
+.code-block { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; margin: 14px 0; overflow: hidden; }
+.code-lang { font-size: 10px; font-weight: 700; color: var(--muted); text-transform: uppercase; padding: 6px 14px; border-bottom: 1px solid var(--border); }
+.code-block pre { margin: 0; padding: 14px 16px; overflow-x: auto; }
+.code-block code { background: none; border: none; padding: 0; color: #b5c4de; font-size: 12.5px; white-space: pre; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; margin: 14px 0; }
+th { background: var(--surface2); color: var(--muted); text-align: left; padding: 8px 12px; font-weight: 600; border: 1px solid var(--border); text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em; }
+td { padding: 8px 12px; border: 1px solid var(--border); color: #c5d0db; vertical-align: top; }
+td code { font-size: 11.5px; }
+tr:hover td { background: rgba(0,201,167,0.03); }
+a { color: var(--teal); }
+strong { color: var(--text); }
+::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="sidebar">
+  <div class="sidebar-header"><div class="logo">kendr<span>.</span></div><div class="tagline">Multi-agent intelligence runtime</div></div>
+  <div class="sidebar-nav">
+    <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
+    <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
+    <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
+    <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
+    <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
+    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+    <a href="/docs" class="nav-btn active"><span class="icon">&#x1F4D6;</span> Docs</a>
+  </div>
+</div>
+<div class="content-wrap">
+  <div class="doc-content">
+""" + body_html + """
+  </div>
+""" + toc_html + """
+</div>
+</body>
+</html>"""
+        self._html(200, page)
+
     def do_OPTIONS(self):
         self.send_response(200)
         path = getattr(self, "path", "")
@@ -4888,6 +5129,9 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/models":
             self._html(200, _MODELS_HTML)
+            return
+        if path == "/docs":
+            self._handle_docs()
             return
         if path == "/api/rag/kbs":
             self._handle_rag_list_kbs()

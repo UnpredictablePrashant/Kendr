@@ -602,3 +602,158 @@ kendr help
 kendr help run
 kendr help gateway
 ```
+
+---
+
+## `kendr mcp`
+
+Manage MCP (Model Context Protocol) server connections. Kendr acts as an MCP **client** — any tools exposed by registered servers are automatically discovered and made available to the agent runtime.
+
+```bash
+kendr mcp <action> [args]
+```
+
+### Subcommands
+
+| Subcommand | Description |
+|---|---|
+| `list` | List all registered MCP servers and their discovered tools. |
+| `add` | Register a new HTTP or stdio MCP server. |
+| `remove` | Remove a registered server by name or ID. |
+| `discover` | Re-run tool discovery on a registered server. |
+| `test` | Ping a server and list its available tools. |
+| `enable` | Enable a disabled server so kendr uses its tools. |
+| `disable` | Disable a server without removing it. |
+| `zapier` | Quick-connect your Zapier MCP server (see below). |
+
+---
+
+### `kendr mcp list`
+
+List all registered servers with their connection type, status, tool count, and ID.
+
+```bash
+kendr mcp list
+```
+
+---
+
+### `kendr mcp add`
+
+Register a new MCP server. Supports both HTTP/SSE servers and stdio (subprocess) servers.
+
+```bash
+kendr mcp add <name> <connection>
+kendr mcp add --name <name> --url <url> [--type http|stdio] [--auth-token TOKEN] [--description TEXT] [--no-discover]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `name` | _(positional)_ | Human-readable server name. |
+| `connection` | _(positional)_ | HTTP endpoint URL or shell command (for stdio servers). |
+| `--name NAME` | — | Server name (overrides positional). |
+| `--url URL` | — | Connection (overrides positional). |
+| `--type` | `http` | Connection type: `http` (HTTP/SSE endpoint) or `stdio` (shell command). |
+| `--auth-token TOKEN` | — | Bearer token sent as `Authorization: Bearer …` for authenticated HTTP servers. |
+| `--description TEXT` | — | Optional description stored with the server entry. |
+| `--no-discover` | _(off)_ | Register without immediately running tool discovery. |
+
+#### Examples
+
+```bash
+# Add an HTTP MCP server
+kendr mcp add "My Server" http://localhost:8000/mcp
+
+# Add with auth token
+kendr mcp add "Private Server" https://api.example.com/mcp --auth-token sk-abc123
+
+# Add a stdio server
+kendr mcp add "Local Agent" "python mcp_servers/my_server.py" --type stdio
+
+# Register without discovering tools yet
+kendr mcp add "Slow Server" http://slow-server.internal/mcp --no-discover
+```
+
+---
+
+### `kendr mcp remove`
+
+Remove a registered MCP server and all its discovered tool metadata.
+
+```bash
+kendr mcp remove <name-or-id>
+```
+
+---
+
+### `kendr mcp discover`
+
+Re-connect to a registered server and refresh its tool list. Useful after the server is updated.
+
+```bash
+kendr mcp discover <name-or-id>
+```
+
+---
+
+### `kendr mcp test`
+
+Ping a server and print all its available tools without modifying the registry.
+
+```bash
+kendr mcp test <name-or-id>
+```
+
+---
+
+### `kendr mcp enable` / `kendr mcp disable`
+
+Enable or disable a server. Disabled servers are skipped during agent runtime but remain in the registry.
+
+```bash
+kendr mcp enable <name-or-id>
+kendr mcp disable <name-or-id>
+```
+
+---
+
+### `kendr mcp zapier`
+
+Quick-connect a **Zapier MCP** server. Zapier exposes 7,000+ app integrations (Gmail, Slack, Notion, GitHub, Salesforce, and more) through a single personal MCP endpoint.
+
+```bash
+kendr mcp zapier <your-zapier-mcp-url>
+kendr mcp zapier --url <url> [--name NAME] [--no-discover]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `mcp_url` | _(positional)_ | Your personal Zapier MCP URL. |
+| `--url URL` | — | Alternative to positional argument. |
+| `--name NAME` | `Zapier` | Name for this registry entry. |
+| `--no-discover` | _(off)_ | Register without running discovery immediately. |
+
+**Get your Zapier MCP URL:**
+
+1. Go to [zapier.com/mcp](https://zapier.com/mcp)
+2. Copy your personal MCP endpoint URL
+3. It will look like: `https://mcp.zapier.com/api/mcp/s/<token>/mcp`
+
+#### Examples
+
+```bash
+# Connect Zapier MCP (tool discovery runs automatically)
+kendr mcp zapier https://mcp.zapier.com/api/mcp/s/abc123xyz/mcp
+
+# Connect with a custom name
+kendr mcp zapier https://mcp.zapier.com/api/mcp/s/abc123xyz/mcp --name "My Zapier"
+
+# Connect without immediate discovery
+kendr mcp zapier https://mcp.zapier.com/api/mcp/s/abc123xyz/mcp --no-discover
+```
+
+Running this command without a URL prints setup instructions:
+
+```bash
+kendr mcp zapier
+```

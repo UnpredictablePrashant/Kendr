@@ -2591,6 +2591,36 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     mcp_disable = mcp_sub.add_parser("disable", help="Disable a registered MCP server.")
     mcp_disable.add_argument("server_id_or_name", help="Server ID or name.")
 
+    mcp_zapier = mcp_sub.add_parser(
+        "zapier",
+        help="Quick-connect a Zapier MCP server.",
+        description=(
+            "Register your Zapier MCP server with kendr.\n\n"
+            "Get your personal MCP URL from https://zapier.com/mcp\n"
+            "URL format:  https://mcp.zapier.com/api/mcp/s/<token>/mcp\n\n"
+            "Usage:  kendr mcp zapier <your-zapier-mcp-url>"
+        ),
+    )
+    mcp_zapier.add_argument(
+        "mcp_url",
+        nargs="?",
+        default=None,
+        help="Your Zapier MCP URL (from zapier.com/mcp).",
+    )
+    mcp_zapier.add_argument(
+        "--url",
+        dest="url_flag",
+        default=None,
+        metavar="URL",
+        help="Zapier MCP URL (alternative to positional).",
+    )
+    mcp_zapier.add_argument(
+        "--name",
+        default="Zapier",
+        help="Name for this server entry (default: Zapier).",
+    )
+    mcp_zapier.add_argument("--no-discover", action="store_true", help="Register without running tool discovery.")
+
     return parser, command_parsers
 
 
@@ -2892,6 +2922,55 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
         else:
             print(style.fail(f"  Toggle failed for {srv['name']}."))
             return 1
+        return 0
+
+    if action == "zapier":
+        mcp_url = str(getattr(args, "url_flag", None) or getattr(args, "mcp_url", "") or "").strip()
+        server_name = str(getattr(args, "name", "Zapier")).strip() or "Zapier"
+        no_discover = bool(getattr(args, "no_discover", False))
+
+        if not mcp_url:
+            print(style.heading("Zapier MCP Quick-Connect"))
+            print()
+            print("  Get your personal MCP URL from:")
+            print(style.ok("    https://zapier.com/mcp"))
+            print()
+            print("  Then run:")
+            print(style.muted("    kendr mcp zapier https://mcp.zapier.com/api/mcp/s/<token>/mcp"))
+            print()
+            return 0
+
+        if "zapier.com" not in mcp_url and "mcp.zapier" not in mcp_url:
+            print(style.warn("Warning: URL does not look like a Zapier MCP endpoint."))
+            print(style.muted("  Expected something like: https://mcp.zapier.com/api/mcp/s/<token>/mcp"))
+
+        print(style.heading(f"Connecting {server_name} MCP…"))
+        srv = add_server(
+            name=server_name,
+            connection=mcp_url,
+            server_type="http",
+            description="Zapier automation tools via MCP",
+            auth_token="",
+        )
+        print(style.ok(f"  Registered: {srv['name']}  (ID: {srv['id']})"))
+        print(style.muted(f"  URL: {srv['connection']}"))
+
+        if not no_discover:
+            print(style.muted("  Discovering Zapier tools…"))
+            result = discover_tools(srv["id"])
+            if result.get("ok"):
+                tool_count = result.get("tool_count", 0)
+                print(style.ok(f"  ✓ {tool_count} Zapier tool(s) discovered"))
+                for t in result.get("tools", [])[:10]:
+                    tname = t.get("name", "?")
+                    tdesc = (t.get("description", "") or "")[:60]
+                    print(style.muted(f"    • {tname:<24}  {tdesc}"))
+                if tool_count > 10:
+                    print(style.muted(f"    … {tool_count - 10} more tools"))
+            else:
+                err = result.get("error", "unknown error")
+                print(style.warn(f"  ⚠ Discovery failed: {err}"))
+                print(style.muted("  Server registered. Run 'kendr mcp discover <id>' when the server is reachable."))
         return 0
 
     print(style.fail(f"Unknown mcp action: {action}"))
