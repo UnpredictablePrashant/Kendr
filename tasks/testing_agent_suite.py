@@ -722,7 +722,17 @@ def test_runner_agent(state: dict) -> dict:
             cmd = shlex.split(custom_cmd_raw)
         else:
             cmd = list(custom_cmd_raw)
-        framework = "custom"
+        cmd_str = " ".join(cmd).lower()
+        if "pytest" in cmd_str or "py.test" in cmd_str:
+            framework = "pytest"
+        elif "vitest" in cmd_str:
+            framework = "vitest"
+        elif "jest" in cmd_str:
+            framework = "jest"
+        elif "mocha" in cmd_str:
+            framework = "jest"
+        else:
+            framework = "custom"
     else:
         cmd, framework = _detect_test_runner(cwd)
 
@@ -747,12 +757,19 @@ def test_runner_agent(state: dict) -> dict:
     if not report:
         if framework in ("pytest",):
             report = _parse_pytest_output(stdout, stderr)
-        else:
+        elif framework in ("jest", "vitest"):
             report = _parse_jest_vitest_output(stdout, stderr)
+        else:
+            combined = stdout + "\n" + stderr
+            if re.search(r"\d+ passed", combined) or "PASSED" in combined or "::test_" in combined:
+                report = _parse_pytest_output(stdout, stderr)
+            else:
+                report = _parse_jest_vitest_output(stdout, stderr)
 
     if not report.get("total") and not report.get("passed") and not report.get("failed"):
         ok_cmd, stdout2, stderr2 = _run_cmd(cmd, cwd, timeout=timeout, env=env)
-        if framework in ("pytest",):
+        combined2 = stdout2 + "\n" + stderr2
+        if framework in ("pytest",) or re.search(r"\d+ passed", combined2) or "::test_" in combined2:
             report = _parse_pytest_output(stdout2, stderr2)
         else:
             report = _parse_jest_vitest_output(stdout2, stderr2)
