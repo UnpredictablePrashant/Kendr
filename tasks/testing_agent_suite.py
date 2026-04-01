@@ -1,16 +1,18 @@
 """Testing Agent Suite.
 
-Four distinct agents:
-  - api_test_agent      : given OpenAPI spec URL or file, generates Pytest/Jest test suite
-  - unit_test_agent     : given source file(s), generates unit tests with edge cases
-  - test_runner_agent   : runs existing test suite, parses output, returns A2A artifact
-  - test_fix_agent      : reads failures, patches sources, re-runs to confirm fix
+Five distinct agents:
+  - api_test_agent       : given OpenAPI spec URL or file, generates Pytest/Jest test suite
+  - unit_test_agent      : given source file(s), generates unit tests with edge cases
+  - test_runner_agent    : runs existing test suite, parses output, returns A2A artifact
+  - test_fix_agent       : reads failures, patches sources, re-runs to confirm fix
+  - regression_test_agent: writes a targeted regression test for a bug description
 
 Each agent returns a structured result dict AND publishes an A2A artifact with:
-  - JSON report  (test_report.json)
-  - Markdown summary (test_summary.md)
+  - JSON report  (<label>_report.json)
+  - Markdown summary (<label>_summary.md)
 
-All four agents are accessible via `kendr test` sub-commands.
+All five agents are accessible via `kendr test` sub-commands and via natural-language
+intent routing in `kendr run`.
 """
 
 from __future__ import annotations

@@ -667,13 +667,13 @@ function renderTestReportCard(report) {
   const runner = report.runner || '';
   const agentName = report.agent || '';
 
-  let cardHtml = '<div style="margin-top:10px;padding:12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px">';
-  cardHtml += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">';
-  cardHtml += '<span style="font-size:16px">' + statusIcon + '</span>';
-  cardHtml += '<span style="font-weight:700;font-size:13px;color:' + statusColor + '">' + esc(status) + '</span>';
-  if (runner) cardHtml += '<span style="font-size:11px;color:var(--muted);margin-left:4px">' + esc(runner) + '</span>';
-  if (agentName) cardHtml += '<span style="font-size:11px;color:var(--muted);margin-left:auto">' + esc(agentName) + '</span>';
-  cardHtml += '</div>';
+  const summaryLabel = statusIcon + ' <b style="color:' + statusColor + '">' + esc(status) + '</b>'
+    + (runner ? ' <span style="color:var(--muted);font-size:11px">' + esc(runner) + '</span>' : '')
+    + (total > 0 ? ' &mdash; ' + passed + ' passed' + (failed > 0 ? ', ' + failed + ' failed' : '') : '')
+    + (agentName ? ' <span style="color:var(--muted);font-size:11px;float:right">' + esc(agentName) + '</span>' : '');
+  let cardHtml = '<details style="margin-top:10px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;overflow:hidden">';
+  cardHtml += '<summary style="padding:10px 12px;cursor:pointer;font-size:13px;font-weight:600;list-style:none;display:flex;align-items:center;gap:6px">' + summaryLabel + '</summary>';
+  cardHtml += '<div style="padding:10px 12px;border-top:1px solid var(--border)">';
 
   if (total > 0) {
     cardHtml += '<div style="display:flex;gap:16px;font-size:12px;margin-bottom:8px">';
@@ -698,7 +698,7 @@ function renderTestReportCard(report) {
     cardHtml += '<div style="margin-top:8px;font-size:12px;color:var(--muted)">\ud83d\udcc4 Generated: ' + files.slice(0, 5).map(f => '<code>' + esc(f) + '</code>').join(', ') + '</div>';
   }
 
-  cardHtml += '</div>';
+  cardHtml += '</div></details>';
   return cardHtml;
 }
 
