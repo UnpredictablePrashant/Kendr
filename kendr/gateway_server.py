@@ -196,9 +196,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if self.path == "/registry/mcp-refresh":
             try:
                 from kendr.discovery import _register_mcp_tools
+                stale = [n for n in list(REGISTRY.agents) if n.startswith("mcp_")]
+                for name in stale:
+                    REGISTRY.agents.pop(name, None)
                 _register_mcp_tools(REGISTRY)
                 mcp_agents = [n for n in REGISTRY.agents if n.startswith("mcp_")]
-                self._send_json(200, {"ok": True, "mcp_agent_count": len(mcp_agents)})
+                self._send_json(200, {
+                    "ok": True,
+                    "mcp_agent_count": len(mcp_agents),
+                    "removed_stale": len(stale),
+                })
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
             return
