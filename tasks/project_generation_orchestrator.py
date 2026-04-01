@@ -180,8 +180,18 @@ class ProjectGenerationOrchestrator:
         self._blueprint: dict = {}
         self._stack_template: dict | None = None
 
-    def _log(self, msg: str) -> None:
-        self._cb(msg)
+    def _log(self, msg: str, event_type: str = "progress", extra: dict | None = None) -> None:
+        """Emit a progress message via the callback.
+
+        The callback receives structured JSON-serialisable dicts so that the
+        web UI can distinguish between event types (progress, file_created,
+        patch_applied, run_output, reviewer_note) and render them appropriately.
+        Plain-text callers (CLI) only see the ``text`` field.
+        """
+        payload: dict = {"type": event_type, "text": msg}
+        if extra:
+            payload.update(extra)
+        self._cb(json.dumps(payload))
 
     def _derive_name(self, given: str) -> str:
         if given.strip():
@@ -586,6 +596,8 @@ Instructions:
                 target.write_text(code + "\n", encoding="utf-8")
                 written_files.append(str(target))
                 context_summary_parts.append(f"- {file_rel}: {module.get('description', '')}")
+                self._log(f"  [coder] wrote {file_rel}", event_type="file_created",
+                          extra={"file": file_rel, "description": module.get("description", "")})
             except Exception as exc:
                 self._log(f"  [coder] error on {file_rel}: {exc}")
         return written_files
@@ -678,11 +690,19 @@ Return ONLY the Dockerfile content, no explanation, no markdown fences.
         return written
 
     def _detect_run_command(self) -> tuple[list[str] | None, str]:
-        """Return (command, cwd) or (None, error_message).
+        """Return (command, cwd) or (None, error_message|"").
 
-        Returns (None, "") when no verification is applicable (e.g. Flutter,
+        Returns (None, "") when no verification is applicable (Flutter,
         no entry point found).  Returns (None, error_text) when install fails —
-        the caller should treat a non-empty error string as a failure to report.
+        the caller treats a non-empty error string as a failure to record.
+
+        Verification strategy (in priority order):
+        1. Django: ``python manage.py check``
+        2. Python: syntax-compile all .py files (fast correctness gate) + try a
+           brief uvicorn/gunicorn import dry-run when applicable
+        3. TypeScript: ``tsc --noEmit`` (type-checking)
+        4. JS + ESLint declared: ``eslint --max-warnings 9999 .``
+        5. Otherwise: skip (no applicable verifier)
         """
         tech = self._blueprint.get("tech_stack", {})
         lang = str(tech.get("language", "")).lower()
@@ -698,17 +718,31 @@ Return ONLY the Dockerfile content, no explanation, no markdown fences.
                 ok, _, err = _run_subprocess(["pip", "install", "-r", "requirements.txt"], root, timeout=120)
                 if not ok:
                     return None, f"pip install failed: {err[:400]}"
-            main_candidates = ["app/main.py", "main.py", "manage.py", "wsgi.py"]
+
+            if (self.project_root / "manage.py").exists():
+                return ["python", "manage.py", "check"], root
+
+            py_files = sorted(self.project_root.rglob("*.py"), key=lambda p: len(p.parts))
+            if not py_files:
+                return None, ""
+
+            first_failing: Path | None = None
+            for pyf in py_files[:25]:
+                ok, _, _ = _run_subprocess(["python", "-m", "py_compile", str(pyf)], root, timeout=20)
+                if not ok:
+                    first_failing = pyf
+                    break
+
+            if first_failing is not None:
+                return ["python", "-m", "py_compile", str(first_failing)], root
+
+            main_candidates = ["app/main.py", "main.py"]
             for candidate in main_candidates:
                 p = self.project_root / candidate
                 if p.exists():
-                    if "manage.py" in candidate:
-                        return ["python", candidate, "check"], root
-                    return ["python", "-m", "py_compile", candidate], root
-            py_files = list(self.project_root.rglob("*.py"))
-            if py_files:
-                return ["python", "-m", "py_compile", str(py_files[0])], root
-            return None, ""
+                    return ["python", "-m", "py_compile", str(p)], root
+
+            return ["python", "-m", "py_compile", str(py_files[0])], root
 
         if (self.project_root / "package.json").exists():
             ok, _, err = _run_subprocess([pm, "install", "--prefer-offline"], root, timeout=180)
@@ -716,11 +750,16 @@ Return ONLY the Dockerfile content, no explanation, no markdown fences.
                 ok, _, err = _run_subprocess(["npm", "install", "--prefer-offline"], root, timeout=180)
             if not ok:
                 return None, f"npm install failed: {err[:400]}"
+
             if (self.project_root / "tsconfig.json").exists():
                 return ["npx", "tsc", "--noEmit"], root
+
             try:
                 pkg = json.loads((self.project_root / "package.json").read_text(encoding="utf-8"))
+                scripts = pkg.get("scripts", {})
                 all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                if "build" in scripts:
+                    return ["npm", "run", "build"], root
                 if "eslint" in all_deps:
                     return ["npx", "eslint", "--max-warnings", "9999", "."], root
             except Exception:
@@ -745,6 +784,9 @@ Return ONLY the Dockerfile content, no explanation, no markdown fences.
 
             self._log(f"  [verifier] iter {iteration + 1}: {' '.join(command)}")
             ok, stdout, stderr = _run_subprocess(command, cwd or str(self.project_root), timeout=120)
+            combined_output = (stdout + "\n" + stderr).strip()
+            self._log(f"  [verifier] output:\n{combined_output[:800]}", event_type="run_output",
+                      extra={"command": " ".join(command), "ok": ok, "stdout": stdout[:400], "stderr": stderr[:400]})
             if ok:
                 self._log(f"  [verifier] iter {iteration + 1}: pass ✓")
                 report["ok"] = True
@@ -788,7 +830,8 @@ Instructions:
                             continue
                         target.parent.mkdir(parents=True, exist_ok=True)
                         target.write_text(content + "\n", encoding="utf-8")
-                        self._log(f"  [fixer] patched: {file_rel}")
+                        self._log(f"  [fixer] patched: {file_rel}", event_type="patch_applied",
+                                  extra={"file": file_rel, "iteration": iteration + 1})
             except Exception as exc:
                 self._log(f"  [fixer] patch parse error: {exc}")
                 report["errors"].append(f"iter {iteration + 1}: {error_text[:200]}")

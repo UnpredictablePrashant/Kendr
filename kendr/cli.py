@@ -2311,8 +2311,14 @@ def _cmd_generate_standalone(
     style = _cli_style(None)
 
     def _progress(msg: str) -> None:
-        if not bool(getattr(args, "quiet", False)):
-            print(msg, flush=True)
+        if bool(getattr(args, "quiet", False)):
+            return
+        try:
+            parsed = json.loads(msg)
+            text = parsed.get("text", msg)
+        except Exception:
+            text = msg
+        print(text, flush=True)
 
     try:
         from tasks.project_generation_orchestrator import ProjectGenerationOrchestrator

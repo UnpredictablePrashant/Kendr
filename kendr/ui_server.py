@@ -278,7 +278,16 @@ def _start_standalone_run_background(run_id: str, payload: dict) -> None:
             from tasks.project_generation_orchestrator import ProjectGenerationOrchestrator
 
             def _cb(msg: str) -> None:
-                _push_event(run_id, "step", {"text": msg, "type": "progress"})
+                try:
+                    import json as _json
+                    data = _json.loads(msg)
+                    event_type = data.get("type", "step")
+                    if event_type == "progress":
+                        event_type = "step"
+                except Exception:
+                    data = {"text": msg, "type": "progress"}
+                    event_type = "step"
+                _push_event(run_id, event_type, data)
 
             description = str(payload.get("text") or payload.get("description") or "")
             stack = str(payload.get("project_stack") or payload.get("stack") or "")
@@ -3201,12 +3210,17 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         if not text:
             self._json(400, {"error": "missing_text"})
             return
-        if not _gateway_ready():
+
+        project_build_mode = bool(body.get("project_build_mode") or body.get("standalone"))
+        gateway_up = _gateway_ready(timeout=0.5)
+
+        if not gateway_up and not project_build_mode:
             self._json(503, {
                 "error": "Gateway not running",
                 "detail": "Start it with: kendr gateway start",
             })
             return
+
         working_directory = str(
             body.get("working_directory") or os.getenv("KENDR_WORKING_DIR", "")
         ).strip()
@@ -3218,6 +3232,12 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         }
         if working_directory:
             payload["working_directory"] = working_directory
+        if project_build_mode:
+            payload["project_build_mode"] = True
+        for key in ("project_name", "project_stack", "stack", "project_root",
+                    "github_repo", "auto_approve", "skip_test_agent", "skip_devops_agent"):
+            if body.get(key) is not None:
+                payload[key] = body[key]
         run_id = str(body.get("run_id") or "").strip() or f"ui-{uuid.uuid4().hex[:8]}"
         payload["run_id"] = run_id
 
@@ -3226,8 +3246,8 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             _run_event_queues[run_id] = q
             _pending_runs[run_id] = {"status": "running"}
 
-        use_standalone = bool(body.get("standalone")) or not _gateway_ready(timeout=0.5)
-        if use_standalone and bool(payload.get("project_build_mode")):
+        use_standalone = project_build_mode and (not gateway_up or bool(body.get("standalone")))
+        if use_standalone:
             _start_standalone_run_background(run_id, payload)
         else:
             _start_run_background(run_id, payload)
