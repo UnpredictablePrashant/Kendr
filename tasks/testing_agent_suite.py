@@ -602,15 +602,20 @@ def unit_test_agent(state: dict) -> dict:
     log_task_update("Unit Test Agent", f"Pass #{call_number}: generating tests for {len(source_files_raw)} file(s)")
 
     written: list[str] = []
+    working_dir_raw = str(state.get("test_working_directory") or state.get("project_root") or "")
+    working_dir = Path(working_dir_raw).resolve() if working_dir_raw else None
+
     for src_path_raw in source_files_raw:
         src_path = Path(src_path_raw.strip())
         if not src_path.is_absolute():
-            candidate_cwd = Path.cwd() / src_path
-            candidate_out = output_dir / src_path
-            if candidate_cwd.exists():
-                src_path = candidate_cwd
-            elif candidate_out.exists():
-                src_path = candidate_out
+            candidates = []
+            if working_dir:
+                candidates.append(working_dir / src_path)
+            candidates.append(Path.cwd() / src_path)
+            candidates.append(output_dir / src_path)
+            resolved = next((c for c in candidates if c.exists()), None)
+            if resolved:
+                src_path = resolved
         if not src_path.exists():
             log_task_update("Unit Test Agent", f"Source file not found: {src_path} — skipping")
             continue
