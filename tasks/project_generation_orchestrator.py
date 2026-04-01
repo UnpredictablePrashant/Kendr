@@ -191,8 +191,9 @@ class ProjectGenerationOrchestrator:
 
     def run(self) -> dict[str, Any]:
         start = time.time()
+        _PENDING = object()
         result: dict[str, Any] = {
-            "ok": False,
+            "ok": _PENDING,
             "project_root": str(self.project_root),
             "project_name": self.project_name,
             "stack": self.stack,
@@ -225,41 +226,48 @@ class ProjectGenerationOrchestrator:
             result["files_created"].extend(files_created)
             self._log(f"[2/7] scaffold complete: {len(files_created)} files/dirs created")
 
-            self._log("[3/7] generating code modules…")
+            self._log("[3/8] generating code modules…")
             coded_files = self._step_code_modules()
             result["files_created"].extend(coded_files)
-            self._log(f"[3/7] code generation complete: {len(coded_files)} files written")
+            self._log(f"[3/8] code generation complete: {len(coded_files)} files written")
+
+            self._log("[4/8] reviewer — checking generated code quality…")
+            review_notes = self._step_reviewer()
+            if review_notes:
+                self._log(f"[4/8] reviewer notes: {review_notes[:200]}")
+            else:
+                self._log("[4/8] reviewer: code looks good")
 
             if not self.skip_devops:
-                self._log("[4/7] generating devops files…")
+                self._log("[5/8] generating devops files…")
                 devops_files = self._step_devops()
                 result["files_created"].extend(devops_files)
-                self._log(f"[4/7] devops files written: {len(devops_files)}")
+                self._log(f"[5/8] devops files written: {len(devops_files)}")
             else:
-                self._log("[4/7] devops generation skipped")
+                self._log("[5/8] devops generation skipped")
 
-            self._log("[5/7] running error-fix loop (up to 3 iterations)…")
+            self._log("[6/8] running error-fix loop (up to 3 iterations)…")
             fix_report = self._step_error_fix_loop()
             if fix_report.get("errors"):
                 result["errors"].extend(fix_report["errors"])
             fix_ok = fix_report.get("ok", True)
-            self._log(f"[5/7] error-fix loop done: {fix_report.get('iterations', 0)} iterations, {'pass' if fix_ok else 'some errors remain'}")
+            self._log(f"[6/8] error-fix loop done: {fix_report.get('iterations', 0)} iterations, {'pass' if fix_ok else 'some errors remain'}")
             if not fix_ok:
-                result["ok"] = False
+                result["ok"] = False  # explicitly mark failure; cannot be reset to True below
 
             if not self.skip_tests:
-                self._log("[6/7] generating tests…")
+                self._log("[7/8] generating tests…")
                 test_files = self._step_generate_tests()
                 result["files_created"].extend(test_files)
-                self._log(f"[6/7] tests written: {len(test_files)} files")
+                self._log(f"[7/8] tests written: {len(test_files)} files")
             else:
-                self._log("[6/7] test generation skipped")
+                self._log("[7/8] test generation skipped")
 
-            self._log("[7/7] writing README…")
+            self._log("[8/8] writing README…")
             readme_written = self._step_readme()
             if readme_written:
                 result["files_created"].append(str(self.project_root / "README.md"))
-            self._log("[7/7] README written")
+            self._log("[8/8] README written")
 
             if self.github_repo:
                 self._log(f"[github] pushing to {self.github_repo}…")
@@ -271,7 +279,7 @@ class ProjectGenerationOrchestrator:
                     self._log("[github] push skipped (no token or error)")
 
             elapsed = round(time.time() - start, 1)
-            if result["ok"] is not False:
+            if result["ok"] is _PENDING:
                 result["ok"] = True
             status_mark = "✓" if result["ok"] else "⚠"
             self._log(f"[orchestrator] done in {elapsed}s  {status_mark}  {self.project_root}")
@@ -282,8 +290,11 @@ class ProjectGenerationOrchestrator:
 
         except Exception as exc:
             result["errors"].append(str(exc))
+            result["ok"] = False
             self._log(f"[orchestrator] error: {exc}")
 
+        if result["ok"] is _PENDING:
+            result["ok"] = False
         return result
 
     def _install_hint(self) -> str:
@@ -579,6 +590,53 @@ Instructions:
                 self._log(f"  [coder] error on {file_rel}: {exc}")
         return written_files
 
+    def _step_reviewer(self) -> str:
+        """Reviewer stage: LLM reviews generated code and returns notes.
+
+        Reads up to 10 generated source files, sends them to the LLM for a
+        review, and returns a summary of issues found.  The notes are logged
+        and made available to the error-fix loop.  This is a lightweight LLM-
+        powered code review; it does not modify any files.
+        """
+        py_files = list(self.project_root.rglob("*.py"))
+        ts_files = list(self.project_root.rglob("*.ts")) + list(self.project_root.rglob("*.tsx"))
+        dart_files = list(self.project_root.rglob("*.dart"))
+        all_files = (py_files + ts_files + dart_files)[:10]
+        if not all_files:
+            return ""
+
+        snippets: list[str] = []
+        for fp in all_files:
+            try:
+                rel = fp.relative_to(self.project_root)
+                content = fp.read_text(encoding="utf-8", errors="replace")[:1200]
+                snippets.append(f"--- {rel} ---\n{content}")
+            except Exception:
+                pass
+        if not snippets:
+            return ""
+
+        review_prompt = f"""
+You are a senior code reviewer. Review the following generated source files and
+identify any critical issues: missing imports, obvious logic errors, unsafe patterns,
+or incomplete implementations. Be concise — bullet-point issues only.
+
+Project: {self._blueprint.get("project_name", self.project_name)}
+Stack: {json.dumps(self._blueprint.get("tech_stack", {}), indent=2)}
+
+Generated files:
+{chr(10).join(snippets[:4000 - 200])}
+
+Return a bullet-point list of critical issues only. If the code looks correct, return "No critical issues found."
+""".strip()
+        try:
+            notes = _llm_call(review_prompt).strip()
+            if len(notes) > 800:
+                notes = notes[:800] + "…"
+            return notes
+        except Exception as exc:
+            return f"reviewer error: {exc}"
+
     def _step_devops(self) -> list[str]:
         tech = self._blueprint.get("tech_stack", {})
         lang = str(tech.get("language", "")).lower()
@@ -660,7 +718,14 @@ Return ONLY the Dockerfile content, no explanation, no markdown fences.
                 return None, f"npm install failed: {err[:400]}"
             if (self.project_root / "tsconfig.json").exists():
                 return ["npx", "tsc", "--noEmit"], root
-            return ["npx", "eslint", "--max-warnings", "9999", "."], root
+            try:
+                pkg = json.loads((self.project_root / "package.json").read_text(encoding="utf-8"))
+                all_deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                if "eslint" in all_deps:
+                    return ["npx", "eslint", "--max-warnings", "9999", "."], root
+            except Exception:
+                pass
+            return None, ""
 
         return None, ""
 
@@ -713,11 +778,17 @@ Instructions:
                     for patch in patches:
                         file_rel = patch.get("file", "")
                         content = patch.get("content", "")
-                        if file_rel and content:
-                            target = self.project_root / file_rel
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            target.write_text(content + "\n", encoding="utf-8")
-                            self._log(f"  [fixer] patched: {file_rel}")
+                        if not file_rel or not content:
+                            continue
+                        target = (self.project_root / file_rel).resolve()
+                        try:
+                            target.relative_to(self.project_root.resolve())
+                        except ValueError:
+                            self._log(f"  [fixer] rejected path-traversal patch: {file_rel}")
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(content + "\n", encoding="utf-8")
+                        self._log(f"  [fixer] patched: {file_rel}")
             except Exception as exc:
                 self._log(f"  [fixer] patch parse error: {exc}")
                 report["errors"].append(f"iter {iteration + 1}: {error_text[:200]}")

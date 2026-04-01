@@ -269,6 +269,55 @@ def _start_run_background(run_id: str, payload: dict) -> None:
     t.start()
 
 
+def _start_standalone_run_background(run_id: str, payload: dict) -> None:
+    """Run ProjectGenerationOrchestrator in a background thread, streaming progress via SSE."""
+
+    def _run() -> None:
+        _push_event(run_id, "status", {"status": "running", "message": "Standalone generator starting…"})
+        try:
+            from tasks.project_generation_orchestrator import ProjectGenerationOrchestrator
+
+            def _cb(msg: str) -> None:
+                _push_event(run_id, "step", {"text": msg, "type": "progress"})
+
+            description = str(payload.get("text") or payload.get("description") or "")
+            stack = str(payload.get("project_stack") or payload.get("stack") or "")
+            project_name = str(payload.get("project_name") or "")
+            project_root = str(payload.get("project_root") or payload.get("working_directory") or "")
+            github_repo = str(payload.get("github_repo") or "")
+            auto_approve = bool(payload.get("auto_approve", True))
+            skip_tests = bool(payload.get("skip_test_agent", False))
+            skip_devops = bool(payload.get("skip_devops_agent", False))
+
+            orch = ProjectGenerationOrchestrator(
+                description=description,
+                stack=stack,
+                project_root=project_root,
+                project_name=project_name,
+                auto_approve=auto_approve,
+                skip_tests=skip_tests,
+                skip_devops=skip_devops,
+                max_fix_iters=3,
+                github_repo=github_repo,
+                progress_cb=_cb,
+            )
+            result = orch.run()
+            result.setdefault("output_dir", result.get("project_root", ""))
+            with _pending_lock:
+                _pending_runs[run_id] = {"status": "completed", "result": result}
+            _push_event(run_id, "result", result)
+            _push_event(run_id, "done", {"run_id": run_id, "status": "completed"})
+        except Exception as exc:
+            err = str(exc)
+            with _pending_lock:
+                _pending_runs[run_id] = {"status": "failed", "error": err}
+            _push_event(run_id, "error", {"message": err})
+            _push_event(run_id, "done", {"run_id": run_id, "status": "failed"})
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
 _CHAT_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -3177,7 +3226,11 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             _run_event_queues[run_id] = q
             _pending_runs[run_id] = {"status": "running"}
 
-        _start_run_background(run_id, payload)
+        use_standalone = bool(body.get("standalone")) or not _gateway_ready(timeout=0.5)
+        if use_standalone and bool(payload.get("project_build_mode")):
+            _start_standalone_run_background(run_id, payload)
+        else:
+            _start_run_background(run_id, payload)
         self._json(200, {"run_id": run_id, "streaming": True, "status": "started"})
 
     def _handle_sse(self, run_id: str) -> None:
