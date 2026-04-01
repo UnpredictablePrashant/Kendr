@@ -87,6 +87,23 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "cards": [c.to_dict() for c in cards],
             })
             return
+        if parsed.path == "/registry/plan":
+            plan = getattr(RUNTIME, "_live_plan_data", {}) or {}
+            steps = plan.get("execution_steps") or plan.get("steps") or []
+            total = len(steps)
+            completed = sum(1 for s in steps if isinstance(s, dict) and s.get("status") == "completed")
+            running_count = sum(1 for s in steps if isinstance(s, dict) and s.get("status") == "running")
+            failed_count = sum(1 for s in steps if isinstance(s, dict) and s.get("status") == "failed")
+            self._send_json(200, {
+                "has_plan": bool(plan),
+                "summary": plan.get("summary", ""),
+                "total_steps": total,
+                "completed_steps": completed,
+                "running_steps": running_count,
+                "failed_steps": failed_count,
+                "steps": steps,
+            })
+            return
         if parsed.path == "/registry/agents":
             self._send_json(
                 200,

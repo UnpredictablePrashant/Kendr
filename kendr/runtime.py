@@ -70,6 +70,7 @@ class AgentRuntime:
     def __init__(self, registry: Registry):
         self.registry = registry
         self.skill_registry: SkillRegistry = build_skill_registry(registry)
+        self._live_plan_data: dict = {}
         _sr_summary = self.skill_registry.summary()
         print(
             f"[kendr] Skill registry ready: "
@@ -352,7 +353,7 @@ class AgentRuntime:
         index = int(state.get("plan_step_index", 0) or 0)
         if not isinstance(steps, list):
             return {"plan_steps": [], "plan_step_index": index, "plan_step_total": 0}
-        summarized: list[dict[str, str]] = []
+        summarized: list[dict] = []
         for step in steps:
             if not isinstance(step, dict):
                 continue
@@ -361,7 +362,16 @@ class AgentRuntime:
             agent = str(step.get("agent") or "").strip()
             if not (step_id or title or agent):
                 continue
-            summarized.append({"id": step_id, "title": title, "agent": agent})
+            summarized.append({
+                "id": step_id,
+                "title": title,
+                "agent": agent,
+                "status": str(step.get("status") or "pending"),
+                "started_at": step.get("started_at"),
+                "completed_at": step.get("completed_at"),
+                "result_summary": step.get("result_summary"),
+                "error": step.get("error"),
+            })
         total = len(summarized)
         return {
             "plan_steps": summarized,
@@ -1323,8 +1333,42 @@ class AgentRuntime:
             lines.append(f"- {name}: {status}")
         return all_ok, "\n".join(lines)
 
-    def _mark_planned_step_complete(self, state: dict) -> None:
-        completed_index = int(state.get("plan_step_index", 0) or 0) + 1
+    def _flush_live_plan(self, state: dict) -> None:
+        try:
+            plan_data = state.get("plan_data")
+            if not isinstance(plan_data, dict):
+                return
+            steps = state.get("plan_steps")
+            if isinstance(steps, list):
+                plan_data = dict(plan_data)
+                plan_data["execution_steps"] = steps
+            import json as _json
+            from tasks.utils import write_text_file as _wtf
+            _wtf("planner_output.json", _json.dumps(plan_data, indent=2, ensure_ascii=False))
+            self._live_plan_data = plan_data
+        except Exception:
+            pass
+
+    def _mark_step_running(self, state: dict, step_index: int) -> None:
+        from datetime import datetime, timezone
+        steps = state.get("plan_steps")
+        if not isinstance(steps, list) or step_index < 0 or step_index >= len(steps):
+            return
+        step = steps[step_index]
+        if not isinstance(step, dict):
+            return
+        step["status"] = "running"
+        step["started_at"] = datetime.now(timezone.utc).isoformat()
+        step["completed_at"] = None
+        step["result_summary"] = None
+        step["error"] = None
+        state["plan_steps"] = steps
+        self._flush_live_plan(state)
+
+    def _mark_planned_step_complete(self, state: dict, result_text: str = "") -> None:
+        from datetime import datetime, timezone
+        current_index = int(state.get("plan_step_index", 0) or 0)
+        completed_index = current_index + 1
         total_steps = len(state.get("plan_steps", []) or [])
         completed_title = (
             state.get("last_completed_plan_step_title")
@@ -1333,6 +1377,17 @@ class AgentRuntime:
             or state.get("planned_active_step_id")
             or "planned step"
         )
+        steps = state.get("plan_steps")
+        if isinstance(steps, list) and 0 <= current_index < len(steps):
+            step = steps[current_index]
+            if isinstance(step, dict):
+                step["status"] = "completed"
+                step["completed_at"] = datetime.now(timezone.utc).isoformat()
+                if result_text:
+                    step["result_summary"] = result_text[:300]
+                step["error"] = None
+            state["plan_steps"] = steps
+        self._flush_live_plan(state)
         log_task_update("Plan", f"Completed step {completed_index}/{total_steps}: {completed_title}.")
         state["plan_step_index"] = completed_index
         state["plan_execution_count"] = int(state.get("plan_execution_count", 0) or 0) + 1
@@ -1347,6 +1402,20 @@ class AgentRuntime:
                 f"via agent {state.get('last_agent', '')}."
             ),
         )
+
+    def _mark_step_failed(self, state: dict, step_index: int, error_message: str) -> None:
+        from datetime import datetime, timezone
+        steps = state.get("plan_steps")
+        if not isinstance(steps, list) or step_index < 0 or step_index >= len(steps):
+            return
+        step = steps[step_index]
+        if not isinstance(step, dict):
+            return
+        step["status"] = "failed"
+        step["completed_at"] = datetime.now(timezone.utc).isoformat()
+        step["error"] = error_message[:300]
+        state["plan_steps"] = steps
+        self._flush_live_plan(state)
 
     def _review_revision_key(self, step_id: str, agent_name: str) -> str:
         resolved_step = str(step_id or "").strip() or "adhoc-step"
@@ -1490,7 +1559,7 @@ class AgentRuntime:
                 state["last_completed_plan_step_success_criteria"] = str(state.get("planned_active_step_success_criteria", "")).strip()
                 state["last_completed_plan_step_agent"] = str(agent_name).strip()
                 if not hold_step_completion:
-                    self._mark_planned_step_complete(state)
+                    self._mark_planned_step_complete(state, result_text=self._truncate(output_text, 300))
                 state["planned_active_agent"] = ""
                 state["planned_active_step_id"] = ""
                 state["planned_active_step_title"] = ""
@@ -1504,6 +1573,8 @@ class AgentRuntime:
             error_message = str(exc)
             state["last_error"] = error_message
             self._record_agent_failure(state, agent_name, error_message)
+            if agent_name == str(state.get("planned_active_agent", "")).strip():
+                self._mark_step_failed(state, int(state.get("plan_step_index", 0) or 0), error_message)
             state = complete_task(state, active_task["task_id"], "failed")
             state["review_pending"] = False
             state = append_message(state, make_message(agent_name, "orchestrator_agent", "error", error_message))
@@ -2341,6 +2412,7 @@ class AgentRuntime:
                 "Plan",
                 f"Starting step {step_index + 1}/{total_steps}: {step_title} -> {next_agent}.",
             )
+            self._mark_step_running(state, step_index)
             state = append_task(
                 state,
                 make_task(

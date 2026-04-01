@@ -669,8 +669,14 @@ function appendKendrMsg(output, runId) {
 function formatOutput(text) {
   if (!text) return '';
   let h = esc(text);
-  h = h.replace(/```([\s\S]*?)```/g, '<pre>$1</pre>');
-  h = h.replace(/`([^`]+)`/g, '<code style="background:rgba(0,0,0,0.3);padding:2px 6px;border-radius:4px;font-family:monospace">$1</code>');
+  h = h.replace(/```([\s\S]*?)```/g, '<pre style="background:rgba(0,0,0,0.3);padding:10px;border-radius:6px;overflow-x:auto;font-family:monospace;font-size:12px;margin:6px 0">$1</pre>');
+  h = h.replace(/`([^`\n]+)`/g, '<code style="background:rgba(0,0,0,0.3);padding:2px 6px;border-radius:4px;font-family:monospace;font-size:12px">$1</code>');
+  h = h.replace(/^### (.+)$/gm, '<div style="font-size:14px;font-weight:700;color:var(--text);margin:10px 0 4px">$1</div>');
+  h = h.replace(/^## (.+)$/gm, '<div style="font-size:15px;font-weight:700;color:var(--text);margin:12px 0 5px">$1</div>');
+  h = h.replace(/^# (.+)$/gm, '<div style="font-size:17px;font-weight:800;color:var(--text);margin:14px 0 6px">$1</div>');
+  h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  h = h.replace(/\*([^*\n]+)\*/g, '<em>$1</em>');
+  h = h.replace(/^→ /gm, '<span style="color:var(--muted)">→ </span>');
   h = h.replace(/\n/g, '<br>');
   return h;
 }
@@ -856,10 +862,60 @@ function finalizeStreamRow(runId, output, error, artifactFiles, testReport, mcpI
   scrollDown();
 }
 
+let _planPollInterval = null;
+
+function startPlanPolling(runId) {
+  stopPlanPolling();
+  let lastStepCount = 0;
+  _planPollInterval = setInterval(async () => {
+    try {
+      const r = await fetch('/api/plan');
+      if (!r.ok) return;
+      const plan = await r.json();
+      if (!plan.has_plan || !plan.steps || plan.steps.length === 0) return;
+      const panelId = 'plan-panel-' + runId;
+      let panel = document.getElementById(panelId);
+      if (!panel) {
+        const wrapper = document.getElementById('stream-steps-' + runId);
+        if (!wrapper) return;
+        panel = document.createElement('div');
+        panel.id = panelId;
+        panel.style.cssText = 'background:rgba(0,201,167,0.05);border:1px solid rgba(0,201,167,0.2);border-radius:10px;padding:12px 14px;margin:10px 0 6px;';
+        panel.innerHTML = '<div style="font-size:11px;font-weight:700;color:var(--teal);letter-spacing:.08em;text-transform:uppercase;margin-bottom:8px">Plan Progress</div><div id="plan-steps-' + runId + '"></div>';
+        wrapper.insertBefore(panel, wrapper.firstChild);
+      }
+      const stepsEl = document.getElementById('plan-steps-' + runId);
+      if (!stepsEl) return;
+      const statusIcon = {pending:'⏳',running:'🔄',completed:'✅',failed:'❌',skipped:'⏭'};
+      const statusColor = {pending:'var(--muted)',running:'var(--amber)',completed:'var(--teal)',failed:'var(--crimson)',skipped:'var(--muted)'};
+      stepsEl.innerHTML = plan.steps.map((s,i) => {
+        const st = s.status || 'pending';
+        const icon = statusIcon[st] || '⏳';
+        const color = statusColor[st] || 'var(--muted)';
+        const title = esc(s.title || s.id || ('Step ' + (i+1)));
+        const agent = esc(s.agent || '');
+        const result = s.result_summary ? '<div style="font-size:11px;color:var(--muted);margin-top:2px;padding-left:4px;border-left:2px solid var(--border)">' + esc(s.result_summary.slice(0,120)) + '</div>' : '';
+        const err = s.error ? '<div style="font-size:11px;color:var(--crimson);margin-top:2px">\u26A0 ' + esc(s.error.slice(0,120)) + '</div>' : '';
+        return '<div style="display:flex;gap:8px;align-items:flex-start;padding:5px 0;border-bottom:1px solid rgba(255,255,255,0.04)">' +
+          '<span style="font-size:13px;min-width:18px">' + icon + '</span>' +
+          '<div style="flex:1;min-width:0"><div style="font-size:12px;color:' + color + ';font-weight:' + (st==='running'?'600':'400') + '">' + title + '</div>' +
+          '<div style="font-size:11px;color:var(--muted)">' + agent + '</div>' + result + err + '</div></div>';
+      }).join('');
+      const summary = '<div style="font-size:11px;color:var(--muted);margin-top:6px">' + plan.completed_steps + '/' + plan.total_steps + ' done' + (plan.running_steps > 0 ? ' &middot; ' + plan.running_steps + ' running' : '') + (plan.failed_steps > 0 ? ' &middot; <span style=\'color:var(--crimson)\'>' + plan.failed_steps + ' failed</span>' : '') + '</div>';
+      stepsEl.insertAdjacentHTML('beforeend', summary);
+    } catch(_) {}
+  }, 2000);
+}
+
+function stopPlanPolling() {
+  if (_planPollInterval) { clearInterval(_planPollInterval); _planPollInterval = null; }
+}
+
 function openEventStream(runId) {
   if (activeEvtSource) { activeEvtSource.close(); activeEvtSource = null; }
   const evtSrc = new EventSource(API + '/api/stream?run_id=' + encodeURIComponent(runId));
   activeEvtSource = evtSrc;
+  startPlanPolling(runId);
 
   evtSrc.addEventListener('status', e => {
     try {
@@ -888,6 +944,7 @@ function openEventStream(runId) {
     } catch(_) {
       finalizeStreamRow(runId, '', 'Stream error');
     }
+    stopPlanPolling();
     evtSrc.close();
     activeEvtSource = null;
     isRunning = false;
@@ -896,6 +953,7 @@ function openEventStream(runId) {
   });
 
   evtSrc.addEventListener('done', e => {
+    stopPlanPolling();
     evtSrc.close();
     activeEvtSource = null;
     isRunning = false;
@@ -907,6 +965,7 @@ function openEventStream(runId) {
 
   evtSrc.onerror = () => {
     if (evtSrc.readyState === EventSource.CLOSED) {
+      stopPlanPolling();
       isRunning = false;
       document.getElementById('sendBtn').disabled = false;
     }
@@ -3286,6 +3345,13 @@ class KendrUIHandler(BaseHTTPRequestHandler):
                 self._json(200, data)
             except Exception:
                 self._json(503, {"error": "Gateway offline", "summary": {}, "cards": []})
+            return
+        if path == "/api/plan":
+            try:
+                data = _gateway_get("/registry/plan", timeout=3.0)
+                self._json(200, data)
+            except Exception:
+                self._json(200, {"has_plan": False, "steps": [], "total_steps": 0, "completed_steps": 0})
             return
         if path == "/api/gateway/status":
             working_dir = os.getenv("KENDR_WORKING_DIR", "").strip()

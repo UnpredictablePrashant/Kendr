@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
@@ -59,10 +60,14 @@ def _normalize_step(item: dict[str, Any], objective: str, index: int, parent_id:
         "depends_on": _as_str_list(item.get("depends_on", [])),
         "parallel_group": str(item.get("parallel_group") or "").strip(),
         "success_criteria": str(item.get("success_criteria") or "").strip(),
-        "rationale": str(item.get("rationale") or "").strip(),
         "llm_model": llm_model,
         "model_source": model_source,
         "substeps": substeps,
+        "status": str(item.get("status") or "pending"),
+        "started_at": item.get("started_at") or None,
+        "completed_at": item.get("completed_at") or None,
+        "result_summary": item.get("result_summary") or None,
+        "error": item.get("error") or None,
     }
 
 
@@ -238,54 +243,70 @@ def normalize_plan_data(raw_plan: Any, objective: str) -> dict[str, Any]:
     return plan_data
 
 
-def _step_markdown_lines(step: dict[str, Any], indent: int = 0) -> list[str]:
+_STATUS_ICON = {
+    "pending": "⏳",
+    "running": "🔄",
+    "completed": "✅",
+    "failed": "❌",
+    "skipped": "⏭",
+}
+
+
+def _step_markdown_lines(step: dict[str, Any], indent: int = 0, show_status: bool = False) -> list[str]:
     prefix = "  " * indent
-    depends_on = step.get("depends_on", [])
-    depends_text = ", ".join(depends_on) if depends_on else "none"
-    parallel_group = str(step.get("parallel_group") or "").strip() or "none"
     title = str(step.get("title", "")).strip() or str(step.get("id", "")).strip() or "Step"
-    lines = [
-        f"{prefix}- {step.get('id')}: {title}",
-        f"{prefix}  agent={step.get('agent')} | llm={step.get('llm_model')} | source={step.get('model_source')}",
-        f"{prefix}  task={step.get('task')}",
-        f"{prefix}  depends_on={depends_text} | parallel_group={parallel_group}",
-        f"{prefix}  success={step.get('success_criteria') or 'n/a'}",
-    ]
-    rationale = str(step.get("rationale") or "").strip()
-    if rationale:
-        lines.append(f"{prefix}  rationale={rationale}")
+    agent = str(step.get("agent") or "").strip()
+    task_text = str(step.get("task") or "").strip()
+    criteria = str(step.get("success_criteria") or "").strip()
+    status = str(step.get("status") or "pending")
+    icon = _STATUS_ICON.get(status, "⏳")
+    step_id = str(step.get("id") or "").strip()
+    parallel_group = str(step.get("parallel_group") or "").strip()
+
+    header = f"{prefix}{icon} **{step_id}: {title}**"
+    if show_status and status not in ("pending",):
+        header += f" [{status}]"
+    lines = [header, f"{prefix}  → agent: `{agent}`"]
+    if task_text:
+        lines.append(f"{prefix}  → task: {task_text}")
+    if criteria:
+        lines.append(f"{prefix}  → done when: {criteria}")
+    if parallel_group:
+        lines.append(f"{prefix}  → parallel group: {parallel_group}")
+    result_summary = str(step.get("result_summary") or "").strip()
+    if result_summary and show_status:
+        lines.append(f"{prefix}  → result: {result_summary[:200]}")
+    error = str(step.get("error") or "").strip()
+    if error and show_status:
+        lines.append(f"{prefix}  → error: {error[:200]}")
     child_steps = step.get("substeps", [])
     if isinstance(child_steps, list) and child_steps:
-        lines.append(f"{prefix}  substeps:")
         for child in child_steps:
             if isinstance(child, dict):
-                lines.extend(_step_markdown_lines(child, indent=indent + 2))
+                lines.extend(_step_markdown_lines(child, indent=indent + 1, show_status=show_status))
     return lines
 
 
-def plan_as_markdown(plan_data: dict[str, Any]) -> str:
+def plan_as_markdown(plan_data: dict[str, Any], show_status: bool = False) -> str:
     lines: list[str] = []
     summary = str(plan_data.get("summary") or "").strip()
     if summary:
-        lines.append(f"Summary: {summary}")
+        lines.append(f"**Summary:** {summary}")
         lines.append("")
 
-    lines.append("Model Allocation:")
-    assignments = plan_data.get("model_assignments", [])
-    if isinstance(assignments, list) and assignments:
-        for item in assignments:
-            lines.append(
-                f"- {item.get('path')}: {item.get('title') or item.get('step_id')} | "
-                f"agent={item.get('agent')} | llm={item.get('llm_model')} | source={item.get('model_source')}"
-            )
-    else:
-        lines.append("- none")
+    execution_steps = plan_data.get("execution_steps") or plan_data.get("steps", [])
+    total = len(execution_steps)
+    if show_status:
+        completed = sum(1 for s in execution_steps if isinstance(s, dict) and s.get("status") == "completed")
+        running = sum(1 for s in execution_steps if isinstance(s, dict) and s.get("status") == "running")
+        lines.append(f"**Progress:** {completed}/{total} steps complete" + (f", {running} running" if running else ""))
+        lines.append("")
 
-    lines.append("")
-    lines.append("Steps:")
-    for step in plan_data.get("steps", []):
+    lines.append(f"**Steps ({total}):**")
+    steps_to_display = execution_steps if execution_steps else plan_data.get("steps", [])
+    for step in steps_to_display:
         if isinstance(step, dict):
-            lines.extend(_step_markdown_lines(step))
+            lines.extend(_step_markdown_lines(step, show_status=show_status))
     return "\n".join(lines).strip()
 
 
@@ -343,38 +364,38 @@ def planner_agent(state):
     prompt = f"""
 You are a planning agent in a multi-agent runtime.
 
-Your job is to create a very detailed execution plan before any substantive work begins.
-The user must review and approve the plan before execution starts.
+Your job is to produce a CONCISE, STRUCTURED execution plan in JSON before work begins.
+The user reviews and approves the plan before execution starts.
 
-Requirements:
-- Prefer concrete agents from the available agent list.
-- The runtime executes a flat list of the most specific executable steps.
-- Build a detailed top-level plan with explicit success criteria.
-- Add substeps for complex deliverables, especially long reports, multi-document outputs, or 50-page style requests.
-- If a step has substeps, treat the parent step as structural and make the substeps the real executable work. Do not rely on the parent wrapper step being dispatched separately.
-- Do NOT assign planner_agent as a step agent in steps or substeps. Planning happens before execution.
+STEP LIMITS — strictly enforced:
+- Standard tasks: 3–6 steps maximum.
+- Complex multi-stage tasks (full project build, 50-page reports): up to 10 steps maximum.
+- NO substeps unless the parent step genuinely cannot be expressed as a flat step (rare).
+- Each step's "task" field: ONE sentence, ≤ 25 words. Be specific, not generic.
+- "success_criteria": ONE short phrase describing the observable output (e.g. "Python file with passing tests", "JSON list of 5 competitors"). Not a paragraph.
+- Do NOT include "rationale" in steps — it wastes tokens and adds no value.
+- Do NOT assign planner_agent as a step agent. Planning is separate from execution.
 - Do not start execution. Only plan.
 
-CLARIFICATION POLICY — be very strict about when to ask:
-- Set "needs_clarification": true ONLY when the task CANNOT PHYSICALLY PROCEED without a specific piece of information from the user that you have absolutely no way to infer or assume. This means: missing credentials/API keys, a specific file path that was referenced but not provided, a target URL for a security scan, a specific codebase you have no access to.
-- For ALL content/research/writing requests: make the best reasonable assumptions and state them clearly in your plan summary. NEVER stop for content decisions. Examples of things you should ASSUME and proceed:
-  * "5 summer fruits" → assume the 5 most common globally (mango, watermelon, strawberry, peach, cherry) and state this in the plan
-  * "a complete document" → assume professional long-form with sections, appropriate length
-  * "for farmers" → assume general audience, practical tone
-  * region not specified → assume a broad/global context or the most common growing regions
-  * format not specified → assume Markdown with PDF/DOCX export options
-- If the user's intent is clear enough that a domain expert could begin working on it immediately without asking a clarifying question, do NOT ask — just plan it with your best assumptions.
-- Asking unnecessary clarification questions is a serious failure mode that wastes the user's time and breaks their workflow. When in doubt, assume and proceed.
+STEP STATUS LIFECYCLE — each step starts as "pending". The runtime will:
+  - Set status="running" when the step starts executing
+  - Set status="completed" when the agent finishes successfully
+  - Set status="failed" if the agent errors out
+Never set these in the plan JSON — always emit "pending" as status.
 
-AGENT ROUTING HINTS — the planning context includes a "skill_registry_hints" list pre-computed by the live skill registry (highest-ranked agents for this specific query). Treat these as strong suggestions — prefer them when semantics match. If the list is empty, use these fallback intent keywords:
-- github_agent: "github", "repository", "repo", "pull request", "PR", "commit", "push", "branch", "clone", "git", "issue", "open a PR", "merge", "code review", "fork"
-- coding_agent / master_coding_agent: "write code", "implement", "generate code", "create a function", "fix the bug", "refactor"
-- aws_automation_agent / aws_inventory_agent: "AWS", "EC2", "S3", "Lambda", "CloudFormation", "IAM"
-- security_scanner_agent: "security scan", "vulnerability", "CVE", "OWASP", "pen test"
-- devops_agent: "Dockerfile", "docker-compose", "CI/CD", "GitHub Actions", "deployment pipeline"
-- long_document_agent: "complete document", "full document", "detailed document", "report", "handbook", "guide", "whitepaper", "farmer document", requests requiring research + long-form writing in one pipeline with PDF/DOCX export
-- document_formatter_agent: ALWAYS use as the FINAL step in any plan that produces a document, report, guide, or handbook. It exports the output as Markdown + PDF + DOCX for download. Do not skip this step for any document-producing workflow.
-Use these hints only when the query semantics clearly match; still defer to available_agents list for exact names.
+CLARIFICATION POLICY — be very strict:
+- Set "needs_clarification": true ONLY when the task CANNOT PHYSICALLY PROCEED without information you cannot infer. This means: missing credentials/API keys, unreferenced file path, specific codebase with no access.
+- For ALL content/research/writing: assume and proceed. State assumptions in "summary". NEVER stop for content decisions.
+- When in doubt, assume and proceed. Asking unnecessary questions is a serious failure.
+
+AGENT ROUTING — the planning context has "skill_registry_hints" pre-computed by the skill registry. Treat as strong suggestions. Fallback intent keywords:
+- github_agent: repo, PR, commit, branch, git, issue, fork
+- coding_agent / master_coding_agent: write code, implement, generate code, fix bug, refactor
+- aws_automation_agent: AWS, EC2, S3, Lambda, CloudFormation, IAM
+- security_scanner_agent: security scan, vulnerability, CVE, OWASP, pen test
+- devops_agent: Dockerfile, docker-compose, CI/CD, GitHub Actions
+- long_document_agent: complete document, full report, handbook, guide, whitepaper (research + long-form writing pipeline)
+- document_formatter_agent: ALWAYS the FINAL step in any plan producing a document, report, or guide. Exports Markdown + PDF + DOCX.
 
 PROJECT BUILD MODE:
 If the planning context contains "project_build_mode": true and a non-empty "blueprint_json",
@@ -397,33 +418,21 @@ Honor the "skip_test_agent" and "skip_devops_agent" flags in the planning contex
 Planning context:
 {_planning_context(state, user_query)}
 
-Return ONLY valid JSON in this schema:
+Return ONLY valid JSON in this exact schema (no extra fields, no markdown, no explanation):
 {{
-  "needs_clarification": true or false,
-  "clarification_questions": ["question"],
-  "summary": "short planning summary",
+  "needs_clarification": false,
+  "clarification_questions": [],
+  "summary": "1–2 sentence summary of the plan and key assumptions",
   "steps": [
     {{
       "id": "step-1",
-      "title": "short step title",
-      "agent": "agent_name",
-      "task": "specific task for the agent",
-      "depends_on": ["step-id"],
-      "parallel_group": "group-a or empty",
-      "success_criteria": "how to verify this step",
-      "rationale": "why this step exists",
-      "substeps": [
-        {{
-          "id": "step-1.1",
-          "title": "short substep title",
-          "agent": "agent_name",
-          "task": "specific task for the agent",
-          "depends_on": ["step-id"],
-          "parallel_group": "",
-          "success_criteria": "verification target",
-          "rationale": "why this substep exists"
-        }}
-      ]
+      "title": "3–6 word step title",
+      "agent": "agent_name_from_available_list",
+      "task": "One sentence, ≤ 25 words, specific action for the agent to perform.",
+      "depends_on": [],
+      "parallel_group": "",
+      "success_criteria": "One short phrase describing the observable output.",
+      "status": "pending"
     }}
   ]
 }}
