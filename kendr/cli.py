@@ -2528,6 +2528,10 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         help="Connection type: 'http' (default) or 'stdio'.",
     )
     mcp_add.add_argument("--description", default="", help="Optional description.")
+    mcp_add.add_argument(
+        "--auth-token", dest="auth_token", default="",
+        help="Optional bearer token for authenticated HTTP MCP servers.",
+    )
     mcp_add.add_argument("--no-discover", action="store_true", help="Register without running tool discovery.")
 
     mcp_sub.add_parser("list", help="List all registered MCP servers and their tools.")
@@ -2712,7 +2716,6 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
     try:
         from kendr.mcp_manager import (
             list_servers,
-            get_server,
             add_server,
             remove_server,
             toggle_server,
@@ -2766,6 +2769,7 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
         connection = str(getattr(args, "connection", "")).strip()
         server_type = str(getattr(args, "server_type", "http"))
         description = str(getattr(args, "description", ""))
+        auth_token = str(getattr(args, "auth_token", ""))
         no_discover = bool(getattr(args, "no_discover", False))
 
         if not name:
@@ -2775,7 +2779,7 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
             print(style.fail("Connection (URL or command) is required."))
             return 1
 
-        srv = add_server(name=name, connection=connection, server_type=server_type, description=description)
+        srv = add_server(name=name, connection=connection, server_type=server_type, description=description, auth_token=auth_token)
         print(style.ok(f"Registered: {srv['name']}  (ID: {srv['id']})"))
         print(style.muted(f"  Type:       {srv['type']}"))
         print(style.muted(f"  Connection: {srv['connection']}"))

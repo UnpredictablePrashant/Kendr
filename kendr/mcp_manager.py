@@ -75,6 +75,7 @@ def add_server(
     connection: str,
     server_type: str = "http",
     description: str = "",
+    auth_token: str = "",
 ) -> dict:
     """Register a new MCP server.
 
@@ -89,6 +90,9 @@ def add_server(
         ``"http"`` or ``"stdio"``.
     description:
         Optional short description shown in the UI.
+    auth_token:
+        Optional bearer token sent as ``Authorization: Bearer <token>`` for HTTP
+        connections.  Never stored in plaintext beyond the local registry file.
     """
     server_id = uuid.uuid4().hex[:12]
     entry = {
@@ -97,6 +101,7 @@ def add_server(
         "type": server_type if server_type in ("http", "stdio") else "http",
         "connection": connection.strip(),
         "description": description.strip(),
+        "auth_token": auth_token.strip(),
         "enabled": True,
         "tools": [],
         "tool_count": 0,
@@ -149,16 +154,22 @@ async def _async_discover(server: dict) -> tuple[list[dict], str | None]:
 
     connection = server.get("connection", "")
     server_type = server.get("type", "http")
+    auth_token = server.get("auth_token", "")
 
     try:
         if server_type == "stdio":
-            # stdio transport: pass the command string directly
+            # stdio transport: pass the command string directly; auth not applicable
             transport = connection
+            client_kwargs: dict = {}
         else:
-            # HTTP/SSE transport
+            # HTTP/SSE transport — pass bearer token if provided
             transport = connection
+            if auth_token:
+                client_kwargs = {"headers": {"Authorization": f"Bearer {auth_token}"}}
+            else:
+                client_kwargs = {}
 
-        async with Client(transport, timeout=15) as client:
+        async with Client(transport, timeout=15, **client_kwargs) as client:
             raw_tools = await client.list_tools()
 
         tools = []

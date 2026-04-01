@@ -2685,9 +2685,16 @@ input:checked + .slider:before { transform: translateX(14px); }
       <input type="text" id="addConn" placeholder="http://localhost:8000/mcp">
       <div id="connHint" style="font-size:11px;color:var(--muted);margin-top:4px">HTTP or SSE endpoint — e.g. http://localhost:8000/mcp</div>
     </div>
-    <div class="form-full">
-      <label>Description (optional)</label>
-      <textarea id="addDesc" rows="2" placeholder="What does this server provide?"></textarea>
+    <div class="form-row">
+      <div>
+        <label>Auth Token (optional)</label>
+        <input type="password" id="addToken" placeholder="Bearer token for HTTP servers" autocomplete="off">
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">Sent as <code>Authorization: Bearer ...</code> — leave blank if not required</div>
+      </div>
+      <div>
+        <label>Description (optional)</label>
+        <textarea id="addDesc" rows="2" placeholder="What does this server provide?"></textarea>
+      </div>
     </div>
     <div class="form-actions">
       <button class="btn btn-primary" onclick="addServer()">Connect &amp; Discover Tools</button>
@@ -2738,15 +2745,18 @@ async function addServer() {
   const type = document.getElementById('addType').value;
   const conn = document.getElementById('addConn').value.trim();
   const desc = document.getElementById('addDesc').value.trim();
+  const token = document.getElementById('addToken').value.trim();
   const msg = document.getElementById('addMsg');
   if (!name) { showMsg(msg, 'Server name is required', 'err'); return; }
   if (!conn) { showMsg(msg, 'Connection is required', 'err'); return; }
   showMsg(msg, '<span class="disc-spinner"></span> Connecting and discovering tools…', 'ok');
   try {
+    const payload = { name, type, connection: conn, description: desc };
+    if (token) payload.auth_token = token;
     const r = await fetch(API + '/api/mcp/servers', {
       method: 'POST',
       headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ name, type, connection: conn, description: desc })
+      body: JSON.stringify(payload)
     });
     const d = await r.json();
     if (d.ok || d.server_id) {
@@ -2754,6 +2764,7 @@ async function addServer() {
       document.getElementById('addName').value = '';
       document.getElementById('addConn').value = '';
       document.getElementById('addDesc').value = '';
+      document.getElementById('addToken').value = '';
       await loadServers();
     } else {
       showMsg(msg, 'Error: ' + (d.error || JSON.stringify(d)), 'err');
@@ -3723,11 +3734,12 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         connection = str(body.get("connection", "")).strip()
         server_type = str(body.get("type", "http")).strip()
         description = str(body.get("description", "")).strip()
+        auth_token = str(body.get("auth_token", "")).strip()
         if not name or not connection:
             self._json(400, {"error": "name and connection are required"})
             return
         try:
-            entry = _mcp_add_server(name, connection, server_type, description)
+            entry = _mcp_add_server(name, connection, server_type, description, auth_token)
             server_id = entry["id"]
             result = _mcp_discover_tools(server_id)
             result["server"] = _mcp_get_server(server_id)
