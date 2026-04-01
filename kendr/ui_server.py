@@ -186,6 +186,21 @@ def _gateway_get(path: str, timeout: float = 5.0) -> dict | list:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _gateway_refresh_mcp(timeout: float = 5.0) -> None:
+    """POST /registry/mcp-refresh so the gateway re-registers MCP synthetic agents."""
+    try:
+        req = urllib.request.Request(
+            f"{_gateway_url()}/registry/mcp-refresh",
+            data=b"{}",
+            method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout):
+            pass
+    except Exception:
+        pass
+
+
 _pending_runs: dict[str, dict] = {}
 _run_event_queues: dict[str, "queue.Queue[dict]"] = {}
 _pending_lock = threading.Lock()
@@ -4332,6 +4347,7 @@ class KendrUIHandler(BaseHTTPRequestHandler):
                 srv["auth_token"] = "****"
             result["server"] = srv
             self._json(200, result)
+            _gateway_refresh_mcp()
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
@@ -4346,6 +4362,7 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         try:
             result = _mcp_discover_tools(server_id)
             self._json(200, result)
+            _gateway_refresh_mcp()
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
@@ -4357,6 +4374,7 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         try:
             removed = _mcp_remove_server(server_id)
             self._json(200, {"removed": removed, "server_id": server_id})
+            _gateway_refresh_mcp()
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
@@ -4369,6 +4387,7 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         try:
             ok = _mcp_toggle_server(server_id, enabled)
             self._json(200, {"ok": ok, "server_id": server_id, "enabled": enabled})
+            _gateway_refresh_mcp()
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 
