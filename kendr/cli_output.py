@@ -72,6 +72,26 @@ AGENT_QUIPS: dict[str, tuple[str, str]] = {
         "🧪 RUNNING TESTS",
         "finding out if the code actually works (results may surprise you)",
     ),
+    "api_test_agent": (
+        "🧪 API TEST GENERATION",
+        "turning your OpenAPI spec into a gauntlet of tests",
+    ),
+    "unit_test_agent": (
+        "🔬 UNIT TEST GENERATION",
+        "writing tests for the code that was never meant to be tested",
+    ),
+    "test_runner_agent": (
+        "▶️  TEST RUNNER",
+        "executing tests with appropriate dread",
+    ),
+    "test_fix_agent": (
+        "🔧 TEST FIX LOOP",
+        "reading failures, patching code, repeating until things work",
+    ),
+    "regression_test_agent": (
+        "🐛 REGRESSION TEST",
+        "ensuring this bug dies and stays dead",
+    ),
     "devops_agent": (
         "🚀 CONFIGURING DEPLOYMENT",
         "devops_agent is setting up infrastructure with quiet determination",

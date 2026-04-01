@@ -2297,7 +2297,194 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     research_parser.add_argument("--json", action="store_true", help="Emit final state as JSON.")
     research_parser.add_argument("--quiet", action="store_true", help="Suppress live progress messages.")
 
+    test_parser = subparsers.add_parser(
+        "test",
+        help="Testing Agent Suite: generate, run, and fix tests from the CLI.",
+        formatter_class=_KendrHelpFormatter,
+    )
+    command_parsers["test"] = test_parser
+    test_sub = test_parser.add_subparsers(dest="test_action", metavar="ACTION")
+
+    t_api = test_sub.add_parser("api", help="Generate API tests from an OpenAPI spec URL or file.")
+    t_api.add_argument("source", help="OpenAPI spec URL or local path (JSON/YAML).")
+    t_api.add_argument("--base-url", default="http://localhost:8000", help="Base URL for the API under test.")
+    t_api.add_argument("--output-dir", default=".", help="Directory to write generated test files.")
+    t_api.add_argument("--language", default="python", choices=["python", "typescript"], help="Test language.")
+    t_api.add_argument("--json", action="store_true", help="Emit JSON report.")
+
+    t_unit = test_sub.add_parser("unit", help="Generate unit tests for one or more source files.")
+    t_unit.add_argument("files", nargs="+", help="Source file(s) to generate tests for.")
+    t_unit.add_argument("--output-dir", default=".", help="Directory to write generated test files.")
+    t_unit.add_argument("--language", default="auto", help="Language hint (python/typescript/javascript).")
+    t_unit.add_argument("--instructions", default="", help="Additional instructions for the test generator.")
+    t_unit.add_argument("--json", action="store_true", help="Emit JSON report.")
+
+    t_run = test_sub.add_parser("run", help="Run the existing test suite and show a formatted results table.")
+    t_run.add_argument("directory", nargs="?", default=".", help="Working directory containing the test suite.")
+    t_run.add_argument("--command", default="", help="Custom test command (e.g. 'pytest -q' or 'npm test').")
+    t_run.add_argument("--timeout", type=int, default=300, help="Timeout in seconds for the test run.")
+    t_run.add_argument("--json", action="store_true", help="Emit JSON report.")
+
+    t_fix = test_sub.add_parser("fix", help="Run tests, read failures, auto-patch, and re-run until passing.")
+    t_fix.add_argument("directory", nargs="?", default=".", help="Working directory containing the test suite.")
+    t_fix.add_argument("--command", default="", help="Custom test command.")
+    t_fix.add_argument("--max-iterations", type=int, default=3, help="Max fix iterations.")
+    t_fix.add_argument("--context-files", default="", help="Comma-separated source files to provide as context.")
+    t_fix.add_argument("--timeout", type=int, default=300, help="Timeout in seconds per test run.")
+    t_fix.add_argument("--json", action="store_true", help="Emit JSON report.")
+
+    t_regression = test_sub.add_parser("regression", help="Write a targeted regression test for a bug description.")
+    t_regression.add_argument("description", nargs="+", help="Bug description (natural language).")
+    t_regression.add_argument("--directory", default=".", help="Working directory / project root.")
+    t_regression.add_argument("--language", default="python", choices=["python", "typescript"], help="Test language.")
+    t_regression.add_argument("--context-files", default="", help="Comma-separated source files to provide as context.")
+    t_regression.add_argument("--json", action="store_true", help="Emit JSON report.")
+
     return parser, command_parsers
+
+
+def _render_test_report(report: dict, style: "_CliStyle") -> str:
+    status = str(report.get("status", "FAIL")).upper()
+    ok = status == "PASS"
+    header = style.ok(f"✓ Tests {status}") if ok else style.fail(f"✗ Tests {status}")
+    rows = [
+        ["Metric", "Count"],
+        ["Passed", str(report.get("passed", 0))],
+        ["Failed", str(report.get("failed", 0))],
+        ["Skipped", str(report.get("skipped", 0))],
+        ["Total", str(report.get("total", 0))],
+    ]
+    table = _render_table(rows[0], rows[1:])
+    lines = [header, "", table]
+    failures = report.get("failures", [])
+    if failures:
+        lines.append("")
+        lines.append(style.warn(f"Failures ({len(failures)}):"))
+        for f in failures[:10]:
+            test_name = str(f.get("test", "?"))
+            msg = str(f.get("message", ""))[:80]
+            lines.append(f"  {style.fail('✗')} {test_name}" + (f"  — {msg}" if msg else ""))
+    patches = report.get("patches_applied", [])
+    if patches:
+        lines.append("")
+        lines.append(style.ok(f"Patches applied: {len(patches)}"))
+        for p in patches[:5]:
+            lines.append(f"  • iter {p.get('iteration', '?')}: {p.get('file', '?')}")
+    return "\n".join(lines)
+
+
+def _cmd_test(args: argparse.Namespace) -> int:
+    style = _style_from_args(args)
+    action = getattr(args, "test_action", None)
+    emit_json = bool(getattr(args, "json", False))
+
+    if not action:
+        p, _ = _build_arg_parser()
+        p.parse_args(["test", "--help"])
+        return 0
+
+    try:
+        from tasks.testing_agent_suite import (
+            api_test_agent,
+            unit_test_agent,
+            test_runner_agent,
+            test_fix_agent,
+            regression_test_agent,
+        )
+    except ImportError as exc:
+        print(style.fail(f"Cannot import testing agents: {exc}"))
+        return 1
+
+    state: dict = {}
+
+    if action == "api":
+        state["test_openapi_source"] = getattr(args, "source", "")
+        state["test_base_url"] = getattr(args, "base_url", "http://localhost:8000")
+        state["test_output_dir"] = str(Path(getattr(args, "output_dir", ".")).resolve())
+        state["test_language"] = getattr(args, "language", "python")
+        try:
+            state = api_test_agent(state)
+        except Exception as exc:
+            print(style.fail(f"api_test_agent error: {exc}"))
+            return 1
+
+    elif action == "unit":
+        state["test_source_files"] = list(getattr(args, "files", []))
+        state["test_output_dir"] = str(Path(getattr(args, "output_dir", ".")).resolve())
+        state["test_language"] = getattr(args, "language", "auto")
+        state["test_instructions"] = getattr(args, "instructions", "")
+        try:
+            state = unit_test_agent(state)
+        except Exception as exc:
+            print(style.fail(f"unit_test_agent error: {exc}"))
+            return 1
+
+    elif action == "run":
+        state["test_working_directory"] = str(Path(getattr(args, "directory", ".")).resolve())
+        state["test_runner_command"] = getattr(args, "command", "") or None
+        state["test_timeout"] = getattr(args, "timeout", 300)
+        try:
+            state = test_runner_agent(state)
+        except Exception as exc:
+            print(style.fail(f"test_runner_agent error: {exc}"))
+            return 1
+
+    elif action == "fix":
+        state["test_working_directory"] = str(Path(getattr(args, "directory", ".")).resolve())
+        state["test_runner_command"] = getattr(args, "command", "") or None
+        state["test_fix_max_iterations"] = getattr(args, "max_iterations", 3)
+        state["test_context_files"] = getattr(args, "context_files", "") or []
+        state["test_timeout"] = getattr(args, "timeout", 300)
+        try:
+            state = test_fix_agent(state)
+        except Exception as exc:
+            print(style.fail(f"test_fix_agent error: {exc}"))
+            return 1
+
+    elif action == "regression":
+        description_parts = getattr(args, "description", [])
+        state["test_bug_description"] = " ".join(str(p) for p in description_parts)
+        state["test_working_directory"] = str(Path(getattr(args, "directory", ".")).resolve())
+        state["test_output_dir"] = str(Path(getattr(args, "directory", ".")).resolve())
+        state["test_language"] = getattr(args, "language", "python")
+        state["test_context_files"] = getattr(args, "context_files", "") or []
+        try:
+            state = regression_test_agent(state)
+        except Exception as exc:
+            print(style.fail(f"regression_test_agent error: {exc}"))
+            return 1
+
+    else:
+        print(style.fail(f"Unknown test action: {action}"))
+        return 1
+
+    report = state.get("test_report", {})
+    summary = state.get("test_summary", "")
+
+    if emit_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False, default=str))
+        return 0 if report.get("status") in ("PASS", "generated") else 1
+
+    print()
+    print(_render_test_report(report, style))
+    print()
+    if summary:
+        suite_path = state.get("test_suite_path", "")
+        if suite_path:
+            print(style.muted(f"  Test files: {suite_path}"))
+
+    artifacts = state.get("a2a", {}).get("artifacts", [])
+    for art in artifacts[-1:]:
+        meta = art.get("metadata", {})
+        json_rpt = meta.get("json_report", "")
+        md_rpt = meta.get("md_summary", "")
+        if json_rpt:
+            print(style.muted(f"  Report: {json_rpt}"))
+        if md_rpt:
+            print(style.muted(f"  Summary: {md_rpt}"))
+
+    ok = report.get("status") in ("PASS", "generated") or bool(state.get("test_passed"))
+    return 0 if ok else 1
 
 
 def _cmd_generate_standalone(
@@ -5208,6 +5395,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_rag(args)
         if args.command == "research":
             return _cmd_research(args)
+        if args.command == "test":
+            return _cmd_test(args)
         if args.command == "agents":
             return _cmd_agents(args)
         if args.command == "plugins":

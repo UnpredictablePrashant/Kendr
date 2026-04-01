@@ -37,6 +37,12 @@ _CODING_AGENTS = {
     "backend_builder_agent",
     "frontend_builder_agent",
     "devops_agent",
+    # Testing agents
+    "api_test_agent",
+    "unit_test_agent",
+    "test_runner_agent",
+    "test_fix_agent",
+    "regression_test_agent",
 }
 
 
