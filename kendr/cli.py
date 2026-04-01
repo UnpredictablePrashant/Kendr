@@ -2215,6 +2215,30 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     sessions_parser.add_argument("--limit", type=int, default=20)
     sessions_parser.add_argument("--json", action="store_true")
 
+    model_parser = subparsers.add_parser("model", help="Manage LLM providers and models.")
+    command_parsers["model"] = model_parser
+    model_sub = model_parser.add_subparsers(dest="model_action", required=True)
+
+    model_sub.add_parser("list", help="List all LLM providers and their status.")
+    model_sub.add_parser("status", help="Show the currently active LLM provider and model.")
+    model_test = model_sub.add_parser("test", help="Send a test prompt to the current (or specified) model.")
+    model_test.add_argument("--provider", default="", help="Provider to test (default: active provider).")
+    model_test.add_argument("--model", default="", help="Model name override.")
+    model_set = model_sub.add_parser("set", help="Set the active LLM provider and/or model.")
+    model_set.add_argument("provider", choices=["openai","anthropic","google","xai","minimax","qwen","glm","ollama","openrouter","custom"],
+                           help="LLM provider name.")
+    model_set.add_argument("model", nargs="?", default="", help="Model name (optional; uses provider default if omitted).")
+    model_ollama_p = model_sub.add_parser("ollama", help="Manage local Ollama models.")
+    model_ollama_sub = model_ollama_p.add_subparsers(dest="ollama_action", required=True)
+    model_ollama_sub.add_parser("status", help="Show Ollama server status and installed models.")
+    ollama_pull = model_ollama_sub.add_parser("pull", help="Pull (download) a model from Ollama.")
+    ollama_pull.add_argument("model_name", help="Model to pull, e.g. llama3.2, mistral, deepseek-r1.")
+    model_ollama_sub.add_parser("list", help="List installed Ollama models.")
+    ollama_rm = model_ollama_sub.add_parser("rm", help="Remove an installed Ollama model.")
+    ollama_rm.add_argument("model_name", help="Model name to remove.")
+    ollama_run = model_ollama_sub.add_parser("run", help="Run Ollama with a model (interactive session).")
+    ollama_run.add_argument("model_name", nargs="?", default="", help="Model to run (default: configured OLLAMA_MODEL).")
+
     resume_parser = subparsers.add_parser("resume", help="Inspect or resume a persisted run from an output folder.")
     command_parsers["resume"] = resume_parser
     resume_parser.add_argument("target", nargs="?", default="", help="Run folder, manifest/checkpoint file, or working directory.")
@@ -5391,6 +5415,159 @@ def _cmd_plugins(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_model(args: argparse.Namespace) -> int:
+    """Handle `kendr model` sub-commands."""
+    from kendr.llm_router import (
+        ALL_PROVIDERS,
+        all_provider_statuses,
+        get_active_provider,
+        get_model_for_provider,
+        is_ollama_running,
+        list_ollama_models,
+        provider_status,
+    )
+    from tasks.setup_config_store import save_component_values
+
+    style = _style_from_args(args)
+    action = args.model_action
+
+    if action == "status":
+        provider = get_active_provider()
+        model = get_model_for_provider(provider)
+        st = provider_status(provider)
+        print(style.heading("\n  Active LLM Configuration"))
+        print(f"  Provider : {provider}")
+        print(f"  Model    : {model}")
+        print(f"  Ready    : {'yes' if st['ready'] else 'no'}")
+        if st.get("base_url"):
+            print(f"  Base URL : {st['base_url']}")
+        if st.get("note"):
+            print(f"  Note     : {st['note']}")
+        print()
+        return 0
+
+    if action == "list":
+        statuses = all_provider_statuses()
+        active = get_active_provider()
+        rows = []
+        for st in statuses:
+            p = st["provider"]
+            tick = style.ok("*") if p == active else " "
+            ready = style.ok("yes") if st["ready"] else style.warn("no")
+            note = st.get("note", "")
+            rows.append([tick, p, st["model"], ready, note[:50]])
+        print(style.heading("\n  LLM Providers\n"))
+        print(_render_table(["", "PROVIDER", "DEFAULT MODEL", "READY", "NOTE"], rows))
+        print(f"\n  Active provider: {active}  (change with: kendr model set <provider>)\n")
+        return 0
+
+    if action == "set":
+        provider = str(args.provider).strip().lower()
+        model_name = str(getattr(args, "model", "") or "").strip()
+
+        values: dict[str, str] = {"KENDR_LLM_PROVIDER": provider}
+        if model_name:
+            values["KENDR_MODEL"] = model_name
+        save_component_values("core_runtime", values)
+        os.environ["KENDR_LLM_PROVIDER"] = provider
+        if model_name:
+            os.environ["KENDR_MODEL"] = model_name
+        print(style.ok(f"Set provider to '{provider}'" + (f" with model '{model_name}'" if model_name else "") + "."))
+        print("  Restart kendr for the change to take effect in running agents.")
+        return 0
+
+    if action == "test":
+        provider = str(getattr(args, "provider", "") or "").strip().lower() or get_active_provider()
+        model_name = str(getattr(args, "model", "") or "").strip() or get_model_for_provider(provider)
+        print(f"  Testing {provider} / {model_name} ...")
+        try:
+            from kendr.llm_router import build_llm
+            client = build_llm(provider=provider, model=model_name)
+            resp = client.invoke("Say hello in one sentence.")
+            content = getattr(resp, "content", str(resp))
+            print(style.ok(f"  Response: {content[:200]}"))
+            return 0
+        except Exception as exc:
+            print(style.fail(f"  Test failed: {exc}"))
+            return 1
+
+    if action == "ollama":
+        ollama_action = getattr(args, "ollama_action", "status")
+
+        if ollama_action == "status":
+            running = is_ollama_running()
+            base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+            print(style.heading("\n  Ollama Status"))
+            print(f"  Server  : {base}")
+            print(f"  Running : {style.ok('yes') if running else style.warn('no')}")
+            if running:
+                models = list_ollama_models()
+                if models:
+                    print(f"  Models  : {', '.join(m.get('name', '') for m in models)}")
+                else:
+                    print("  Models  : (none — run: kendr model ollama pull llama3.2)")
+            else:
+                print("  Start   : ollama serve")
+            print()
+            return 0
+
+        if ollama_action == "list":
+            if not is_ollama_running():
+                print(style.warn("Ollama is not running. Start it with: ollama serve"))
+                return 1
+            models = list_ollama_models()
+            if not models:
+                print(style.warn("No models installed. Pull one with: kendr model ollama pull <model>"))
+                return 0
+            rows = [[m.get("name", ""), m.get("size", ""), m.get("modified_at", "")[:19] if m.get("modified_at") else ""] for m in models]
+            print(_render_table(["MODEL", "SIZE", "MODIFIED"], rows))
+            return 0
+
+        if ollama_action == "pull":
+            model_name = args.model_name.strip()
+            if not model_name:
+                raise SystemExit("Please specify a model name, e.g. llama3.2")
+            print(f"  Pulling {model_name} from Ollama registry ...")
+            try:
+                result = subprocess.run(["ollama", "pull", model_name], check=True)
+                if result.returncode == 0:
+                    print(style.ok(f"  Done! Model '{model_name}' is ready."))
+                    print(f"  Use it: kendr model set ollama {model_name}")
+                return result.returncode
+            except FileNotFoundError:
+                print(style.fail("  'ollama' command not found. Install from ollama.ai and ensure it's in your PATH."))
+                return 1
+            except subprocess.CalledProcessError as exc:
+                print(style.fail(f"  Pull failed: {exc}"))
+                return 1
+
+        if ollama_action == "rm":
+            model_name = args.model_name.strip()
+            try:
+                result = subprocess.run(["ollama", "rm", model_name], check=True)
+                print(style.ok(f"  Removed '{model_name}'."))
+                return result.returncode
+            except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+                print(style.fail(f"  Failed: {exc}"))
+                return 1
+
+        if ollama_action == "run":
+            model_name = (getattr(args, "model_name", "") or "").strip()
+            from kendr.llm_router import get_model_for_provider as _gmp
+            if not model_name:
+                model_name = _gmp("ollama")
+            try:
+                subprocess.run(["ollama", "run", model_name], check=False)
+                return 0
+            except FileNotFoundError:
+                print(style.fail("  'ollama' command not found. Install from ollama.ai."))
+                return 1
+
+        raise SystemExit(f"Unknown ollama action: {ollama_action}")
+
+    raise SystemExit(f"Unknown model action: {action}")
+
+
 def _run_setup_wizard(style: "_CliStyle") -> int:  # noqa: F821
     """Interactive CLI wizard that configures unconfigured integrations step-by-step."""
     from kendr.setup.catalog import INTEGRATION_DEFINITIONS
@@ -5965,6 +6142,8 @@ def main(argv: list[str] | None = None) -> int:
                 heartbeat_interval_seconds=args.heartbeat_interval,
                 once=args.once,
             )
+        if args.command == "model":
+            return _cmd_model(args)
         if args.command == "setup":
             return _cmd_setup(args)
         if args.command == "workdir":

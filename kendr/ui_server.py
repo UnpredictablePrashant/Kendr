@@ -576,6 +576,7 @@ a:hover { text-decoration: underline; }
     <a href="/runs" class="nav-btn"><span class="icon">📋</span> Run History</a>
     <a href="/skills" class="nav-btn"><span class="icon">🧠</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">🔬</span> Super-RAG</a>
+    <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">🧩</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">📁</span> Projects</a>
   </div>
@@ -1497,6 +1498,7 @@ a { color: var(--teal); }
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
+    <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -1846,6 +1848,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
+    <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn active"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -2562,6 +2565,7 @@ input:checked + .slider:before{transform:translateX(18px);}
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Run History</a>
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn active"><span class="icon">&#x1F52C;</span> Super-RAG</a>
+    <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -3199,6 +3203,423 @@ init();
 </html>"""
 
 
+_MODELS_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kendr &mdash; LLM Models</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--surface:#161b22;--surface2:#1c2128;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--teal:#00c9a7;--amber:#ffb347;--red:#f85149;--violet:#7b61ff}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;display:flex;height:100vh;overflow:hidden}
+.sidebar{width:200px;flex-shrink:0;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:16px 0;gap:4px}
+.logo{padding:0 16px 14px;border-bottom:1px solid var(--border);margin-bottom:10px}
+.logo h1{font-size:18px;font-weight:800;color:var(--teal)}
+.logo small{font-size:10px;color:var(--muted)}
+.nav-btn{display:flex;align-items:center;gap:8px;padding:8px 16px;color:var(--muted);text-decoration:none;font-size:13px;border-radius:0;transition:all .15s}
+.nav-btn:hover{background:var(--surface2);color:var(--text)}
+.nav-btn.active{background:rgba(0,201,167,.1);color:var(--teal);border-left:2px solid var(--teal)}
+.nav-btn .icon{font-size:15px}
+.main{flex:1;overflow-y:auto;padding:24px}
+.page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.page-title{font-size:20px;font-weight:800}
+.active-bar{background:var(--surface);border:1px solid var(--teal);border-radius:10px;padding:14px 20px;margin-bottom:20px;display:flex;align-items:center;gap:18px}
+.active-provider-name{font-size:16px;font-weight:700;color:var(--teal)}
+.active-model-name{font-size:13px;color:var(--muted);margin-left:4px}
+.active-badge{background:rgba(0,201,167,.15);color:var(--teal);font-size:10px;font-weight:700;padding:2px 8px;border-radius:20px}
+.providers-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-bottom:30px}
+.provider-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;display:flex;flex-direction:column;gap:10px;transition:border-color .2s,box-shadow .2s;cursor:pointer}
+.provider-card:hover{border-color:rgba(0,201,167,.4);box-shadow:0 4px 18px rgba(0,201,167,.08)}
+.provider-card.active-card{border-color:var(--teal);box-shadow:0 0 0 1px var(--teal)}
+.provider-card.needs-key{border-color:rgba(255,179,71,.3);opacity:.75}
+.provider-card.needs-key:hover{border-color:rgba(255,179,71,.6);opacity:1}
+.pcard-header{display:flex;align-items:flex-start;gap:10px}
+.pcard-emoji{font-size:24px;flex-shrink:0}
+.pcard-info{flex:1}
+.pcard-name{font-size:14px;font-weight:700;margin-bottom:2px}
+.pcard-type{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.pcard-status{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:700;white-space:nowrap}
+.st-active{background:rgba(0,201,167,.15);color:var(--teal)}
+.st-ready{background:rgba(0,201,167,.10);color:var(--teal)}
+.st-nokey{background:rgba(255,179,71,.12);color:var(--amber)}
+.pcard-model{font-size:11px;color:var(--muted);background:var(--surface2);border:1px solid var(--border);border-radius:5px;padding:2px 8px;display:inline-block;margin-top:2px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pcard-note{font-size:11px;color:var(--muted)}
+.set-btn{background:var(--teal);color:#0d1117;border:none;border-radius:6px;padding:6px 14px;font-size:11px;font-weight:700;cursor:pointer;width:100%}
+.set-btn:hover{opacity:.85}
+.cfg-btn{background:transparent;color:var(--amber);border:1px solid rgba(255,179,71,.4);border-radius:6px;padding:6px 14px;font-size:11px;font-weight:600;cursor:pointer;width:100%}
+.cfg-btn:hover{background:rgba(255,179,71,.08)}
+/* Ollama section */
+.section-title{font-size:14px;font-weight:700;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.ollama-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:24px}
+.ollama-status{display:flex;align-items:center;gap:8px;margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid var(--border)}
+.dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.dot.green{background:var(--teal)}
+.dot.red{background:var(--red)}
+.ollama-models-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.ollama-model-chip{background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:4px 10px;font-size:12px;display:flex;align-items:center;gap:6px}
+.use-chip-btn{background:none;border:none;color:var(--teal);font-size:11px;font-weight:700;cursor:pointer;padding:0}
+.use-chip-btn:hover{text-decoration:underline}
+.pull-row{display:flex;gap:8px;align-items:center;margin-top:10px}
+.pull-input{flex:1;background:var(--surface2);border:1px solid var(--border);border-radius:7px;padding:8px 12px;font-size:12px;color:var(--text);outline:none}
+.pull-input:focus{border-color:var(--teal)}
+.pull-btn{background:var(--violet);color:#fff;border:none;border-radius:7px;padding:8px 18px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap}
+.pull-btn:hover{opacity:.85}
+.pull-status{font-size:12px;color:var(--muted);margin-top:6px}
+/* cfg modal */
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:1000;align-items:center;justify-content:center}
+.modal-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;width:460px;max-height:85vh;overflow-y:auto;padding:22px}
+.modal-title{font-size:15px;font-weight:700;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between}
+.modal-close{background:none;border:none;color:var(--muted);font-size:20px;cursor:pointer;line-height:1}
+.field-row{margin-bottom:14px}
+.field-label{font-size:11px;font-weight:700;color:var(--teal);text-transform:uppercase;letter-spacing:.04em;margin-bottom:3px;display:block}
+.field-hint{font-size:11px;color:var(--muted);margin-bottom:4px}
+.field-input{width:100%;background:var(--surface2);border:1px solid var(--border);border-radius:6px;padding:8px 10px;font-size:12px;color:var(--text);outline:none}
+.field-input:focus{border-color:var(--teal)}
+.modal-actions{display:flex;gap:10px;margin-top:18px}
+.btn-save{flex:1;background:var(--teal);color:#0d1117;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:700;cursor:pointer}
+.btn-save:hover{opacity:.85}
+.btn-cancel{background:var(--surface2);border:1px solid var(--border);color:var(--muted);border-radius:8px;padding:10px 18px;font-size:13px;cursor:pointer}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--teal);color:#0d1117;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:700;z-index:2000;display:none}
+</style>
+</head>
+<body>
+<nav class="sidebar">
+  <div class="logo"><h1>kendr</h1><small>multi-agent runtime</small></div>
+  <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
+  <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
+  <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+  <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
+  <a href="/models" class="nav-btn active"><span class="icon">&#x1F916;</span> LLM Models</a>
+  <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+  <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+</nav>
+
+<main class="main">
+  <div class="page-header">
+    <div class="page-title">&#x1F916; LLM Models &amp; Providers</div>
+    <div style="display:flex;gap:10px">
+      <button onclick="loadModels()" style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:6px 14px;border-radius:8px;font-size:12px;cursor:pointer">&#x21BB; Refresh</button>
+    </div>
+  </div>
+
+  <!-- Active provider bar -->
+  <div class="active-bar" id="activeBar">
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:2px">Active Provider</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="active-provider-name" id="activeProviderName">loading...</span>
+        <span class="active-badge">ACTIVE</span>
+      </div>
+    </div>
+    <div style="width:1px;height:36px;background:var(--border)"></div>
+    <div>
+      <div style="font-size:11px;color:var(--muted);margin-bottom:2px">Model</div>
+      <span class="active-model-name" id="activeModelName">...</span>
+    </div>
+    <div style="margin-left:auto">
+      <button onclick="openTestModal()" style="background:rgba(0,201,167,.12);color:var(--teal);border:1px solid rgba(0,201,167,.3);border-radius:8px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer">&#x26A1; Test</button>
+    </div>
+  </div>
+
+  <!-- Providers grid -->
+  <div class="section-title">All Providers</div>
+  <div class="providers-grid" id="providersGrid"></div>
+
+  <!-- Ollama section -->
+  <div class="section-title" id="ollamaTitle">&#x1F4BB; Ollama &mdash; Local Models</div>
+  <div class="ollama-box" id="ollamaBox">
+    <div class="ollama-status" id="ollamaStatus">
+      <div class="dot red" id="ollamaDot"></div>
+      <span id="ollamaStatusText">Checking...</span>
+      <span style="margin-left:auto;font-size:11px;color:var(--muted)">localhost:11434</span>
+    </div>
+    <div id="ollamaModelsArea">
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">Installed models:</div>
+      <div class="ollama-models-list" id="ollamaModelsList"></div>
+    </div>
+    <div class="pull-row">
+      <input class="pull-input" id="pullInput" placeholder="llama3.2, mistral, deepseek-r1, qwen2.5..." onkeydown="if(event.key==='Enter')pullOllamaModel()">
+      <button class="pull-btn" onclick="pullOllamaModel()">&#x2193; Pull Model</button>
+    </div>
+    <div class="pull-status" id="pullStatus"></div>
+    <div style="margin-top:10px;font-size:11px;color:var(--muted)">
+      Not installed? <a href="https://ollama.ai" target="_blank" style="color:var(--teal)">Download Ollama</a>, then run <code style="background:var(--surface2);padding:1px 5px;border-radius:3px">ollama serve</code> to start the server.
+    </div>
+  </div>
+</main>
+
+<!-- Configure modal -->
+<div class="modal-overlay" id="cfgModal">
+  <div class="modal-box">
+    <div class="modal-title">
+      <span id="cfgModalTitle">Configure Provider</span>
+      <button class="modal-close" onclick="closeCfgModal()">&times;</button>
+    </div>
+    <div id="cfgModalBody"></div>
+    <div class="modal-actions">
+      <button class="btn-save" onclick="saveCfgModal()">Save &amp; Activate</button>
+      <button class="btn-cancel" onclick="closeCfgModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Test modal -->
+<div class="modal-overlay" id="testModal">
+  <div class="modal-box" style="width:520px">
+    <div class="modal-title">
+      <span>&#x26A1; Test Current Model</span>
+      <button class="modal-close" onclick="closeTestModal()">&times;</button>
+    </div>
+    <div id="testResult" style="font-size:13px;color:var(--muted);min-height:80px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:14px;line-height:1.6;white-space:pre-wrap">Click "Run Test" to send a hello prompt to the active model.</div>
+    <div class="modal-actions">
+      <button class="btn-save" onclick="runModelTest()">&#x25B6; Run Test</button>
+      <button class="btn-cancel" onclick="closeTestModal()">Close</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const PROVIDER_META = {
+  openai:      { emoji: '\uD83D\uDFE2', label: 'OpenAI',              type: 'Cloud API',     models: ['gpt-4o','gpt-4o-mini','gpt-5','o3'], keyEnv: 'OPENAI_API_KEY',      hint: 'platform.openai.com/api-keys' },
+  anthropic:   { emoji: '\uD83D\uDCA0', label: 'Anthropic (Claude)',  type: 'Cloud API',     models: ['claude-opus-4-6','claude-sonnet-4-6','claude-haiku-4-5'], keyEnv: 'ANTHROPIC_API_KEY', hint: 'console.anthropic.com' },
+  google:      { emoji: '\uD83D\uDD35', label: 'Google Gemini',       type: 'Cloud API',     models: ['gemini-2.5-pro','gemini-2.0-flash','gemini-1.5-pro'], keyEnv: 'GOOGLE_API_KEY', hint: 'aistudio.google.com' },
+  xai:         { emoji: '\u274E',       label: 'xAI (Grok)',          type: 'Cloud API',     models: ['grok-3','grok-3-mini','grok-2'], keyEnv: 'XAI_API_KEY',       hint: 'console.x.ai' },
+  minimax:     { emoji: '\uD83C\uDF00', label: 'MiniMax',             type: 'Cloud API',     models: ['MiniMax-M2','image-01'], keyEnv: 'MINIMAX_API_KEY',   hint: 'platform.minimaxi.com' },
+  qwen:        { emoji: '\uD83D\uDCCA', label: 'Qwen (Alibaba)',      type: 'Cloud API',     models: ['qwen-max','qwen-plus','qwen-turbo'], keyEnv: 'QWEN_API_KEY',    hint: 'dashscope.aliyuncs.com' },
+  glm:         { emoji: '\u26A1',       label: 'GLM (Zhipu AI)',      type: 'Cloud API',     models: ['glm-5','glm-4','glm-4-flash'], keyEnv: 'GLM_API_KEY',     hint: 'bigmodel.cn' },
+  ollama:      { emoji: '\uD83D\uDCBB', label: 'Ollama',              type: 'Local (no key)',models: ['llama3.2','mistral','deepseek-r1','qwen2.5','gemma3'], keyEnv: '', hint: 'ollama.ai' },
+  openrouter:  { emoji: '\uD83D\uDEE3', label: 'OpenRouter',          type: 'Multi-provider',models: ['openai/gpt-4o','anthropic/claude-3-5-sonnet','meta-llama/llama-3.1-8b-instruct'], keyEnv: 'OPENROUTER_API_KEY', hint: 'openrouter.ai/keys' },
+  custom:      { emoji: '\uD83D\uDD27', label: 'Custom / Self-hosted',type: 'Self-hosted',   models: [], keyEnv: '', hint: 'Any OpenAI-compatible server' },
+};
+
+let _data = {};
+
+function showToast(msg, err) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.style.background = err ? 'var(--red)' : 'var(--teal)';
+  t.style.color = err ? '#fff' : '#0d1117';
+  t.style.display = 'block';
+  setTimeout(() => { t.style.display = 'none'; }, 3200);
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+async function loadModels() {
+  try {
+    const r = await fetch('/api/models');
+    _data = await r.json();
+    renderActiveBar(_data);
+    renderProviders(_data);
+    renderOllama(_data);
+  } catch(e) {
+    document.getElementById('providersGrid').innerHTML = '<div style="color:var(--muted);grid-column:1/-1;padding:30px 0">Could not load provider data.</div>';
+  }
+}
+
+function renderActiveBar(d) {
+  const meta = PROVIDER_META[d.active_provider] || {};
+  document.getElementById('activeProviderName').textContent = (meta.label || d.active_provider) + ' ' + (meta.emoji || '');
+  document.getElementById('activeModelName').textContent = d.active_model || '(default)';
+}
+
+function renderProviders(d) {
+  const grid = document.getElementById('providersGrid');
+  const active = d.active_provider;
+  const statuses = {};
+  (d.providers || []).forEach(s => { statuses[s.provider] = s; });
+
+  grid.innerHTML = Object.entries(PROVIDER_META).map(([id, meta]) => {
+    const st = statuses[id] || {};
+    const isActive = id === active;
+    const ready = st.ready;
+    const model = st.model || (meta.models[0] || '');
+    const statusCls = isActive ? 'st-active' : ready ? 'st-ready' : 'st-nokey';
+    const statusLabel = isActive ? '\u2714 Active' : ready ? '\u2714 Ready' : '\u26A1 Add Key';
+    const cardCls = isActive ? 'provider-card active-card' : ready ? 'provider-card' : 'provider-card needs-key';
+
+    let btn = '';
+    if (!isActive && ready) {
+      btn = `<button class="set-btn" onclick="setActive('${id}','')">Set as Active</button>`;
+    } else if (!ready && id !== 'ollama' && id !== 'custom') {
+      btn = `<button class="cfg-btn" onclick="openCfg('${id}')">Add API Key</button>`;
+    } else if (id === 'custom') {
+      btn = `<button class="cfg-btn" onclick="openCfg('${id}')">Configure Endpoint</button>`;
+    } else if (id === 'ollama') {
+      btn = `<button class="set-btn" onclick="setActive('ollama','')">Use Ollama</button>`;
+    } else {
+      btn = `<button class="cfg-btn" onclick="openCfg('${id}')">Edit Settings</button>`;
+    }
+
+    return `<div class="${cardCls}">
+      <div class="pcard-header">
+        <div class="pcard-emoji">${meta.emoji}</div>
+        <div class="pcard-info">
+          <div class="pcard-name">${esc(meta.label)}</div>
+          <div class="pcard-type">${esc(meta.type)}</div>
+        </div>
+        <div class="pcard-status ${statusCls}">${statusLabel}</div>
+      </div>
+      <div class="pcard-model" title="${esc(model)}">${esc(model) || '(not set)'}</div>
+      <div class="pcard-note">${esc(st.note || meta.hint || '')}</div>
+      ${btn}
+    </div>`;
+  }).join('');
+}
+
+function renderOllama(d) {
+  const running = d.ollama_running;
+  document.getElementById('ollamaDot').className = 'dot ' + (running ? 'green' : 'red');
+  document.getElementById('ollamaStatusText').textContent = running ? 'Running' : 'Not running — start with: ollama serve';
+  const models = d.ollama_models || [];
+  const list = document.getElementById('ollamaModelsList');
+  if (models.length === 0) {
+    list.innerHTML = '<div style="font-size:12px;color:var(--muted)">' + (running ? 'No models installed yet. Pull one below.' : 'Start Ollama to see installed models.') + '</div>';
+  } else {
+    list.innerHTML = models.map(m =>
+      `<div class="ollama-model-chip">
+         ${esc(m)}
+         <button class="use-chip-btn" onclick="setActive('ollama','${esc(m)}')">Use</button>
+       </div>`
+    ).join('');
+  }
+}
+
+async function setActive(provider, model) {
+  try {
+    const r = await fetch('/api/models/set', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ provider, model })
+    });
+    const d = await r.json();
+    if (d.saved) {
+      showToast('\u2714 Switched to ' + provider + (model ? ' / ' + model : ''));
+      await loadModels();
+    } else {
+      showToast(d.error || 'Save failed', true);
+    }
+  } catch(e) { showToast('Error: ' + e.message, true); }
+}
+
+async function pullOllamaModel() {
+  const input = document.getElementById('pullInput');
+  const model = input.value.trim();
+  if (!model) return;
+  const status = document.getElementById('pullStatus');
+  status.textContent = 'Pulling ' + model + '... (this may take a minute)';
+  try {
+    const r = await fetch('/api/models/ollama/pull', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ model })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      status.textContent = '\u2714 Pulled ' + model + ' successfully!';
+      input.value = '';
+      showToast('\u2714 ' + model + ' is ready');
+      await loadModels();
+    } else {
+      status.textContent = '\u274C ' + (d.error || 'Pull failed');
+    }
+  } catch(e) { status.textContent = '\u274C Error: ' + e.message; }
+}
+
+// Config modal
+const CFG_FIELDS = {
+  openai:     [{ key:'OPENAI_API_KEY', label:'API Key', secret:true, hint:'From platform.openai.com/api-keys' },
+               { key:'OPENAI_MODEL_GENERAL', label:'General Model', hint:'e.g. gpt-4o, gpt-4o-mini, gpt-5' },
+               { key:'OPENAI_MODEL_CODING', label:'Coding Model', hint:'e.g. gpt-4o (for coding agents)' }],
+  anthropic:  [{ key:'ANTHROPIC_API_KEY', label:'API Key', secret:true, hint:'From console.anthropic.com' },
+               { key:'ANTHROPIC_MODEL', label:'Default Model', hint:'e.g. claude-opus-4-6, claude-haiku-4-5' }],
+  google:     [{ key:'GOOGLE_API_KEY', label:'API Key', secret:true, hint:'From aistudio.google.com' },
+               { key:'GOOGLE_MODEL', label:'Default Model', hint:'e.g. gemini-2.5-pro, gemini-2.0-flash' }],
+  xai:        [{ key:'XAI_API_KEY', label:'API Key', secret:true, hint:'From console.x.ai' },
+               { key:'XAI_MODEL', label:'Default Model', hint:'e.g. grok-3, grok-3-mini' }],
+  minimax:    [{ key:'MINIMAX_API_KEY', label:'API Key', secret:true, hint:'From platform.minimaxi.com' },
+               { key:'MINIMAX_MODEL', label:'Default Model', hint:'e.g. MiniMax-M2' }],
+  qwen:       [{ key:'QWEN_API_KEY', label:'API Key', secret:true, hint:'From dashscope.aliyuncs.com' },
+               { key:'QWEN_MODEL', label:'Default Model', hint:'e.g. qwen-max, qwen-plus' }],
+  glm:        [{ key:'GLM_API_KEY', label:'API Key', secret:true, hint:'From bigmodel.cn' },
+               { key:'GLM_MODEL', label:'Default Model', hint:'e.g. glm-5, glm-4' }],
+  ollama:     [{ key:'OLLAMA_BASE_URL', label:'Server URL', hint:'Default: http://localhost:11434' },
+               { key:'OLLAMA_MODEL', label:'Default Model', hint:'e.g. llama3.2, mistral, deepseek-r1' }],
+  openrouter: [{ key:'OPENROUTER_API_KEY', label:'API Key', secret:true, hint:'From openrouter.ai/keys' },
+               { key:'OPENROUTER_MODEL', label:'Default Model', hint:'e.g. openai/gpt-4o, anthropic/claude-3-5-sonnet' }],
+  custom:     [{ key:'CUSTOM_LLM_BASE_URL', label:'Base URL', hint:'e.g. http://localhost:1234/v1' },
+               { key:'CUSTOM_LLM_MODEL', label:'Model Name', hint:'As expected by the server' },
+               { key:'CUSTOM_LLM_API_KEY', label:'API Key (optional)', secret:true, hint:'Bearer token if required' }],
+};
+
+let _cfgProvider = null;
+
+function openCfg(provider) {
+  _cfgProvider = provider;
+  const meta = PROVIDER_META[provider] || {};
+  document.getElementById('cfgModalTitle').textContent = (meta.emoji || '') + ' Configure ' + (meta.label || provider);
+  const fields = CFG_FIELDS[provider] || [];
+  document.getElementById('cfgModalBody').innerHTML = fields.map(f => `
+    <div class="field-row">
+      <label class="field-label">${esc(f.label)}</label>
+      <div class="field-hint">${esc(f.hint || '')}</div>
+      <input id="cfg-${f.key}" class="field-input" type="${f.secret?'password':'text'}" placeholder="${esc(f.key)}"
+             style="${f.secret?'font-family:monospace':''}">
+    </div>`).join('');
+  document.getElementById('cfgModal').style.display = 'flex';
+}
+
+function closeCfgModal() { document.getElementById('cfgModal').style.display = 'none'; }
+
+async function saveCfgModal() {
+  const fields = CFG_FIELDS[_cfgProvider] || [];
+  const values = {};
+  fields.forEach(f => {
+    const el = document.getElementById('cfg-' + f.key);
+    if (el && el.value.trim()) values[f.key] = el.value.trim();
+  });
+  try {
+    const r = await fetch('/api/setup/save', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ component_id: _cfgProvider === 'google' ? 'google_gemini' : _cfgProvider, values })
+    });
+    const d = await r.json();
+    closeCfgModal();
+    showToast('\u2714 Saved ' + _cfgProvider + ' configuration');
+    // If credentials now complete, set as active
+    await fetch('/api/models/set', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ provider: _cfgProvider, model: '' }) });
+    await loadModels();
+  } catch(e) { showToast('\u274C Save failed: ' + e.message, true); }
+}
+
+function openTestModal() { document.getElementById('testModal').style.display = 'flex'; }
+function closeTestModal() { document.getElementById('testModal').style.display = 'none'; }
+
+async function runModelTest() {
+  const el = document.getElementById('testResult');
+  el.textContent = 'Sending test prompt...';
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ query: 'Say hello in one sentence.', session_id: '__model_test__' })
+    });
+    const d = await r.json();
+    el.textContent = d.reply || d.content || d.answer || JSON.stringify(d, null, 2);
+  } catch(e) { el.textContent = 'Error: ' + e.message; }
+}
+
+loadModels();
+</script>
+</body>
+</html>"""
+
+
 _MCP_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -3287,6 +3708,7 @@ input:checked + .slider:before { transform: translateX(14px); }
     <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
+    <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn active"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -3603,7 +4025,8 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,san
   <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
   <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
   <a href="/skills" class="nav-btn active"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
-  <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+  <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
+    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
   <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
 </nav>
 <main class="main" style="padding:20px 24px;overflow-y:auto">
@@ -4005,6 +4428,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/runs" class="nav-btn active"><span class="icon">&#x1F4CB;</span> Run History</a>
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
+    <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
     <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   </div>
@@ -4110,6 +4534,9 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         if path == "/projects":
             self._html(200, _PROJECTS_HTML)
             return
+        if path == "/models":
+            self._html(200, _MODELS_HTML)
+            return
         if path == "/api/rag/kbs":
             self._handle_rag_list_kbs()
             return
@@ -4136,6 +4563,29 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._json(200, {"service": "kendr-ui", "status": "ok"})
+            return
+        if path == "/api/models":
+            try:
+                from kendr.llm_router import (
+                    all_provider_statuses,
+                    get_active_provider,
+                    get_model_for_provider,
+                    is_ollama_running,
+                    list_ollama_models,
+                )
+                active = get_active_provider()
+                statuses = all_provider_statuses()
+                ollama_running = is_ollama_running()
+                ollama_models = list_ollama_models() if ollama_running else []
+                self._json(200, {
+                    "active_provider": active,
+                    "active_model": get_model_for_provider(active),
+                    "providers": statuses,
+                    "ollama_running": ollama_running,
+                    "ollama_models": [m.get("name", "") for m in ollama_models],
+                })
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
             return
         if path == "/api/skills":
             try:
@@ -4388,6 +4838,12 @@ class KendrUIHandler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, **result})
             except Exception as exc:
                 self._json(500, {"error": str(exc)})
+            return
+        if path == "/api/models/set":
+            self._handle_models_set(body)
+            return
+        if path == "/api/models/ollama/pull":
+            self._handle_ollama_pull(body)
             return
         if path == "/api/setup/save":
             self._handle_setup_save(body)
@@ -4730,6 +5186,42 @@ class KendrUIHandler(BaseHTTPRequestHandler):
             ))
         except Exception as exc:
             self._html(500, f"<h1>OAuth failed</h1><p>{_html.escape(str(exc))}</p>")
+
+    def _handle_models_set(self, body: dict) -> None:
+        provider = str(body.get("provider", "")).strip().lower()
+        model = str(body.get("model", "")).strip()
+        if not provider:
+            self._json(400, {"error": "missing_provider"})
+            return
+        try:
+            values: dict[str, str] = {"KENDR_LLM_PROVIDER": provider}
+            if model:
+                values["KENDR_MODEL"] = model
+            result = save_component_values("core_runtime", values)
+            apply_setup_env_defaults()
+            self._json(200, {"saved": True, "provider": provider, "model": model})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_ollama_pull(self, body: dict) -> None:
+        import subprocess
+        model_name = str(body.get("model", "")).strip()
+        if not model_name:
+            self._json(400, {"error": "missing_model"})
+            return
+        try:
+            proc = subprocess.run(
+                ["ollama", "pull", model_name],
+                capture_output=True, text=True, timeout=300,
+            )
+            if proc.returncode == 0:
+                self._json(200, {"ok": True, "model": model_name})
+            else:
+                self._json(500, {"error": proc.stderr.strip() or "Pull failed"})
+        except FileNotFoundError:
+            self._json(503, {"error": "ollama not found — install from ollama.ai"})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
 
     def _handle_setup_save(self, body: dict) -> None:
         comp_id = str(body.get("component_id", "")).strip()

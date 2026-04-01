@@ -21,7 +21,7 @@ os.makedirs(RUN_OUTPUT_ROOT, exist_ok=True)
 ACTIVE_OUTPUT_DIR = OUTPUT_DIR
 
 _ACTIVE_AGENT_NAME: ContextVar[str] = ContextVar("active_agent_name", default="")
-_LLM_CLIENTS: dict[str, ChatOpenAI] = {}
+_LLM_CLIENTS: dict[str, object] = {}
 _DEFAULT_GENERAL_MODEL = os.getenv("OPENAI_MODEL_GENERAL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
 _DEFAULT_CODING_MODEL = os.getenv("OPENAI_MODEL_CODING", os.getenv("OPENAI_CODEX_MODEL", _DEFAULT_GENERAL_MODEL))
 _CODING_AGENTS = {
@@ -46,30 +46,44 @@ _CODING_AGENTS = {
 }
 
 
+def _agent_role(agent_name: str) -> str:
+    return "coding" if agent_name in _CODING_AGENTS else "general"
+
+
 def model_selection_for_agent(agent_name: str = "") -> dict[str, str]:
+    from kendr.llm_router import get_active_provider, get_model_for_provider
+
     name = (agent_name or "").strip()
+    provider = get_active_provider()
+
+    # Agent-specific override still respected
     if name:
         agent_key = f"OPENAI_MODEL_AGENT_{name.upper()}"
         agent_specific = os.getenv(agent_key, "").strip()
         if agent_specific:
-            return {"model": agent_specific, "source": agent_key}
-    if name in _CODING_AGENTS:
-        model = os.getenv("OPENAI_MODEL_CODING", os.getenv("OPENAI_CODEX_MODEL", _DEFAULT_CODING_MODEL)).strip() or _DEFAULT_CODING_MODEL
-        return {"model": model, "source": "OPENAI_MODEL_CODING/OPENAI_CODEX_MODEL"}
-    model = os.getenv("OPENAI_MODEL_GENERAL", os.getenv("OPENAI_MODEL", _DEFAULT_GENERAL_MODEL)).strip() or _DEFAULT_GENERAL_MODEL
-    return {"model": model, "source": "OPENAI_MODEL_GENERAL/OPENAI_MODEL"}
+            return {"model": agent_specific, "source": agent_key, "provider": provider}
+
+    role = _agent_role(name)
+    model = get_model_for_provider(provider, role)
+    return {"model": model, "source": f"KENDR_LLM_PROVIDER={provider}", "provider": provider}
 
 
 def model_for_agent(agent_name: str = "") -> str:
     return model_selection_for_agent(agent_name).get("model", _DEFAULT_GENERAL_MODEL)
 
 
-def _client_for_model(model: str) -> ChatOpenAI:
-    key = model.strip() or _DEFAULT_GENERAL_MODEL
-    client = _LLM_CLIENTS.get(key)
+def _client_for_model(model: str, role: str = "general") -> object:
+    from kendr.llm_router import build_llm, get_active_provider
+
+    provider = get_active_provider()
+    cache_key = f"{provider}:{model}"
+    client = _LLM_CLIENTS.get(cache_key)
     if client is None:
-        client = ChatOpenAI(model=key)
-        _LLM_CLIENTS[key] = client
+        try:
+            client = build_llm(provider=provider, model=model, role=role)
+        except Exception:
+            client = ChatOpenAI(model=model)
+        _LLM_CLIENTS[cache_key] = client
     return client
 
 
@@ -86,8 +100,9 @@ class RoutedLLM:
     def invoke(self, prompt, *args, **kwargs):
         forced_agent = kwargs.pop("agent_name", "")
         agent_name = forced_agent or _ACTIVE_AGENT_NAME.get("")
+        role = _agent_role(agent_name)
         model = model_for_agent(agent_name)
-        return _client_for_model(model).invoke(prompt, *args, **kwargs)
+        return _client_for_model(model, role).invoke(prompt, *args, **kwargs)
 
 
 llm = RoutedLLM()
