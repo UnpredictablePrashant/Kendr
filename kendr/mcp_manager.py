@@ -1,7 +1,8 @@
 """MCP Server Manager — kendr as an MCP client.
 
-Persists a registry of external MCP servers and connects to them to
-auto-discover their tools, just like Cursor does.
+Persists a registry of external MCP servers in the local SQLite DB
+(``output/agent_workflow.sqlite3``, table ``mcp_servers``) and connects to
+them to auto-discover their tools, just like Cursor does.
 
 Supported connection types
 --------------------------
@@ -12,56 +13,22 @@ Supported connection types
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import os
-import threading
 import time
 import uuid
 from typing import Any
 
 _log = logging.getLogger("kendr.mcp_manager")
 
-_DEFAULT_STORE = os.path.join(os.path.expanduser("~"), ".kendr", "mcp_registry.json")
-_MCP_STORE_PATH = os.getenv("KENDR_MCP_REGISTRY", _DEFAULT_STORE)
-_store_lock = threading.Lock()
-
 
 # ---------------------------------------------------------------------------
-# Persistence helpers
-# ---------------------------------------------------------------------------
-
-def _load_registry() -> dict:
-    try:
-        os.makedirs(os.path.dirname(_MCP_STORE_PATH), exist_ok=True)
-        if os.path.isfile(_MCP_STORE_PATH):
-            with open(_MCP_STORE_PATH, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-    except Exception as exc:
-        _log.warning("Could not load MCP registry: %s", exc)
-    return {"servers": {}}
-
-
-def _save_registry(reg: dict) -> None:
-    try:
-        os.makedirs(os.path.dirname(_MCP_STORE_PATH), exist_ok=True)
-        with open(_MCP_STORE_PATH, "w", encoding="utf-8") as fh:
-            json.dump(reg, fh, indent=2)
-    except Exception as exc:
-        _log.warning("Could not save MCP registry: %s", exc)
-
-
-# ---------------------------------------------------------------------------
-# Public registry API
+# Public registry API  (delegates to SQLite persistence layer)
 # ---------------------------------------------------------------------------
 
 def list_servers() -> list[dict]:
-    """Return all registered MCP servers (sorted by name) — includes auth_token (internal use)."""
-    with _store_lock:
-        reg = _load_registry()
-    servers = list(reg.get("servers", {}).values())
-    servers.sort(key=lambda s: s.get("name", "").lower())
-    return servers
+    """Return all registered MCP servers — includes auth_token (internal use)."""
+    from kendr.persistence.mcp_store import list_mcp_servers
+    return list_mcp_servers()
 
 
 def list_servers_safe() -> list[dict]:
@@ -77,9 +44,8 @@ def list_servers_safe() -> list[dict]:
 
 
 def get_server(server_id: str) -> dict | None:
-    with _store_lock:
-        reg = _load_registry()
-    return reg.get("servers", {}).get(server_id)
+    from kendr.persistence.mcp_store import get_mcp_server
+    return get_mcp_server(server_id)
 
 
 def add_server(
@@ -104,50 +70,28 @@ def add_server(
         Optional short description shown in the UI.
     auth_token:
         Optional bearer token sent as ``Authorization: Bearer <token>`` for HTTP
-        connections.  Never stored in plaintext beyond the local registry file.
+        connections.  Stored in the local DB (localhost-only access).
     """
+    from kendr.persistence.mcp_store import add_mcp_server
     server_id = uuid.uuid4().hex[:12]
-    entry = {
-        "id": server_id,
-        "name": name.strip() or "Unnamed Server",
-        "type": server_type if server_type in ("http", "stdio") else "http",
-        "connection": connection.strip(),
-        "description": description.strip(),
-        "auth_token": auth_token.strip(),
-        "enabled": True,
-        "tools": [],
-        "tool_count": 0,
-        "last_discovered": None,
-        "status": "unknown",
-        "error": None,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    with _store_lock:
-        reg = _load_registry()
-        reg.setdefault("servers", {})[server_id] = entry
-        _save_registry(reg)
-    return entry
+    return add_mcp_server(
+        server_id=server_id,
+        name=name.strip() or "Unnamed Server",
+        connection=connection.strip(),
+        server_type=server_type if server_type in ("http", "stdio") else "http",
+        description=description.strip(),
+        auth_token=auth_token.strip(),
+    )
 
 
 def remove_server(server_id: str) -> bool:
-    with _store_lock:
-        reg = _load_registry()
-        if server_id in reg.get("servers", {}):
-            del reg["servers"][server_id]
-            _save_registry(reg)
-            return True
-    return False
+    from kendr.persistence.mcp_store import remove_mcp_server
+    return remove_mcp_server(server_id)
 
 
 def toggle_server(server_id: str, enabled: bool) -> bool:
-    with _store_lock:
-        reg = _load_registry()
-        srv = reg.get("servers", {}).get(server_id)
-        if srv is None:
-            return False
-        srv["enabled"] = enabled
-        _save_registry(reg)
-    return True
+    from kendr.persistence.mcp_store import toggle_mcp_server
+    return toggle_mcp_server(server_id, enabled)
 
 
 # ---------------------------------------------------------------------------
@@ -170,11 +114,9 @@ async def _async_discover(server: dict) -> tuple[list[dict], str | None]:
 
     try:
         if server_type == "stdio":
-            # stdio transport: pass the command string directly; auth not applicable
             transport = connection
             client_kwargs: dict = {}
         else:
-            # HTTP/SSE transport — pass bearer token if provided
             transport = connection
             if auth_token:
                 client_kwargs = {"headers": {"Authorization": f"Bearer {auth_token}"}}
@@ -204,32 +146,27 @@ async def _async_discover(server: dict) -> tuple[list[dict], str | None]:
 def discover_tools(server_id: str) -> dict:
     """Synchronously discover tools from a registered MCP server.
 
-    Updates the registry and returns the result dict.
+    Updates the DB and returns the result dict.
     """
-    with _store_lock:
-        reg = _load_registry()
-        server = reg.get("servers", {}).get(server_id)
+    from kendr.persistence.mcp_store import get_mcp_server, update_mcp_server_tools
 
+    server = get_mcp_server(server_id)
     if server is None:
         return {"ok": False, "error": "Server not found", "tools": []}
 
-    # Run async discovery in a fresh event loop
     try:
         tools, error = asyncio.run(_async_discover(server))
     except Exception as exc:
         tools, error = [], str(exc)
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    with _store_lock:
-        reg = _load_registry()
-        srv = reg.get("servers", {}).get(server_id)
-        if srv is not None:
-            srv["tools"] = tools
-            srv["tool_count"] = len(tools)
-            srv["last_discovered"] = now
-            srv["status"] = "error" if error else "connected"
-            srv["error"] = error
-            _save_registry(reg)
+    update_mcp_server_tools(
+        server_id=server_id,
+        tools=tools,
+        status="error" if error else "connected",
+        error=error,
+        last_discovered=now,
+    )
 
     return {
         "ok": error is None,
@@ -296,7 +233,7 @@ if __name__ == "__main__":
     # Starts an HTTP server on http://localhost:8000/mcp
     # Change host/port via env: MCP_HOST, MCP_PORT
     import os
-    host = os.getenv("MCP_HOST", "127.0.0.1")
+    host = os.getenv("MCP_HOST", "0.0.0.0")
     port = int(os.getenv("MCP_PORT", "8000"))
-    mcp.run(transport="http", host=host, port=port, path="/mcp")
+    mcp.run(transport="sse", host=host, port=port)
 '''

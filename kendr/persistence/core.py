@@ -195,6 +195,22 @@ def initialize_db(db_path: str = DB_PATH):
                 status TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS mcp_servers (
+                server_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL DEFAULT 'http',
+                connection TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                auth_token TEXT DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                tools_json TEXT DEFAULT '[]',
+                tool_count INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'unknown',
+                error TEXT DEFAULT '',
+                last_discovered TEXT DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS monitor_events (
                 event_id TEXT PRIMARY KEY,
                 rule_id TEXT,

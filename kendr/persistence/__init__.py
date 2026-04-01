@@ -52,6 +52,14 @@ from .superrag_store import (
     list_superrag_sessions,
     upsert_superrag_session,
 )
+from .mcp_store import (
+    add_mcp_server,
+    get_mcp_server,
+    list_mcp_servers,
+    remove_mcp_server,
+    toggle_mcp_server,
+    update_mcp_server_tools,
+)
 
 __all__ = [
     "DB_PATH",
@@ -103,4 +111,10 @@ __all__ = [
     "upsert_superrag_session",
     "upsert_task",
     "upsert_task_session",
+    "add_mcp_server",
+    "get_mcp_server",
+    "list_mcp_servers",
+    "remove_mcp_server",
+    "toggle_mcp_server",
+    "update_mcp_server_tools",
 ]
