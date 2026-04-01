@@ -118,18 +118,6 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 ],
             )
             return
-        if parsed.path == "/registry/mcp-refresh" and self.command == "POST":
-            try:
-                from kendr.discovery import _register_mcp_tools
-                _register_mcp_tools(REGISTRY)
-                mcp_agents = [
-                    n for n in REGISTRY.agents
-                    if n.startswith("mcp_")
-                ]
-                self._send_json(200, {"ok": True, "mcp_agent_count": len(mcp_agents)})
-            except Exception as exc:
-                self._send_json(500, {"ok": False, "error": str(exc)})
-            return
         if parsed.path == "/registry/plugins":
             self._send_json(
                 200,
@@ -205,6 +193,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not_found"})
 
     def do_POST(self):
+        if self.path == "/registry/mcp-refresh":
+            try:
+                from kendr.discovery import _register_mcp_tools
+                _register_mcp_tools(REGISTRY)
+                mcp_agents = [n for n in REGISTRY.agents if n.startswith("mcp_")]
+                self._send_json(200, {"ok": True, "mcp_agent_count": len(mcp_agents)})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
         if self.path not in {"/ingest", "/resume"}:
             self._send_json(404, {"error": "not_found"})
             return
