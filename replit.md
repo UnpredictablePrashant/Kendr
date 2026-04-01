@@ -273,3 +273,43 @@ Explicit management: `kendr gateway start` (pre-launch) / `kendr gateway stop` (
 ### Embedding
 Default: `openai:text-embedding-3-small` (requires `OPENAI_API_KEY`).
 Local fallback uses existing `tasks/research_infra.py` chunking utilities.
+
+## Task #10: Software Project Creation Suite
+
+`tasks/project_generation_orchestrator.py` — Standalone `ProjectGenerationOrchestrator` class.
+
+### New capabilities
+- **`ProjectGenerationOrchestrator`** — Runs the full multi-agent pipeline locally without requiring the gateway:
+  1. Blueprint generation (LLM → JSON architecture plan)
+  2. Interactive blueprint approval gate (skipped with `--auto-approve`)
+  3. Scaffold (directory structure, .gitignore, .env.example, docker-compose, frontend starters)
+  4. Code generation per module (priority-ordered, LLM writes each file)
+  5. Devops files (Dockerfile multi-stage, compose)
+  6. Error-fix loop (verifier runs check command → LLM patches failing files × max 3 iterations)
+  7. Test writer (pytest / vitest / jest / flutter_test based on stack)
+  8. README writer
+  9. GitHub push (optional, requires GITHUB_TOKEN)
+
+### New stack templates
+- **`plugin_templates/project_stacks/react_vite.py`** — React + Vite + TypeScript + Tailwind
+- **`plugin_templates/project_stacks/flutter.py`** — Flutter (Mobile + Web / Dart)
+
+### Total stacks available (11)
+`custom_freeform`, `django_react_postgres`, `express_prisma_postgres`, `fastapi_postgres`, `fastapi_react_postgres`, `flutter`, `mern_microservices_mongodb`, `nextjs_prisma_postgres`, `nextjs_static_site`, `pern_postgres`, `react_vite`
+
+### Stack aliases (short names)
+`nextjs` → `nextjs_prisma_postgres`, `react-vite` → `react_vite`, `fastapi` → `fastapi_postgres`, `express` → `express_prisma_postgres`, `django` → `django_react_postgres`, `flutter` → `flutter`, `mern` → `mern_microservices_mongodb`, `pern` → `pern_postgres`, `static` → `nextjs_static_site`, `custom` → `custom_freeform`
+
+### CLI additions to `kendr generate`
+- `--stack nextjs` / `--stack react-vite` / `--stack flutter` — short alias support
+- `--github-repo owner/repo` — push generated project to GitHub after completion
+- `--standalone` — run `ProjectGenerationOrchestrator` directly (no gateway required)
+- **Automatic fallback**: if the gateway is not running, `kendr generate` automatically falls back to the standalone orchestrator
+
+### Usage examples
+```bash
+kendr generate --stack nextjs "Build a job board where employers post jobs and candidates apply" --auto-approve
+kendr generate --stack react-vite "A todo app with auth" --github-repo my-org/todo-app
+kendr generate --stack flutter "A mobile weather app" --standalone --skip-devops
+kendr generate --stack fastapi "A REST API for inventory management" --output /tmp/inventory-api
+```

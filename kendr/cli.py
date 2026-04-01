@@ -2071,10 +2071,11 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         "--stack",
         default="",
         help=(
-            "Optional tech stack template to use. "
-            "Available: fastapi_postgres, fastapi_react_postgres, nextjs_prisma_postgres, "
-            "express_prisma_postgres, mern_microservices_mongodb, pern_postgres, nextjs_static_site, "
-            "django_react_postgres, custom_freeform. "
+            "Tech stack template to use. "
+            "Short aliases: nextjs, react-vite, fastapi, express, django, flutter, mern, pern. "
+            "Full names: nextjs_prisma_postgres, react_vite, fastapi_postgres, fastapi_react_postgres, "
+            "express_prisma_postgres, django_react_postgres, mern_microservices_mongodb, pern_postgres, "
+            "nextjs_static_site, flutter, custom_freeform. "
             "Leave blank for LLM-driven stack selection."
         ),
     )
@@ -2118,6 +2119,17 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         "--current-folder",
         action="store_true",
         help="Use current terminal folder as working directory.",
+    )
+    generate_parser.add_argument(
+        "--github-repo",
+        default="",
+        metavar="OWNER/REPO",
+        help="Push the generated project to a GitHub repository (e.g. my-org/job-board). Requires GITHUB_TOKEN.",
+    )
+    generate_parser.add_argument(
+        "--standalone",
+        action="store_true",
+        help="Run the project generation pipeline locally without requiring the gateway.",
     )
     generate_parser.add_argument("--json", action="store_true", help="Emit final state as JSON.")
     generate_parser.add_argument("--quiet", action="store_true", help="Suppress live progress messages.")
@@ -2288,6 +2300,62 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     return parser, command_parsers
 
 
+def _cmd_generate_standalone(
+    args: argparse.Namespace,
+    description: str = "",
+    project_name: str = "",
+    project_stack: str = "",
+    project_root: str = "",
+    github_repo: str = "",
+) -> int:
+    style = _cli_style(None)
+
+    def _progress(msg: str) -> None:
+        if not bool(getattr(args, "quiet", False)):
+            print(msg, flush=True)
+
+    try:
+        from tasks.project_generation_orchestrator import ProjectGenerationOrchestrator
+    except ImportError as exc:
+        print(style.fail(f"Cannot import orchestrator: {exc}"))
+        return 1
+
+    orch = ProjectGenerationOrchestrator(
+        description=description,
+        stack=project_stack,
+        project_root=project_root,
+        project_name=project_name,
+        auto_approve=bool(getattr(args, "auto_approve", False)),
+        skip_tests=bool(getattr(args, "skip_tests", False)),
+        skip_devops=bool(getattr(args, "skip_devops", False)),
+        max_fix_iters=3,
+        github_repo=github_repo,
+        progress_cb=_progress,
+    )
+
+    result = orch.run()
+
+    if bool(getattr(args, "json", False)):
+        print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        return 0 if result.get("ok") else 1
+
+    if result.get("ok"):
+        print(style.ok(f"\n✓ Project generated at: {result['project_root']}"))
+        print(style.muted(f"  Files created: {len(result.get('files_created', []))}"))
+        if result.get("github_url"):
+            print(style.ok(f"  GitHub: {result['github_url']}"))
+        errors = result.get("errors", [])
+        if errors:
+            print(style.warn(f"  Warnings: {len(errors)}"))
+            for err in errors[:3]:
+                print(style.muted(f"    - {err[:120]}"))
+        return 0
+
+    errors = result.get("errors", [])
+    print(style.fail(f"Generation failed: {errors[0] if errors else 'unknown error'}"))
+    return 1
+
+
 def _cmd_generate(args: argparse.Namespace) -> int:
     description = " ".join(args.description).strip()
     if not description:
@@ -2299,6 +2367,12 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     style = _cli_style(None)
     project_name = str(args.name or "").strip()
     project_stack = str(args.stack or "").strip()
+    github_repo = str(getattr(args, "github_repo", "") or "").strip()
+    standalone_mode = bool(getattr(args, "standalone", False))
+
+    if project_stack:
+        from tasks.project_generation_orchestrator import resolve_stack_name
+        project_stack = resolve_stack_name(project_stack)
 
     if bool(args.current_folder):
         configured_working_dir = str(Path.cwd())
@@ -2323,6 +2397,15 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         _emit_status(args, f"[generate] project name: {project_name}")
     if project_stack:
         _emit_status(args, f"[generate] stack template: {project_stack}")
+    if github_repo:
+        _emit_status(args, f"[generate] github repo: {github_repo}")
+
+    if standalone_mode or not _gateway_ready():
+        if not standalone_mode:
+            _emit_status(args, "[generate] gateway not running — using standalone orchestrator")
+        return _cmd_generate_standalone(args, description=description, project_name=project_name,
+                                        project_stack=project_stack, project_root=project_root,
+                                        github_repo=github_repo)
 
     query = description
     base_ingest_payload: dict = {
@@ -2336,6 +2419,8 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         base_ingest_payload["project_name"] = project_name
     if project_stack:
         base_ingest_payload["project_stack"] = project_stack
+    if github_repo:
+        base_ingest_payload["github_repo"] = github_repo
     if bool(args.auto_approve):
         base_ingest_payload["auto_approve"] = True
         base_ingest_payload["auto_approve_plan"] = True
