@@ -270,28 +270,36 @@ class ProjectGenerationOrchestrator:
             else:
                 self._log("[5/8] devops generation skipped")
 
-            self._log("[6/8] running error-fix loop (up to 3 iterations)…")
+            self._log("[6/9] running error-fix loop (up to 3 iterations)…")
             fix_report = self._step_error_fix_loop()
             if fix_report.get("errors"):
                 result["errors"].extend(fix_report["errors"])
             fix_ok = fix_report.get("ok", True)
-            self._log(f"[6/8] error-fix loop done: {fix_report.get('iterations', 0)} iterations, {'pass' if fix_ok else 'some errors remain'}")
+            self._log(f"[6/9] error-fix loop done: {fix_report.get('iterations', 0)} iterations, {'pass' if fix_ok else 'some errors remain'}")
             if not fix_ok:
                 result["ok"] = False  # explicitly mark failure; cannot be reset to True below
 
+            self._log("[7/9] runtime smoke test…")
+            smoke_errs = self._step_smoke_test()
+            if smoke_errs:
+                result["errors"].extend(smoke_errs)
+                self._log(f"[7/9] smoke test found {len(smoke_errs)} issue(s) — patched")
+            else:
+                self._log("[7/9] smoke test passed")
+
             if not self.skip_tests:
-                self._log("[7/8] generating tests…")
+                self._log("[8/9] generating tests…")
                 test_files = self._step_generate_tests()
                 result["files_created"].extend(test_files)
-                self._log(f"[7/8] tests written: {len(test_files)} files")
+                self._log(f"[8/9] tests written: {len(test_files)} files")
             else:
-                self._log("[7/8] test generation skipped")
+                self._log("[8/9] test generation skipped")
 
-            self._log("[8/8] writing README…")
+            self._log("[9/9] writing README…")
             readme_written = self._step_readme()
             if readme_written:
                 result["files_created"].append(str(self.project_root / "README.md"))
-            self._log("[8/8] README written")
+            self._log("[9/9] README written")
 
             if self.github_repo:
                 self._log(f"[github] pushing to {self.github_repo}…")
@@ -451,11 +459,34 @@ Rules:
             data.setdefault("tech_stack", {})
             for k, v in self._stack_template.get("tech_stack", {}).items():
                 data["tech_stack"].setdefault(k, v)
+
             for dep_key in ("runtime", "dev"):
                 base_deps = self._stack_template.get("base_dependencies", {}).get(dep_key, [])
                 existing = data.get("dependencies", {}).get(dep_key, [])
                 merged = list({d: None for d in (base_deps + existing)})
                 data.setdefault("dependencies", {})[dep_key] = merged
+
+            base_dirs = self._stack_template.get("base_directory_structure", [])
+            if base_dirs:
+                existing_dirs = set(data.get("directory_structure", []))
+                for d in base_dirs:
+                    if d not in existing_dirs:
+                        data.setdefault("directory_structure", []).append(d)
+
+            base_env_vars = self._stack_template.get("base_env_vars", [])
+            if base_env_vars:
+                existing_names = {e.get("name") for e in data.get("env_vars", [])}
+                for ev in base_env_vars:
+                    if ev.get("name") not in existing_names:
+                        data.setdefault("env_vars", []).append(ev)
+
+            base_docker = self._stack_template.get("base_docker_services", [])
+            if base_docker:
+                existing_svc_names = {s.get("name") for s in data.get("docker_services", [])}
+                for svc in base_docker:
+                    if svc.get("name") not in existing_svc_names:
+                        data.setdefault("docker_services", []).append(svc)
+
         return data
 
     def _step_blueprint_approval(self, blueprint: dict) -> dict:
@@ -823,6 +854,111 @@ Return ONLY the Dockerfile content, no explanation, no markdown fences.
             written.append(str(compose_path))
 
         return written
+
+    def _step_smoke_test(self) -> list[str]:
+        """Per-stack runtime smoke test.
+
+        Launches the start command for at most `_SMOKE_TIMEOUT` seconds.
+        If the process exits immediately with a non-zero code, the stderr is
+        treated as a real runtime error and the LLM is asked to patch it.
+
+        Long-running servers that survive the timeout are considered healthy.
+        Errors are returned as a list of strings (empty = all clear).
+        """
+        _SMOKE_TIMEOUT = 5
+
+        tech = self._blueprint.get("tech_stack", {})
+        lang = str(tech.get("language", "")).lower()
+        fw = str(tech.get("framework", "")).lower()
+        pm = str(tech.get("package_manager", "npm")).lower()
+        root = str(self.project_root)
+
+        if lang == "dart" or fw == "flutter":
+            return []
+
+        smoke_cmd: list[str] | None = None
+        if "python" in lang:
+            for candidate in ["app/main.py", "main.py"]:
+                if (self.project_root / candidate).exists():
+                    smoke_cmd = ["python", "-c", f"import importlib.util; spec=importlib.util.spec_from_file_location('main','{self.project_root / candidate}'); mod=importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)"]
+                    break
+        elif (self.project_root / "package.json").exists():
+            try:
+                pkg = json.loads((self.project_root / "package.json").read_text(encoding="utf-8"))
+                scripts = pkg.get("scripts", {})
+                if "start" in scripts:
+                    smoke_cmd = [pm, "run", "start"]
+                elif "dev" in scripts:
+                    smoke_cmd = [pm, "run", "dev"]
+            except Exception:
+                pass
+
+        if not smoke_cmd:
+            return []
+
+        try:
+            proc = subprocess.Popen(
+                smoke_cmd,
+                cwd=root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                stdout_data, stderr_data = proc.communicate(timeout=_SMOKE_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                return []
+
+            if proc.returncode == 0:
+                return []
+
+            crash_output = (stderr_data + "\n" + stdout_data).strip()[:2000]
+            if not crash_output:
+                return []
+
+            self._log(f"  [smoke] crash detected (rc={proc.returncode}): {crash_output[:300]}", event_type="run_output",
+                      extra={"command": " ".join(smoke_cmd), "ok": False, "stderr": stderr_data[:400]})
+
+            fix_prompt = f"""
+The following project crashed immediately on startup. Fix it.
+
+Project: {self._blueprint.get("project_name", self.project_name)}
+Tech stack: {json.dumps(tech, indent=2)}
+Start command: {' '.join(smoke_cmd)}
+
+Crash output:
+{crash_output}
+
+Return a JSON array of file patches to fix the crash:
+[{{"file": "relative/path/file.ext", "content": "full corrected content"}}]
+Return ONLY valid JSON, no explanation, no markdown fences.
+""".strip()
+            try:
+                raw = _llm_call(fix_prompt)
+                patches = json.loads(_strip_json_fences(raw))
+                if isinstance(patches, list):
+                    for patch in patches:
+                        file_rel = patch.get("file", "")
+                        content = patch.get("content", "")
+                        if not file_rel or not content:
+                            continue
+                        target = self._safe_path(file_rel)
+                        if target is None:
+                            self._log(f"  [smoke] rejected path-traversal patch: {file_rel}")
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_text(content + "\n", encoding="utf-8")
+                        self._log(f"  [smoke] patched: {file_rel}", event_type="patch_applied",
+                                  extra={"file": file_rel, "stage": "smoke_test"})
+            except Exception as exc:
+                self._log(f"  [smoke] patch error: {exc}")
+
+            return [f"Startup crash (rc={proc.returncode}): {crash_output[:300]}"]
+        except Exception as exc:
+            self._log(f"  [smoke] error: {exc}")
+            return []
 
     def _detect_run_command(self) -> tuple[list[str] | None, str]:
         """Return (command, cwd) or (None, error_message|"").
