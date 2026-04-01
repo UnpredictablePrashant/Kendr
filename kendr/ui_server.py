@@ -555,6 +555,7 @@ let isRunning = false;
 let gatewayOnline = false;
 let workingDir = '';
 let activeEvtSource = null;
+let _loadRunToken = 0;
 
 async function checkGateway() {
   try {
@@ -604,6 +605,7 @@ async function loadRun(runId) {
   isRunning = false;
   document.getElementById('sendBtn').disabled = false;
   currentRunId = runId;
+  const myToken = ++_loadRunToken;
   loadRuns();
 
   const msgs = document.getElementById('messages');
@@ -612,6 +614,7 @@ async function loadRun(runId) {
   try {
     const r = await fetch(API + '/api/runs/' + runId);
     const d = await r.json();
+    if (_loadRunToken !== myToken) return;
     const query = d.user_query || d.query || d.text || '';
     const output = d.final_output || d.output || d.draft_response || '';
     const status = (d.status || 'completed').toLowerCase();
@@ -681,6 +684,7 @@ function esc(s) {
 }
 
 function newChat() {
+  _loadRunToken++;
   currentRunId = null;
   if (activeEvtSource) { activeEvtSource.close(); activeEvtSource = null; }
   stopPlanPolling();
@@ -694,9 +698,11 @@ function newChat() {
 
 function clearChat() {
   const msgs = document.getElementById('messages');
-  const hasMessages = msgs.querySelectorAll('.message-row').length > 0;
-  if (!hasMessages) return;
+  const welcome = document.getElementById('welcome');
+  const alreadyClear = welcome && msgs.contains(welcome) && msgs.children.length === 1;
+  if (alreadyClear) return;
   if (!confirm('Clear this chat? All messages in this view will be removed.')) return;
+  _loadRunToken++;
   if (activeEvtSource) { activeEvtSource.close(); activeEvtSource = null; }
   stopPlanPolling();
   isRunning = false;
