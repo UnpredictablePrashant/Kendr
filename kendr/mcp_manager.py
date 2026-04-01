@@ -233,7 +233,7 @@ if __name__ == "__main__":
     # Starts an HTTP server on http://localhost:8000/mcp
     # Change host/port via env: MCP_HOST, MCP_PORT
     import os
-    host = os.getenv("MCP_HOST", "0.0.0.0")
+    host = os.getenv("MCP_HOST", "127.0.0.1")
     port = int(os.getenv("MCP_PORT", "8000"))
     mcp.run(transport="sse", host=host, port=port)
 '''

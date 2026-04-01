@@ -84,13 +84,13 @@ def _maybe_migrate(db_path: str = DB_PATH) -> None:
                         ),
                     )
         _log.info("MCP registry migrated from JSON (%d servers)", len(servers))
+        try:
+            os.makedirs(os.path.dirname(_MIGRATED_FLAG), exist_ok=True)
+            open(_MIGRATED_FLAG, "w").close()
+        except Exception:
+            pass
     except Exception as exc:
-        _log.warning("MCP JSON migration failed (non-fatal): %s", exc)
-    try:
-        os.makedirs(os.path.dirname(_MIGRATED_FLAG), exist_ok=True)
-        open(_MIGRATED_FLAG, "w").close()
-    except Exception:
-        pass
+        _log.warning("MCP JSON migration failed (will retry next run): %s", exc)
 
 
 def list_mcp_servers(db_path: str = DB_PATH) -> list[dict]:
