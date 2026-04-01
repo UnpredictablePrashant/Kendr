@@ -70,7 +70,15 @@ logs/
 *.db-journal
 *.db-wal
 *.db-shm
-*replit*
+
+# Replit platform files (never commit these)
+.replit
+replit.md
+replit.nix
+*.nix
+.local/
+.upm/
+.config/
 
 # Generated agents and plugin state
 tasks/generated_agents/manifest.json
