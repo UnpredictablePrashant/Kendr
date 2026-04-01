@@ -893,7 +893,12 @@ async function loadRuns() {
       list.innerHTML = '<div style="padding:12px 10px;font-size:12px;color:var(--muted)">No runs yet. Start a chat to begin.</div>';
       return;
     }
-    (runs || []).slice(0, 30).forEach(run => {
+    const chatRuns = (runs || []).filter(r => !(r.session_id || '').includes('project_ui'));
+    if (!chatRuns.length) {
+      list.innerHTML = '<div style="padding:12px 10px;font-size:12px;color:var(--muted)">No chat history yet.</div>';
+      return;
+    }
+    chatRuns.slice(0, 30).forEach(run => {
       const div = document.createElement('div');
       const status = (run.status || 'completed').toLowerCase();
       const isActive = run.run_id === currentRunId;
@@ -2123,11 +2128,19 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
   <div class="tab-panels">
 
     <!-- Chat tab -->
-    <div class="tab-panel active" id="panel-chat">
-      <div class="chat-messages" id="chatMessages">
+    <div class="tab-panel active" id="panel-chat" style="display:flex;flex-direction:column;overflow:hidden">
+      <!-- Recent chats history bar -->
+      <div id="projChatHistory" style="display:none;border-bottom:1px solid var(--border);flex-shrink:0">
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 14px;cursor:pointer;user-select:none" onclick="toggleChatHistory()">
+          <span style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.05em">&#x1F4DC; Recent Chats</span>
+          <span id="chatHistoryToggle" style="font-size:10px;color:var(--muted)">&#x25BC;</span>
+        </div>
+        <div id="projChatHistoryList" style="max-height:160px;overflow-y:auto;padding:0 8px 6px"></div>
+      </div>
+      <div class="chat-messages" id="chatMessages" style="flex:1;overflow-y:auto">
         <div class="msg-row system"><div class="msg-bubble">Open a project, then ask me anything about it — review code, explain files, find bugs, add features.</div></div>
       </div>
-      <div class="chat-input-bar">
+      <div class="chat-input-bar" style="flex-shrink:0">
         <textarea class="chat-input" id="chatInput" rows="1" placeholder="Ask about your project..." onkeydown="chatKeydown(event)"></textarea>
         <button class="send-btn" id="sendBtn" onclick="sendChat()">&#x27A4;</button>
       </div>
@@ -2339,6 +2352,105 @@ async function openProject(id, path, name) {
     gitBadge.style.display = '';
   } else {
     gitBadge.style.display = 'none';
+  }
+  loadProjectRuns();
+}
+
+let _projHistoryOpen = true;
+function toggleChatHistory() {
+  _projHistoryOpen = !_projHistoryOpen;
+  document.getElementById('projChatHistoryList').style.display = _projHistoryOpen ? '' : 'none';
+  document.getElementById('chatHistoryToggle').textContent = _projHistoryOpen ? '\u25BC' : '\u25B6';
+}
+
+async function loadProjectRuns() {
+  const historyBar = document.getElementById('projChatHistory');
+  const listEl = document.getElementById('projChatHistoryList');
+  if (!_activeProjectPath) { historyBar.style.display = 'none'; return; }
+  try {
+    const r = await fetch(API + '/api/runs');
+    if (!r.ok) return;
+    const runs = await r.json();
+    const projRuns = (runs || []).filter(run => {
+      const wd = run.working_directory || '';
+      const sid = run.session_id || '';
+      return wd === _activeProjectPath || sid.includes('project_ui');
+    });
+    if (!projRuns.length) { historyBar.style.display = 'none'; return; }
+    historyBar.style.display = '';
+    listEl.innerHTML = '';
+    projRuns.slice(0, 20).forEach(run => {
+      const status = (run.status || 'completed').toLowerCase();
+      const isRunning = status === 'running' || status === 'started';
+      const rawText = run.user_query || run.query || '';
+      const cleanText = rawText.replace(/^\[Project:[^\]]*\]\s*/i, '').trim();
+      const title = cleanText.split('\n')[0].substring(0, 80) || 'Untitled';
+      const ts = _relTime(run.started_at || run.updated_at || '');
+      const dotColor = isRunning ? 'var(--teal)' : status === 'failed' ? '#ef4444' : '#6b7280';
+      const dot = isRunning
+        ? '<span class="spinner" style="width:8px;height:8px;display:inline-block;flex-shrink:0"></span>'
+        : '<span style="width:7px;height:7px;border-radius:50%;display:inline-block;flex-shrink:0;background:' + dotColor + '"></span>';
+      const item = document.createElement('div');
+      item.style.cssText = 'display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;cursor:pointer;font-size:12px;color:#ccc;transition:background 0.15s';
+      item.innerHTML = dot + '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(title) + '</span><span style="font-size:10px;color:var(--muted);flex-shrink:0">' + ts + '</span>';
+      item.onmouseenter = () => item.style.background = 'rgba(255,255,255,0.05)';
+      item.onmouseleave = () => item.style.background = '';
+      item.onclick = () => loadProjectRun(run.run_id);
+      listEl.appendChild(item);
+    });
+  } catch(e) { historyBar.style.display = 'none'; }
+}
+
+function _relTime(iso) {
+  if (!iso) return '';
+  try {
+    const diff = Date.now() - new Date(iso).getTime();
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return 'just now';
+    if (m < 60) return m + 'm ago';
+    const h = Math.floor(m / 60);
+    if (h < 24) return h + 'h ago';
+    return Math.floor(h / 24) + 'd ago';
+  } catch(_) { return ''; }
+}
+
+async function loadProjectRun(runId) {
+  const box = document.getElementById('chatMessages');
+  box.innerHTML = '<div class="msg-row system"><div class="msg-bubble"><span class="spinner"></span> Loading...</div></div>';
+  try {
+    const r = await fetch(API + '/api/runs/' + encodeURIComponent(runId));
+    if (!r.ok) { box.innerHTML = '<div class="msg-row system"><div class="msg-bubble" style="color:var(--crimson)">Failed to load run.</div></div>'; return; }
+    const d = await r.json();
+    box.innerHTML = '';
+    const rawQuery = d.user_query || d.query || '';
+    const cleanQuery = rawQuery.replace(/^\[Project:[^\]]*\]\s*/i, '').trim();
+    const output = d.final_output || d.output || d.draft_response || '';
+    const status = (d.status || 'completed').toLowerCase();
+    if (cleanQuery) {
+      const urow = document.createElement('div');
+      urow.className = 'msg-row user';
+      urow.innerHTML = '<div class="msg-bubble"><div style="white-space:pre-wrap">' + esc(cleanQuery) + '</div></div>';
+      box.appendChild(urow);
+    }
+    if (output) {
+      const arow = document.createElement('div');
+      arow.className = 'msg-row agent';
+      arow.innerHTML = '<div class="msg-bubble">' + esc(output).replace(/\n/g, '<br>') + '</div>';
+      box.appendChild(arow);
+    }
+    const meta = document.createElement('div');
+    const statusColor = status === 'completed' ? 'var(--teal)' : status === 'failed' ? 'var(--crimson)' : 'var(--muted)';
+    meta.style.cssText = 'padding:6px 14px;font-size:10px;color:var(--muted);display:flex;gap:8px;align-items:center';
+    meta.innerHTML = '<span style="color:' + statusColor + ';font-weight:600">' + esc(status) + '</span>'
+      + (d.started_at ? '<span>' + new Date(d.started_at).toLocaleString() + '</span>' : '')
+      + '<span style="font-family:monospace;opacity:0.5">' + esc(runId) + '</span>';
+    box.appendChild(meta);
+    box.scrollTop = box.scrollHeight;
+    if (!cleanQuery && !output) {
+      box.innerHTML = '<div class="msg-row system"><div class="msg-bubble" style="color:var(--muted)">No content for this run.</div></div>';
+    }
+  } catch(e) {
+    box.innerHTML = '<div class="msg-row system"><div class="msg-bubble" style="color:var(--crimson)">Error: ' + esc(String(e)) + '</div></div>';
   }
 }
 
