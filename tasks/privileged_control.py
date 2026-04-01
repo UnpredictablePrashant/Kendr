@@ -49,14 +49,57 @@ _MUTATING_COMMAND_HINTS = [
     "sed -i",
     "tee ",
     "apt-get install",
+    "apt install",
+    "apt-get update",
+    "apt-get upgrade",
     "yum install",
     "dnf install",
     "pip install",
+    "pip3 install",
     "npm install",
+    "npm i ",
+    "yarn add",
+    "pnpm add",
+    "brew install",
+    "brew update",
+    "brew upgrade",
     "choco install",
     "winget install",
+    "scoop install",
+    "cargo install",
+    "go install",
+    "pipx install",
+    "conda install",
+    "snap install",
+    "flatpak install",
+    "gem install",
+    "composer require",
+    "docker pull",
+    "docker run",
+    "docker build",
+    "docker-compose up",
+    "docker compose up",
+    "ollama pull",
+    "ollama run",
+    "ollama serve",
+    "systemctl start",
+    "systemctl stop",
+    "systemctl enable",
+    "systemctl restart",
+    "service start",
+    "service stop",
+    "service restart",
     "git commit",
     "git push",
+    "git clone",
+    "git pull",
+    "chmod ",
+    "chown ",
+    "ln -s",
+    "ln -f",
+    "echo ",
+    "cat >",
+    "write_file",
 ]
 
 
@@ -92,10 +135,22 @@ def build_privileged_policy(state: dict) -> dict:
         except Exception:
             continue
 
+    auto_approve = _truthy(
+        state.get("shell_auto_approve")
+        or state.get("privileged_auto_approve")
+        or os.getenv("KENDR_AUTO_APPROVE_COMMANDS", False)
+    )
+
+    approved = _truthy(state.get("privileged_approved", False)) or auto_approve
+    approval_note = str(state.get("privileged_approval_note", "")).strip()
+    if auto_approve and not approval_note:
+        approval_note = "Auto-approved via shell automation mode"
+
     policy = {
         "privileged_mode": _truthy(state.get("privileged_mode", os.getenv("KENDR_PRIVILEGED_MODE", False))),
-        "approved": _truthy(state.get("privileged_approved", False)),
-        "approval_note": str(state.get("privileged_approval_note", "")).strip(),
+        "approved": approved,
+        "approval_note": approval_note,
+        "auto_approve": auto_approve,
         "require_approvals": _truthy(state.get("privileged_require_approvals", os.getenv("KENDR_REQUIRE_APPROVALS", True))),
         "read_only": _truthy(state.get("privileged_read_only", os.getenv("KENDR_READ_ONLY_MODE", False))),
         "allow_root": _truthy(state.get("privileged_allow_root", os.getenv("KENDR_ALLOW_ROOT", False))),
@@ -163,20 +218,37 @@ def redact_sensitive_text(text: str) -> str:
 
 def ensure_command_allowed(command: str, working_directory: str, policy: dict) -> None:
     classification = classify_command(command)
+    auto_approve = policy.get("auto_approve", False)
+
     if policy.get("require_approvals", True):
-        if not policy.get("approved", False) or not policy.get("approval_note", ""):
-            raise PermissionError("Privileged action requires explicit approval and non-empty privileged_approval_note.")
+        if auto_approve:
+            if not policy.get("approval_note", ""):
+                raise PermissionError("Shell automation mode active but approval_note is missing.")
+        else:
+            if not policy.get("approved", False) or not policy.get("approval_note", ""):
+                raise PermissionError(
+                    "Shell execution requires explicit approval. "
+                    "Enable Shell Automation mode in the chat header, or pass "
+                    "privileged_approved=True and a privileged_approval_note."
+                )
+
     if policy.get("read_only", False) and classification["mutating"]:
-        raise PermissionError("Read-only privileged mode blocks mutating commands.")
+        raise PermissionError("Read-only mode is active — mutating commands are blocked.")
     if classification["root_requested"] and not policy.get("allow_root", False):
-        raise PermissionError("Command requests root escalation but privileged_allow_root is false.")
+        raise PermissionError(
+            "Command requests root (sudo) escalation but allow_root is false. "
+            "Set KENDR_ALLOW_ROOT=true or privileged_allow_root=true to enable."
+        )
     if classification["destructive"] and not policy.get("allow_destructive", False):
-        raise PermissionError("Destructive command blocked: privileged_allow_destructive is false.")
+        raise PermissionError(
+            "Destructive command detected and blocked. "
+            "Set KENDR_ALLOW_DESTRUCTIVE=true or privileged_allow_destructive=true to enable."
+        )
     if not path_allowed(working_directory, policy.get("allowed_paths", [])):
-        raise PermissionError("Working directory is outside privileged allowed path scope.")
+        raise PermissionError("Working directory is outside the allowed path scope.")
     for ref in extract_path_references(command):
         if not path_allowed(ref, policy.get("allowed_paths", [])):
-            raise PermissionError(f"Command references path outside allowed scope: {ref}")
+            raise PermissionError(f"Command references a path outside the allowed scope: {ref}")
 
 
 def create_backup_snapshot(state: dict, *, source_dir: str, reason: str) -> str:

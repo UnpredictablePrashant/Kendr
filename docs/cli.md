@@ -757,3 +757,92 @@ Running this command without a URL prints setup instructions:
 ```bash
 kendr mcp zapier
 ```
+
+---
+
+## Shell Automation
+
+Kendr's shell automation lets agents install tools, run multi-step OS commands, and execute complex workflows directly on your machine — all from the chat UI or CLI.
+
+### How it works
+
+When shell automation is active, the OS agent (`os_agent`) and the shell plan agent (`shell_plan_agent`) are authorised to:
+
+- Run arbitrary shell commands (`bash`, `sh`, POSIX-compatible)
+- Install packages with `apt`, `brew`, `pip`, `npm`, `cargo`, `go install`, `pipx`, etc.
+- Start and manage services with `docker`, `docker compose`, `systemctl`, `ollama`, `nginx`, etc.
+- Clone repos, pull updates, and run build pipelines with `git`, `make`, `cmake`, etc.
+
+For multi-step goals (e.g. "install Docker, pull an image, and run a container"), Kendr uses `shell_plan_agent` which:
+
+1. Decomposes the goal into ordered steps via LLM
+2. For each step, runs an optional check command first — if the check passes, the step is skipped (idempotent)
+3. Executes the command and captures stdout/stderr
+4. Reports per-step status: ✓ done / skipped / blocked / error
+
+### Enabling Shell Automation in the Chat UI
+
+Click the **💻 Shell** button in the chat header. When it turns amber the mode is active.  
+A warning banner appears below the input box as a reminder that agents may run commands on your machine.
+
+To disable, click the button again.
+
+### Enabling Shell Automation via CLI
+
+Pass `--privileged-approved` together with a note to any `kendr run` invocation:
+
+```bash
+kendr run "Install nginx, configure it, and start it" \
+  --privileged-approved \
+  --privileged-approval-note "Approved by me for nginx setup"
+```
+
+Or use the environment variable to auto-approve for all shell commands in a session:
+
+```bash
+export KENDR_AUTO_APPROVE_COMMANDS=true
+kendr run "Set up a Python venv and install fastapi uvicorn"
+```
+
+### Policy and safety
+
+Shell automation follows kendr's **privileged control** policy:
+
+| Situation | Behaviour |
+|---|---|
+| Non-destructive command, auto-approve ON | Runs automatically |
+| Destructive command (rm -rf, DROP TABLE, etc.) | Always prompts — never auto-approved |
+| `sudo` or root-requiring command | Blocked unless `--privileged-allow-root` is set |
+| Path outside working directory | Blocked unless `--privileged-allowed-paths` includes it |
+
+To allow destructive commands explicitly:
+
+```bash
+kendr run "Clean build artefacts" \
+  --privileged-approved \
+  --privileged-approval-note "Safe to delete build/" \
+  --privileged-allow-destructive
+```
+
+### Terminal output rendering
+
+Shell automation results in the Chat UI are rendered in a dark terminal style with colour-coded lines:
+
+- **Green** — command being run
+- **Blue-grey** — standard output
+- **Red** — errors / stderr
+- **Amber** — blocked commands
+- **Muted** — skipped steps
+
+### Example goals
+
+```bash
+# Install and start Ollama with llama3
+kendr run "Install ollama, pull llama3, and start the server" --privileged-approved --privileged-approval-note "Local dev setup"
+
+# Dockerise a project
+kendr run "Write a Dockerfile for this Python project and build it" --privileged-approved --privileged-approval-note "Build image"
+
+# Set up nginx reverse proxy
+kendr run "Install nginx and configure it to proxy port 3000 on /app" --privileged-approved --privileged-approval-note "Dev proxy"
+```

@@ -393,6 +393,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "superrag_top_k",
             "superrag_chunk_size",
             "superrag_chunk_overlap",
+            "shell_auto_approve",
         ]
         for key in passthrough_keys:
             if key in payload:

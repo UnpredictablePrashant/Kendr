@@ -526,6 +526,30 @@ a:hover { text-decoration: underline; }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--crimson); }
 .status-dot.online { background: var(--teal); animation: pulse 2s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+/* Shell Mode toggle */
+.shell-mode-btn { display: flex; align-items: center; gap: 5px; padding: 5px 12px; border-radius: 8px; border: 1px solid var(--border); background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; transition: all 0.2s; font-weight: 500; }
+.shell-mode-btn:hover { border-color: var(--amber); color: var(--amber); background: rgba(255,179,71,0.08); }
+.shell-mode-btn.active { border-color: var(--amber); color: #0d0f14; background: var(--amber); font-weight: 700; }
+.shell-mode-btn.active .shell-mode-icon { filter: none; }
+/* Terminal output block */
+.terminal-block { font-family: "Cascadia Code", "Fira Code", "SF Mono", Consolas, monospace; font-size: 12px; background: #0a0c0f; border: 1px solid #2a3140; border-radius: 8px; overflow: hidden; margin: 10px 0; }
+.terminal-header { display: flex; align-items: center; gap: 8px; padding: 7px 14px; background: #111418; border-bottom: 1px solid #1e2530; }
+.terminal-dot { width: 10px; height: 10px; border-radius: 50%; }
+.terminal-title { font-size: 11px; color: #7d8590; flex: 1; margin-left: 4px; }
+.terminal-body { padding: 12px 16px; overflow-x: auto; max-height: 500px; overflow-y: auto; }
+.terminal-line { line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.terminal-line.cmd { color: #00C9A7; }
+.terminal-line.cmd::before { content: "$ "; opacity: 0.6; }
+.terminal-line.out { color: #b5c4de; }
+.terminal-line.err { color: #FF4757; }
+.terminal-line.ok { color: #00C9A7; }
+.terminal-line.skip { color: #7d8590; font-style: italic; }
+.terminal-line.blocked { color: #FFB347; }
+.terminal-step { margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid #1e2530; }
+.terminal-step:last-child { margin-bottom: 0; padding-bottom: 0; border-bottom: none; }
+.terminal-step-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 12px; font-weight: 600; }
+.shell-mode-banner { display: none; background: rgba(255,179,71,0.08); border: 1px solid rgba(255,179,71,0.25); border-radius: 8px; padding: 8px 14px; margin: 8px 0 0; font-size: 12px; color: var(--amber); }
+.shell-mode-banner.visible { display: flex; align-items: center; gap: 8px; }
 .messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; scroll-behavior: smooth; }
 .message-row { display: flex; gap: 12px; max-width: 900px; }
 .message-row.user { flex-direction: row-reverse; margin-left: auto; }
@@ -661,6 +685,9 @@ a:hover { text-decoration: underline; }
       <div class="chat-subtitle">Powered by kendr multi-agent runtime</div>
     </div>
     <div class="header-status">
+      <button id="shellModeBtn" class="shell-mode-btn" onclick="toggleShellMode()" title="Enable shell automation — lets agents install tools, run commands, and execute multi-step workflows">
+        <span class="shell-mode-icon">&#x1F4BB;</span> Shell
+      </button>
       <button class="clear-chat-btn" id="clearChatBtn" onclick="deleteChat()" title="Delete this chat and all its data" style="display:none">&#x1F5D1; Delete</button>
       <div class="status-dot" id="gatewayDot"></div>
       <span id="gatewayStatus">Checking gateway...</span>
@@ -687,6 +714,7 @@ a:hover { text-decoration: underline; }
       <button class="send-btn" id="sendBtn" onclick="sendMessage()" title="Send (Enter)">&#x27A4;</button>
     </div>
     <div class="input-hint">Enter to send &#xB7; Shift+Enter for new line &#xB7; Gateway auto-starts if not running</div>
+    <div class="shell-mode-banner" id="shellModeBanner">&#x26A0;&#xFE0F; Shell Automation is ON &#x2014; agents may install tools and run commands on this machine</div>
   </div>
 </div>
 <script>
@@ -698,6 +726,79 @@ let gatewayOnline = false;
 let workingDir = '';
 let activeEvtSource = null;
 let _loadRunToken = 0;
+let shellModeActive = false;
+
+function toggleShellMode() {
+  shellModeActive = !shellModeActive;
+  const btn = document.getElementById('shellModeBtn');
+  const banner = document.getElementById('shellModeBanner');
+  if (shellModeActive) {
+    btn.classList.add('active');
+    btn.title = 'Shell Automation ON \u2014 click to disable';
+    if (banner) banner.classList.add('visible');
+  } else {
+    btn.classList.remove('active');
+    btn.title = 'Enable shell automation \u2014 lets agents install tools, run commands, and execute multi-step workflows';
+    if (banner) banner.classList.remove('visible');
+  }
+}
+
+function _renderTerminalBlock(text) {
+  const lines = text.split('\n');
+  let steps = [];
+  let curStep = null;
+  for (const raw of lines) {
+    const line = raw;
+    if (/^\[STEP\s+\d+\]/i.test(line)) {
+      curStep = { header: line, lines: [] };
+      steps.push(curStep);
+    } else if (curStep) {
+      curStep.lines.push(line);
+    } else {
+      if (steps.length === 0) steps.push({ header: null, lines: [] });
+      steps[steps.length - 1].lines.push(line);
+    }
+  }
+  const makeLineClass = (l) => {
+    if (/^\$\s/.test(l) || /^Running:/i.test(l)) return 'cmd';
+    if (/^(error|Error|ERROR|traceback|Traceback|failed|FAILED)/i.test(l) || l.includes('stderr:')) return 'err';
+    if (/^(\u2713|OK|Success|Done|Completed|SKIP|Already)/i.test(l.trim())) return 'ok';
+    if (/^(BLOCKED|Permission|Not allowed)/i.test(l.trim())) return 'blocked';
+    if (/^(Skipping|Skipped)/i.test(l.trim())) return 'skip';
+    return 'out';
+  };
+  const esc2 = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  let html = '<div class="terminal-block"><div class="terminal-header">'
+    + '<div class="terminal-dot" style="background:#FF5F57"></div>'
+    + '<div class="terminal-dot" style="background:#FFBD2E"></div>'
+    + '<div class="terminal-dot" style="background:#28CA41"></div>'
+    + '<div class="terminal-title">kendr \u2014 shell automation</div></div>'
+    + '<div class="terminal-body">';
+  for (const step of steps) {
+    html += '<div class="terminal-step">';
+    if (step.header) {
+      html += '<div class="terminal-step-header"><span style="color:#FFB347;font-size:11px">' + esc2(step.header) + '</span></div>';
+    }
+    for (const ln of step.lines) {
+      if (!ln && !step.header) continue;
+      const cls = makeLineClass(ln);
+      const content = cls === 'cmd' ? esc2(ln.replace(/^\$\s/, '')) : esc2(ln);
+      html += '<div class="terminal-line ' + cls + '">' + content + '</div>';
+    }
+    html += '</div>';
+  }
+  html += '</div></div>';
+  return html;
+}
+
+function _looksLikeShellOutput(text) {
+  if (!text) return false;
+  return /\[STEP\s+\d+\]/i.test(text)
+    || (/^\$\s/m.test(text) && text.split('\n').length > 2)
+    || /\bstdout:\s/i.test(text)
+    || /\bstderr:\s/i.test(text)
+    || /^Running:\s+\S+/m.test(text);
+}
 
 // ── Project context (kendr.md) ────────────────────────────────────────────
 let _projCtx = null;      // last fetched context from /api/projects/active/context
@@ -1175,6 +1276,7 @@ function appendKendrMsg(output, runId) {
 
 function formatOutput(text) {
   if (!text) return '';
+  if (_looksLikeShellOutput(text)) return _renderTerminalBlock(text);
   let h = esc(text);
   h = h.replace(/```([\s\S]*?)```/g, '<pre style="background:rgba(0,0,0,0.3);padding:10px;border-radius:6px;overflow-x:auto;font-family:monospace;font-size:12px;margin:6px 0">$1</pre>');
   h = h.replace(/`([^`\n]+)`/g, '<code style="background:rgba(0,0,0,0.3);padding:2px 6px;border-radius:4px;font-family:monospace;font-size:12px">$1</code>');
@@ -1589,6 +1691,10 @@ async function sendMessage() {
       run_id: runId,
       working_directory: workingDir
     };
+    if (shellModeActive) {
+      payload.shell_auto_approve = true;
+      payload.privileged_approval_note = 'Approved via Shell Automation mode in chat UI';
+    }
     if (resumeDir) {
       endpoint = API + '/api/chat/resume';
       payload.resume_dir = resumeDir;
@@ -5592,7 +5698,8 @@ strong { color: var(--text); }
         if project_build_mode:
             payload["project_build_mode"] = True
         for key in ("project_name", "project_stack", "stack", "project_root",
-                    "github_repo", "auto_approve", "skip_test_agent", "skip_devops_agent"):
+                    "github_repo", "auto_approve", "skip_test_agent", "skip_devops_agent",
+                    "shell_auto_approve", "privileged_approval_note"):
             if body.get(key) is not None:
                 payload[key] = body[key]
         # Auto-inject active project context when caller didn't supply project_root
