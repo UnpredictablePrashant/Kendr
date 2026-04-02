@@ -3,9 +3,14 @@
 Standalone multi-agent pipeline that scaffolds a complete, runnable project
 from a natural language description — no gateway required.
 
-Pipeline:
-  blueprint → scaffold → coder (per module) → verifier/error-fixer (x3) →
-  test writer → README writer → [optional GitHub push]
+Pipeline (spec-aligned 16-agent DAG):
+  planner → scaffolder → architect → db_agent →
+  backend_coder → frontend_coder → stylist →
+  reviewer → devops → error_fixer → smoke_test →
+  test_agent → doc_agent → git_agent → github_agent
+
+All pipeline stages emit MessageBus events using the ``<agent>:<action>``
+convention defined in the AgentSys specification.
 """
 
 from __future__ import annotations
@@ -20,6 +25,8 @@ import textwrap
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+from kendr.orchestration import MessageBus
 
 _STACK_ALIASES: dict[str, str] = {
     "nextjs": "nextjs_prisma_postgres",
@@ -179,6 +186,9 @@ class ProjectGenerationOrchestrator:
         self._cb = progress_cb or (lambda msg: print(msg, flush=True))
         self._blueprint: dict = {}
         self._stack_template: dict | None = None
+        # In-process event bus — all agents communicate via bus events.
+        # Subscribe before run() so callers can attach monitors via bus.subscribe("*", fn).
+        self._bus: MessageBus = MessageBus()
 
     def _log(self, msg: str, event_type: str = "progress", extra: dict | None = None) -> None:
         """Emit a progress message via the callback.
@@ -214,6 +224,28 @@ class ProjectGenerationOrchestrator:
         return "-".join(words) or "my-app"
 
     def run(self) -> dict[str, Any]:
+        """Execute the full 16-agent spec-aligned pipeline.
+
+        Pipeline stages (following the AgentSys DAG specification):
+          1.  planner     — generate project blueprint
+          2.  scaffolder  — create directory tree + base files
+          3.  architect   — ARCHITECTURE.md + openapi.yaml
+          4.  db_agent    — database schema / migrations / seed
+          5.  backend_coder — generate all backend modules
+          6.  frontend_coder — generate all frontend modules (conditional)
+          7.  stylist     — CSS / theme config (conditional)
+          8.  reviewer    — LLM code-quality review
+          9.  devops      — Dockerfile + docker-compose
+          10. error_fixer — compile / type-check + LLM patch loop
+          11. smoke_test  — startup crash detection
+          12. test_agent  — generate test suite
+          13. doc_agent   — README + API.md + CONTRIBUTING.md + DEPLOYMENT.md
+          14. git_agent   — local git init + commit
+          15. github_agent — create/push to GitHub repo
+
+        Every stage emits a ``<agent>:complete`` MessageBus event so monitor
+        subscribers can observe the full pipeline in real time.
+        """
         start = time.time()
         _PENDING = object()
         result: dict[str, Any] = {
@@ -238,83 +270,159 @@ class ProjectGenerationOrchestrator:
                 else:
                     self._log(f"[orchestrator] no template found for '{self.stack}', using LLM-driven stack selection")
 
-            self._log("[1/7] generating blueprint…")
+            # ── 1/15  planner ────────────────────────────────────────────────
+            self._log("[1/15] planner — generating blueprint…")
             self._blueprint = self._step_blueprint()
-            self._log(f"[1/7] blueprint ready: {self._blueprint.get('project_name', self.project_name)}")
+            self._log(f"[1/15] blueprint ready: {self._blueprint.get('project_name', self.project_name)}")
+            self._bus.emit("planner:complete", {
+                "project_name": self._blueprint.get("project_name", self.project_name),
+                "stack": self._blueprint.get("tech_stack", {}),
+                "modules": len(self._blueprint.get("modules", [])),
+            })
 
             if not self.auto_approve:
                 self._blueprint = self._step_blueprint_approval(self._blueprint)
 
-            self._log("[2/7] scaffolding project structure…")
+            # ── 2/15  scaffolder ─────────────────────────────────────────────
+            self._log("[2/15] scaffolder — creating directory structure…")
             files_created = self._step_scaffold()
             result["files_created"].extend(files_created)
-            self._log(f"[2/7] scaffold complete: {len(files_created)} files/dirs created")
+            self._log(f"[2/15] scaffold complete: {len(files_created)} files/dirs created")
+            self._bus.emit("scaffolder:complete", {"files": files_created})
 
-            self._log("[3/8] generating code modules…")
-            coded_files = self._step_code_modules()
-            result["files_created"].extend(coded_files)
-            self._log(f"[3/8] code generation complete: {len(coded_files)} files written")
+            # ── 3/15  architect ──────────────────────────────────────────────
+            self._log("[3/15] architect — generating ARCHITECTURE.md + openapi.yaml…")
+            arch_files = self._step_architect()
+            result["files_created"].extend(arch_files)
+            self._log(f"[3/15] architect complete: {arch_files}")
+            self._bus.emit("architect:complete", {"files": arch_files})
 
-            self._log("[4/8] reviewer — checking generated code quality…")
+            # ── 4/15  db_agent ───────────────────────────────────────────────
+            self._log("[4/15] db_agent — generating database schema / migrations…")
+            db_files = self._step_db_agent()
+            result["files_created"].extend(db_files)
+            self._log(f"[4/15] db_agent complete: {len(db_files)} files")
+            self._bus.emit("db_agent:complete", {"files": db_files})
+
+            # ── 5/15  backend_coder ──────────────────────────────────────────
+            self._log("[5/15] backend_coder — generating backend modules…")
+            backend_files = self._step_backend_coder()
+            result["files_created"].extend(backend_files)
+            self._log(f"[5/15] backend_coder complete: {len(backend_files)} files written")
+            self._bus.emit("backend_coder:complete", {"files": backend_files})
+
+            # ── 6/15  frontend_coder (conditional) ──────────────────────────
+            if self._has_frontend():
+                self._log("[6/15] frontend_coder — generating frontend modules…")
+                frontend_files = self._step_frontend_coder()
+                result["files_created"].extend(frontend_files)
+                self._log(f"[6/15] frontend_coder complete: {len(frontend_files)} files written")
+                self._bus.emit("frontend_coder:complete", {"files": frontend_files})
+            else:
+                self._log("[6/15] frontend_coder skipped (no frontend in stack)")
+                self._bus.emit("frontend_coder:skipped", {})
+
+            # ── 7/15  stylist (conditional) ──────────────────────────────────
+            if self._has_frontend():
+                self._log("[7/15] stylist — generating CSS / theme config…")
+                style_files = self._step_stylist()
+                result["files_created"].extend(style_files)
+                self._log(f"[7/15] stylist complete: {len(style_files)} files")
+                self._bus.emit("stylist:complete", {"files": style_files})
+            else:
+                self._log("[7/15] stylist skipped (no frontend in stack)")
+                self._bus.emit("stylist:skipped", {})
+
+            # ── 8/15  reviewer ───────────────────────────────────────────────
+            self._log("[8/15] reviewer — checking generated code quality…")
             review_notes = self._step_reviewer()
             if review_notes:
-                self._log(f"[4/8] reviewer notes: {review_notes[:200]}")
+                self._log(f"[8/15] reviewer notes: {review_notes[:200]}")
             else:
-                self._log("[4/8] reviewer: code looks good")
+                self._log("[8/15] reviewer: code looks good")
+            self._bus.emit("reviewer:complete", {"notes": review_notes or ""})
 
+            # ── 9/15  devops ─────────────────────────────────────────────────
             if not self.skip_devops:
-                self._log("[5/8] generating devops files…")
+                self._log("[9/15] devops — generating Dockerfile + docker-compose…")
                 devops_files = self._step_devops()
                 result["files_created"].extend(devops_files)
-                self._log(f"[5/8] devops files written: {len(devops_files)}")
+                self._log(f"[9/15] devops complete: {len(devops_files)} files written")
+                self._bus.emit("devops:complete", {"files": devops_files})
             else:
-                self._log("[5/8] devops generation skipped")
+                self._log("[9/15] devops skipped")
+                self._bus.emit("devops:skipped", {})
 
-            self._log("[6/9] running error-fix loop (up to 3 iterations)…")
+            # ── 10/15  error_fixer ────────────────────────────────────────────
+            self._log("[10/15] error_fixer — compile / type-check + LLM patch loop…")
             fix_report = self._step_error_fix_loop()
             if fix_report.get("errors"):
                 result["errors"].extend(fix_report["errors"])
             fix_ok = fix_report.get("ok", True)
-            self._log(f"[6/9] error-fix loop done: {fix_report.get('iterations', 0)} iterations, {'pass' if fix_ok else 'some errors remain'}")
+            self._log(f"[10/15] error_fixer done: {fix_report.get('iterations', 0)} iter(s), {'pass' if fix_ok else 'some errors remain'}")
             if not fix_ok:
-                result["ok"] = False  # explicitly mark failure; cannot be reset to True below
+                result["ok"] = False
 
-            self._log("[7/9] runtime smoke test…")
+            # ── 11/15  smoke_test ─────────────────────────────────────────────
+            self._log("[11/15] smoke_test — startup crash detection…")
             smoke_errs = self._step_smoke_test()
             if smoke_errs:
                 result["errors"].extend(smoke_errs)
-                self._log(f"[7/9] smoke test found {len(smoke_errs)} issue(s) — patched")
+                self._log(f"[11/15] smoke_test found {len(smoke_errs)} issue(s) — patched")
             else:
-                self._log("[7/9] smoke test passed")
+                self._log("[11/15] smoke_test passed")
+            self._bus.emit("smoke_test:complete", {"errors": smoke_errs})
 
+            # ── 12/15  test_agent ─────────────────────────────────────────────
             if not self.skip_tests:
-                self._log("[8/9] generating tests…")
+                self._log("[12/15] test_agent — generating test suite…")
                 test_files = self._step_generate_tests()
                 result["files_created"].extend(test_files)
-                self._log(f"[8/9] tests written: {len(test_files)} files")
+                self._log(f"[12/15] test_agent complete: {len(test_files)} files")
+                self._bus.emit("test_agent:complete", {"files": test_files})
             else:
-                self._log("[8/9] test generation skipped")
+                self._log("[12/15] test_agent skipped")
+                self._bus.emit("test_agent:skipped", {})
 
-            self._log("[9/9] writing README…")
-            readme_written = self._step_readme()
-            if readme_written:
-                result["files_created"].append(str(self.project_root / "README.md"))
-            self._log("[9/9] README written")
+            # ── 13/15  doc_agent ──────────────────────────────────────────────
+            self._log("[13/15] doc_agent — writing README + API.md + CONTRIBUTING.md + DEPLOYMENT.md…")
+            doc_files = self._step_doc_agent()
+            result["files_created"].extend(doc_files)
+            self._log(f"[13/15] doc_agent complete: {doc_files}")
+            self._bus.emit("doc_agent:complete", {"files": doc_files})
 
+            # ── 14/15  git_agent ──────────────────────────────────────────────
+            self._log("[14/15] git_agent — local git init + commit…")
+            committed = self._step_git_commit(f"feat: initial scaffold — {self.project_name}")
+            self._log(f"[14/15] git_agent: {'committed' if committed else 'nothing to commit'}")
+            self._bus.emit("git_agent:complete", {"committed": committed})
+
+            # ── 15/15  github_agent ───────────────────────────────────────────
             if self.github_repo:
-                self._log(f"[github] pushing to {self.github_repo}…")
+                self._log(f"[15/15] github_agent — pushing to {self.github_repo}…")
                 github_url = self._step_github_push()
                 result["github_url"] = github_url
                 if github_url:
-                    self._log(f"[github] pushed: {github_url}")
+                    self._log(f"[15/15] github_agent: pushed to {github_url}")
+                    self._bus.emit("github_agent:complete", {"url": github_url})
                 else:
-                    self._log("[github] push skipped (no token or error)")
+                    self._log("[15/15] github_agent: push skipped (no token or error)")
+                    self._bus.emit("github_agent:skipped", {})
+            else:
+                self._log("[15/15] github_agent skipped (no --github-repo)")
+                self._bus.emit("github_agent:skipped", {})
 
             elapsed = round(time.time() - start, 1)
             if result["ok"] is _PENDING:
                 result["ok"] = True
             status_mark = "✓" if result["ok"] else "⚠"
             self._log(f"[orchestrator] done in {elapsed}s  {status_mark}  {self.project_root}")
+            self._bus.emit("orchestrator:complete", {
+                "ok": result["ok"],
+                "elapsed": elapsed,
+                "files": len(result["files_created"]),
+                "errors": len(result["errors"]),
+            })
 
             install_hint = self._install_hint()
             if install_hint:
@@ -738,21 +846,333 @@ Instructions:
 """.strip()
 
     def _step_code_modules(self) -> list[str]:
+        """Generate all modules (legacy helper, delegates to _generate_modules)."""
         modules = self._blueprint.get("modules", [])
         if not modules:
             return []
         modules_sorted = sorted(modules, key=lambda m: int(m.get("priority", 99)))
+        return self._generate_modules(modules_sorted, "coder")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # New spec-aligned agent step methods
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def _has_frontend(self) -> bool:
+        """Return True if the project includes a frontend layer."""
+        tech = self._blueprint.get("tech_stack", {})
+        fw = str(tech.get("framework", "")).lower()
+        lang = str(tech.get("language", "")).lower()
+        # Pure-backend frameworks have no frontend
+        if fw in ("fastapi", "django", "express") and "react" not in self.description.lower() and "frontend" not in self.description.lower():
+            return False
+        if lang == "dart" or fw == "flutter":
+            return True
+        frontend_keywords = ("react", "nextjs", "next", "vite", "vue", "svelte", "angular", "flutter", "mern", "pern")
+        return any(kw in fw for kw in frontend_keywords)
+
+    def _is_backend_module(self, module: dict) -> bool:
+        """Return True if *module* is a backend/server-side file."""
+        file_path = str(module.get("file", "")).lower()
+        desc = str(module.get("description", "")).lower()
+        frontend_signals = ("/components/", "/pages/", "/screens/", "/views/", "/ui/", "/styles/",
+                            "/hooks/", "/context/", "widget", ".css", ".scss", "tailwind")
+        if any(sig in file_path for sig in frontend_signals):
+            return False
+        backend_signals = ("/api/", "/routes/", "/models/", "/schema", "/migrations/", "/services/",
+                           "/middleware/", "/auth/", "/db/", "/controllers/", "main.py",
+                           "settings.py", "config.py", "prisma", "alembic")
+        if any(sig in file_path for sig in backend_signals):
+            return True
+        backend_desc_signals = ("api", "route", "model", "schema", "database", "migration",
+                                "auth", "service", "controller", "server", "endpoint")
+        return any(sig in desc for sig in backend_desc_signals)
+
+    def _is_frontend_module(self, module: dict) -> bool:
+        """Return True if *module* is a frontend/client-side file."""
+        return not self._is_backend_module(module)
+
+    def _step_architect(self) -> list[str]:
+        """Architect agent: generate ARCHITECTURE.md and openapi.yaml.
+
+        Mirrors spec Section 4 — architect agent produces:
+        - ARCHITECTURE.md : high-level design document
+        - openapi.yaml    : OpenAPI 3.1 spec derived from blueprint api_design
+        """
+        written: list[str] = []
+        tech = self._blueprint.get("tech_stack", {})
+        api = self._blueprint.get("api_design", {})
+        schema = self._blueprint.get("database_schema", {})
+        modules = self._blueprint.get("modules", [])
+
+        # ── ARCHITECTURE.md ───────────────────────────────────────────────────
+        arch_path = self.project_root / "ARCHITECTURE.md"
+        if not arch_path.exists():
+            arch_prompt = f"""
+You are a senior software architect. Write a concise ARCHITECTURE.md document for this project.
+
+Project: {self._blueprint.get("project_name", self.project_name)}
+Description: {self._blueprint.get("description", self.description)}
+Tech stack: {json.dumps(tech, indent=2)}
+Modules: {json.dumps([{{"file": m.get("file"), "description": m.get("description")}} for m in modules[:20]], indent=2)}
+API design: {json.dumps(api.get("endpoints", [])[:15], indent=2)}
+Database schema: {json.dumps(schema.get("tables", [])[:8], indent=2)}
+
+Include sections:
+1. Overview — what the system does
+2. Architecture — diagram (ASCII), key components and how they interact
+3. Data flow — request lifecycle
+4. Directory structure — purpose of each major directory
+5. Key design decisions — rationale for tech choices
+
+Return ONLY the Markdown content. No code fences.
+""".strip()
+            try:
+                content = _llm_call(arch_prompt)
+                arch_path.write_text(content + "\n", encoding="utf-8")
+                written.append(str(arch_path))
+                self._log("  [architect] wrote ARCHITECTURE.md", event_type="file_created",
+                          extra={"file": "ARCHITECTURE.md"})
+            except Exception as exc:
+                self._log(f"  [architect] ARCHITECTURE.md error: {exc}")
+
+        # ── openapi.yaml ──────────────────────────────────────────────────────
+        openapi_path = self.project_root / "openapi.yaml"
+        endpoints = api.get("endpoints", [])
+        if not openapi_path.exists() and endpoints:
+            openapi_prompt = f"""
+Write a valid OpenAPI 3.1 spec (YAML) for this API.
+
+Project: {self._blueprint.get("project_name", self.project_name)}
+Description: {self._blueprint.get("description", self.description)}
+Base URL: http://localhost:8000
+
+Endpoints:
+{json.dumps(endpoints[:20], indent=2)}
+
+Database tables (for schema components):
+{json.dumps(schema.get("tables", [])[:8], indent=2)}
+
+Include:
+- openapi: "3.1.0" header
+- info block with title, version, description
+- paths for each endpoint with request/response schemas
+- components/schemas for key data models
+- security schemes if auth is involved
+
+Return ONLY the YAML content. No code fences.
+""".strip()
+            try:
+                content = _llm_call(openapi_prompt)
+                content = _strip_fences(content)
+                openapi_path.write_text(content + "\n", encoding="utf-8")
+                written.append(str(openapi_path))
+                self._log("  [architect] wrote openapi.yaml", event_type="file_created",
+                          extra={"file": "openapi.yaml"})
+            except Exception as exc:
+                self._log(f"  [architect] openapi.yaml error: {exc}")
+
+        return written
+
+    def _step_db_agent(self) -> list[str]:
+        """DB agent: generate schema definitions, migrations, and seed data.
+
+        Mirrors spec Section 5 — db_agent produces stack-appropriate files:
+        - Prisma schema  → prisma/schema.prisma
+        - SQLAlchemy     → app/models.py  (if not already generated)
+        - Django ORM     → app/models.py  (if not already generated)
+        - Seed data file → prisma/seed.ts or seeds/seed.py
+        """
+        tech = self._blueprint.get("tech_stack", {})
+        orm = str(tech.get("orm", "")).lower()
+        fw = str(tech.get("framework", "")).lower()
+        lang = str(tech.get("language", "")).lower()
+        db = str(tech.get("database", "")).lower()
+        schema = self._blueprint.get("database_schema", {})
+        written: list[str] = []
+
+        if not db or db == "none":
+            return written
+
+        # ── Prisma schema ─────────────────────────────────────────────────────
+        if orm == "prisma":
+            prisma_path = self.project_root / "prisma" / "schema.prisma"
+            if not prisma_path.exists():
+                prisma_prompt = f"""
+Write a complete Prisma schema file for this project.
+
+Database: {db}
+Tables/models: {json.dumps(schema.get("tables", []), indent=2)}
+Project description: {self._blueprint.get("description", self.description)}
+
+Include:
+- datasource db block with postgresql provider and DATABASE_URL env var
+- generator client block
+- All model definitions with proper field types, relations, and attributes
+- @id, @unique, @default, @@index as appropriate
+- Relation fields with @relation for all foreign keys
+
+Return ONLY the Prisma schema content. No code fences.
+""".strip()
+                try:
+                    content = _llm_call(prisma_prompt)
+                    content = _strip_fences(content)
+                    prisma_path.parent.mkdir(parents=True, exist_ok=True)
+                    prisma_path.write_text(content + "\n", encoding="utf-8")
+                    written.append(str(prisma_path))
+                    self._log("  [db_agent] wrote prisma/schema.prisma", event_type="file_created",
+                              extra={"file": "prisma/schema.prisma"})
+                except Exception as exc:
+                    self._log(f"  [db_agent] schema.prisma error: {exc}")
+
+            # Seed file
+            seed_path = self.project_root / "prisma" / "seed.ts"
+            if not seed_path.exists():
+                seed_prompt = f"""
+Write a Prisma seed script in TypeScript for this project.
+
+Models: {json.dumps(schema.get("tables", [])[:6], indent=2)}
+Project: {self._blueprint.get("project_name", self.project_name)}
+
+Use @prisma/client. Include realistic sample data for development/testing.
+Export a main() function and call it with error handling.
+Return ONLY the TypeScript file content. No code fences.
+""".strip()
+                try:
+                    content = _llm_call(seed_prompt)
+                    content = _strip_fences(content)
+                    seed_path.write_text(content + "\n", encoding="utf-8")
+                    written.append(str(seed_path))
+                    self._log("  [db_agent] wrote prisma/seed.ts", event_type="file_created",
+                              extra={"file": "prisma/seed.ts"})
+                except Exception as exc:
+                    self._log(f"  [db_agent] seed.ts error: {exc}")
+
+        # ── SQLAlchemy / Alembic ──────────────────────────────────────────────
+        elif orm == "sqlalchemy" or ("python" in lang and "postgres" in db):
+            models_path_candidates = [
+                self.project_root / "app" / "models.py",
+                self.project_root / "models.py",
+            ]
+            models_path = next((p for p in models_path_candidates if p.exists()), models_path_candidates[0])
+            if not models_path.exists():
+                models_prompt = f"""
+Write SQLAlchemy 2.x models for this project.
+
+Database: {db}
+Tables: {json.dumps(schema.get("tables", []), indent=2)}
+
+Use:
+- DeclarativeBase from sqlalchemy.orm
+- Mapped[] and mapped_column() syntax (SQLAlchemy 2.x)
+- Relationship() for foreign key associations
+- __tablename__ attribute on each model
+- Type annotations throughout
+
+Return ONLY the Python file content. No code fences.
+""".strip()
+                try:
+                    content = _llm_call(models_prompt)
+                    content = _strip_fences(content)
+                    models_path.parent.mkdir(parents=True, exist_ok=True)
+                    models_path.write_text(content + "\n", encoding="utf-8")
+                    written.append(str(models_path))
+                    self._log(f"  [db_agent] wrote {models_path.relative_to(self.project_root)}",
+                              event_type="file_created")
+                except Exception as exc:
+                    self._log(f"  [db_agent] models.py error: {exc}")
+
+            # Alembic env.py stub
+            alembic_env = self.project_root / "alembic" / "env.py"
+            if not alembic_env.exists():
+                alembic_prompt = f"""
+Write a minimal alembic/env.py for this FastAPI/SQLAlchemy project.
+
+Import Base from app.models or app.database.
+Set target_metadata = Base.metadata.
+Use DATABASE_URL from environment.
+Support both online and offline migration modes.
+
+Return ONLY the Python file content. No code fences.
+""".strip()
+                try:
+                    content = _llm_call(alembic_prompt)
+                    content = _strip_fences(content)
+                    alembic_env.parent.mkdir(parents=True, exist_ok=True)
+                    alembic_env.write_text(content + "\n", encoding="utf-8")
+                    written.append(str(alembic_env))
+                    self._log("  [db_agent] wrote alembic/env.py", event_type="file_created")
+                except Exception as exc:
+                    self._log(f"  [db_agent] alembic/env.py error: {exc}")
+
+        # ── Django models ─────────────────────────────────────────────────────
+        elif "django" in fw:
+            django_models = self.project_root / "api" / "models.py"
+            if not django_models.exists():
+                django_models_prompt = f"""
+Write Django ORM models for this project.
+
+Tables: {json.dumps(schema.get("tables", []), indent=2)}
+App name: api
+
+Include:
+- All models as Django Model subclasses
+- ForeignKey, ManyToManyField as appropriate
+- __str__ method on each model
+- Meta class with ordering where relevant
+- Use Django's built-in fields (CharField, IntegerField, DateTimeField, etc.)
+
+Return ONLY the Python file content. No code fences.
+""".strip()
+                try:
+                    content = _llm_call(django_models_prompt)
+                    content = _strip_fences(content)
+                    django_models.parent.mkdir(parents=True, exist_ok=True)
+                    django_models.write_text(content + "\n", encoding="utf-8")
+                    written.append(str(django_models))
+                    self._log("  [db_agent] wrote api/models.py", event_type="file_created")
+                except Exception as exc:
+                    self._log(f"  [db_agent] django models.py error: {exc}")
+
+        return written
+
+    def _step_backend_coder(self) -> list[str]:
+        """Backend coder agent: generate server-side / API modules only."""
+        modules = self._blueprint.get("modules", [])
+        if not modules:
+            return []
+        modules_sorted = sorted(modules, key=lambda m: int(m.get("priority", 99)))
+        backend_modules = [m for m in modules_sorted if self._is_backend_module(m)]
+        if not backend_modules:
+            # If no backend/frontend split can be made, generate all modules here
+            backend_modules = modules_sorted
+        return self._generate_modules(backend_modules, "backend_coder")
+
+    def _step_frontend_coder(self) -> list[str]:
+        """Frontend coder agent: generate client-side / UI modules only."""
+        modules = self._blueprint.get("modules", [])
+        if not modules:
+            return []
+        modules_sorted = sorted(modules, key=lambda m: int(m.get("priority", 99)))
+        frontend_modules = [m for m in modules_sorted if self._is_frontend_module(m)]
+        return self._generate_modules(frontend_modules, "frontend_coder")
+
+    def _generate_modules(self, modules: list[dict], agent_label: str) -> list[str]:
+        """Shared code generation loop used by backend_coder and frontend_coder."""
         written_files: list[str] = []
         context_summary_parts: list[str] = []
-        for i, module in enumerate(modules_sorted, start=1):
+        for i, module in enumerate(modules, start=1):
             file_rel = module.get("file", "")
             if not file_rel:
                 continue
             target = self._safe_path(file_rel)
             if target is None:
-                self._log(f"  [coder] rejected path-traversal module: {file_rel}")
+                self._log(f"  [{agent_label}] rejected path-traversal module: {file_rel}")
                 continue
-            self._log(f"  [coder] {i}/{len(modules_sorted)} {file_rel}")
+            if target.exists() and target.stat().st_size > 50:
+                # Don't overwrite files already written by db_agent or scaffold
+                self._log(f"  [{agent_label}] {i}/{len(modules)} {file_rel} (already exists, skipping)")
+                continue
+            self._log(f"  [{agent_label}] {i}/{len(modules)} {file_rel}")
             context_summary = "\n".join(context_summary_parts[-6:])
             prompt = self._build_module_prompt(module, context_summary)
             try:
@@ -762,11 +1182,241 @@ Instructions:
                 target.write_text(code + "\n", encoding="utf-8")
                 written_files.append(str(target))
                 context_summary_parts.append(f"- {file_rel}: {module.get('description', '')}")
-                self._log(f"  [coder] wrote {file_rel}", event_type="file_created",
+                self._log(f"  [{agent_label}] wrote {file_rel}", event_type="file_created",
                           extra={"file": file_rel, "description": module.get("description", "")})
             except Exception as exc:
-                self._log(f"  [coder] error on {file_rel}: {exc}")
+                self._log(f"  [{agent_label}] error on {file_rel}: {exc}")
         return written_files
+
+    def _step_stylist(self) -> list[str]:
+        """Stylist agent: generate CSS / Tailwind config / global styles.
+
+        Mirrors spec Section 8 — stylist produces theme configuration and
+        global stylesheets so frontend_coder can reference consistent design
+        tokens rather than duplicating colours/spacing per component.
+        """
+        tech = self._blueprint.get("tech_stack", {})
+        css = str(tech.get("css", "")).lower()
+        fw = str(tech.get("framework", "")).lower()
+        written: list[str] = []
+
+        # ── Tailwind config ───────────────────────────────────────────────────
+        if "tailwind" in css:
+            tw_path = self.project_root / "tailwind.config.js"
+            if not tw_path.exists():
+                tw_prompt = f"""
+Write a complete tailwind.config.js for this project.
+
+Framework: {fw}
+Project description: {self._blueprint.get("description", self.description)}
+
+Include:
+- content array covering all source files
+- theme.extend with custom colours, fonts, spacing derived from the project type
+- Any plugins (forms, typography, etc.) appropriate for the project
+
+Return ONLY the JavaScript file content. No code fences.
+""".strip()
+                try:
+                    content = _llm_call(tw_prompt)
+                    content = _strip_fences(content)
+                    tw_path.write_text(content + "\n", encoding="utf-8")
+                    written.append(str(tw_path))
+                    self._log("  [stylist] wrote tailwind.config.js", event_type="file_created",
+                              extra={"file": "tailwind.config.js"})
+                except Exception as exc:
+                    self._log(f"  [stylist] tailwind.config.js error: {exc}")
+
+        # ── Global CSS ────────────────────────────────────────────────────────
+        global_css_candidates = [
+            self.project_root / "src" / "app" / "globals.css",
+            self.project_root / "src" / "styles" / "global.css",
+            self.project_root / "src" / "index.css",
+            self.project_root / "styles" / "globals.css",
+        ]
+        global_css_path = next((p for p in global_css_candidates if p.exists()), global_css_candidates[0])
+        if not global_css_path.exists():
+            css_prompt = f"""
+Write a production-quality global CSS file for this project.
+
+Framework: {fw}
+CSS library: {css or 'none'}
+Project: {self._blueprint.get("project_name", self.project_name)}
+
+{"Include Tailwind @tailwind base/components/utilities directives." if "tailwind" in css else ""}
+Include CSS custom properties (variables) for colors, typography, and spacing.
+Include basic reset and sensible defaults.
+
+Return ONLY the CSS file content. No code fences.
+""".strip()
+            try:
+                content = _llm_call(css_prompt)
+                content = _strip_fences(content)
+                global_css_path.parent.mkdir(parents=True, exist_ok=True)
+                global_css_path.write_text(content + "\n", encoding="utf-8")
+                written.append(str(global_css_path))
+                self._log(f"  [stylist] wrote {global_css_path.relative_to(self.project_root)}",
+                          event_type="file_created")
+            except Exception as exc:
+                self._log(f"  [stylist] global CSS error: {exc}")
+
+        return written
+
+    def _step_git_commit(self, message: str) -> bool:
+        """Git agent: initialise local repo and create a commit.
+
+        Returns True if a commit was created, False otherwise.
+        Mirrors spec Section 12 — git_agent performs local git operations
+        (init, add, commit) before the github_agent pushes to remote.
+        """
+        if not shutil.which("git"):
+            self._log("  [git_agent] git not found — skipping local commit")
+            return False
+        root = str(self.project_root)
+        git_dir = self.project_root / ".git"
+        try:
+            if not git_dir.exists():
+                ok, _, err = _run_subprocess(["git", "init", "-b", "main"], root, timeout=30)
+                if not ok:
+                    # Older git doesn't support -b; fall back
+                    _run_subprocess(["git", "init"], root, timeout=30)
+                    _run_subprocess(["git", "checkout", "-b", "main"], root, timeout=10)
+
+            _run_subprocess(["git", "config", "user.email", "kendr-bot@kendr.ai"], root, timeout=10)
+            _run_subprocess(["git", "config", "user.name", "Kendr Bot"], root, timeout=10)
+            _run_subprocess(["git", "add", "-A"], root, timeout=30)
+
+            ok, stdout, _ = _run_subprocess(
+                ["git", "status", "--porcelain"], root, timeout=10
+            )
+            if not stdout.strip():
+                return False
+
+            ok, _, err = _run_subprocess(["git", "commit", "-m", message], root, timeout=30)
+            if ok:
+                self._log(f"  [git_agent] committed: {message[:80]}")
+                return True
+            else:
+                if "nothing to commit" in err:
+                    return False
+                self._log(f"  [git_agent] commit error: {err[:200]}")
+                return False
+        except Exception as exc:
+            self._log(f"  [git_agent] error: {exc}")
+            return False
+
+    def _step_doc_agent(self) -> list[str]:
+        """Doc agent: generate full documentation suite.
+
+        Mirrors spec Section 13 — doc_agent produces:
+        - README.md      : project overview + quick start
+        - API.md         : full API reference
+        - CONTRIBUTING.md: contribution guidelines
+        - DEPLOYMENT.md  : deployment instructions
+        """
+        written: list[str] = []
+
+        # ── README.md ─────────────────────────────────────────────────────────
+        readme_written = self._step_readme()
+        if readme_written:
+            written.append(str(self.project_root / "README.md"))
+
+        # ── API.md ────────────────────────────────────────────────────────────
+        api_doc_path = self.project_root / "API.md"
+        if not api_doc_path.exists():
+            api = self._blueprint.get("api_design", {})
+            endpoints = api.get("endpoints", [])
+            if endpoints:
+                api_prompt = f"""
+Write a comprehensive API.md reference document for this REST API.
+
+Project: {self._blueprint.get("project_name", self.project_name)}
+Base URL: http://localhost:8000
+
+Endpoints:
+{json.dumps(endpoints[:25], indent=2)}
+
+For each endpoint include:
+- Method + path as a heading
+- Description
+- Request parameters / body (JSON example)
+- Response format (JSON example)
+- Status codes
+- Authentication requirements
+
+Return ONLY the Markdown content. No code fences.
+""".strip()
+                try:
+                    content = _llm_call(api_prompt)
+                    api_doc_path.write_text(content + "\n", encoding="utf-8")
+                    written.append(str(api_doc_path))
+                    self._log("  [doc_agent] wrote API.md", event_type="file_created",
+                              extra={"file": "API.md"})
+                except Exception as exc:
+                    self._log(f"  [doc_agent] API.md error: {exc}")
+
+        # ── CONTRIBUTING.md ────────────────────────────────────────────────────
+        contrib_path = self.project_root / "CONTRIBUTING.md"
+        if not contrib_path.exists():
+            tech = self._blueprint.get("tech_stack", {})
+            contrib_prompt = f"""
+Write a CONTRIBUTING.md for this open-source project.
+
+Project: {self._blueprint.get("project_name", self.project_name)}
+Stack: {tech.get("framework", "?")} + {tech.get("language", "?")}
+Install command: {self._blueprint.get("install_command", "npm install")}
+Test command: {tech.get("testing", "pytest/jest")}
+
+Include sections:
+1. Getting started (fork, clone, install)
+2. Development workflow (branch naming, commit style)
+3. Running tests
+4. Submitting a pull request
+5. Code style / linting
+
+Return ONLY the Markdown content. No code fences.
+""".strip()
+            try:
+                content = _llm_call(contrib_prompt)
+                contrib_path.write_text(content + "\n", encoding="utf-8")
+                written.append(str(contrib_path))
+                self._log("  [doc_agent] wrote CONTRIBUTING.md", event_type="file_created",
+                          extra={"file": "CONTRIBUTING.md"})
+            except Exception as exc:
+                self._log(f"  [doc_agent] CONTRIBUTING.md error: {exc}")
+
+        # ── DEPLOYMENT.md ──────────────────────────────────────────────────────
+        deploy_path = self.project_root / "DEPLOYMENT.md"
+        if not deploy_path.exists():
+            docker_services = self._blueprint.get("docker_services", [])
+            deploy_prompt = f"""
+Write a DEPLOYMENT.md for this project.
+
+Project: {self._blueprint.get("project_name", self.project_name)}
+Stack: {json.dumps(self._blueprint.get("tech_stack", {}), indent=2)}
+Docker services: {json.dumps(docker_services, indent=2)}
+Environment variables: {json.dumps([e.get("name") for e in self._blueprint.get("env_vars", [])], indent=2)}
+
+Include sections:
+1. Prerequisites
+2. Environment configuration (required env vars)
+3. Docker deployment (if docker services present)
+4. Manual deployment (without Docker)
+5. Production considerations (health checks, scaling, monitoring)
+6. CI/CD setup hints
+
+Return ONLY the Markdown content. No code fences.
+""".strip()
+            try:
+                content = _llm_call(deploy_prompt)
+                deploy_path.write_text(content + "\n", encoding="utf-8")
+                written.append(str(deploy_path))
+                self._log("  [doc_agent] wrote DEPLOYMENT.md", event_type="file_created",
+                          extra={"file": "DEPLOYMENT.md"})
+            except Exception as exc:
+                self._log(f"  [doc_agent] DEPLOYMENT.md error: {exc}")
+
+        return written
 
     def _step_reviewer(self) -> str:
         """Reviewer stage: LLM reviews generated code and returns notes.

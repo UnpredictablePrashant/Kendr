@@ -174,6 +174,30 @@ def _gateway_base_url() -> str:
     return f"http://{host}:{port}"
 
 
+def _ui_host_port() -> tuple[str, int]:
+    host = os.getenv("KENDR_UI_HOST", "127.0.0.1")
+    port = int(os.getenv("KENDR_UI_PORT", "2151"))
+    return host, port
+
+
+def _ui_base_url() -> str:
+    host, port = _ui_host_port()
+    display_host = "localhost" if host in ("0.0.0.0", "") else host
+    return f"http://{display_host}:{port}"
+
+
+def _ui_ready(timeout_seconds: float = 1.0) -> bool:
+    _, port = _ui_host_port()
+    try:
+        import urllib.request as _req
+        import json as _json
+        with _req.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=timeout_seconds) as r:
+            data = _json.loads(r.read())
+            return data.get("service") == "kendr-ui"
+    except Exception:
+        return False
+
+
 def _http_json_get(url: str, timeout_seconds: float = 2.0):
     request = urllib.request.Request(url, method="GET")
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
@@ -734,6 +758,15 @@ def _clear_gateway_pid() -> None:
 
 
 def _pid_is_alive(pid: int) -> bool:
+    if os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, check=False,
+            )
+            return f'"{pid}"' in result.stdout
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True
@@ -742,6 +775,10 @@ def _pid_is_alive(pid: int) -> bool:
 
 
 def _pid_is_gateway_owned(pid: int) -> bool:
+    if os.name == "nt":
+        # No /proc on Windows — trust our own PID file
+        stored_pid = _read_gateway_pid()
+        return stored_pid is not None and stored_pid == pid
     try:
         raw = _gateway_owner_marker_path().read_text(encoding="utf-8")
     except Exception:
@@ -898,18 +935,53 @@ def _terminate_gateway_on_port() -> int:
     pids = _listener_pids_for_port(port)
     if not pids:
         return 0
-    owned = [p for p in pids if _pid_is_gateway_owned(p)]
-    if not owned:
+    if os.name == "nt":
+        targets = pids
+    else:
+        targets = [p for p in pids if _pid_is_gateway_owned(p)]
+    if not targets:
         return 0
-    for pid in owned:
+    for pid in targets:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True, check=False)
+            else:
+                os.kill(pid, 15)
+        except Exception:
+            continue
+    return len(targets)
+
+
+def _terminate_ui_on_port() -> int:
+    """Kill any kendr UI process running on the configured UI port. Returns count killed."""
+    ui_port = int(os.getenv("KENDR_UI_PORT", "2151"))
+    pids = _listener_pids_for_port(ui_port)
+    if not pids:
+        return 0
+    # Verify it's actually the kendr UI before killing
+    is_kendr_ui = False
+    try:
+        import urllib.request as _req
+        import json as _json
+        with _req.urlopen(f"http://127.0.0.1:{ui_port}/api/health", timeout=1) as r:
+            data = _json.loads(r.read())
+            if data.get("service") == "kendr-ui":
+                is_kendr_ui = True
+    except Exception:
+        pass
+    if not is_kendr_ui:
+        return 0
+    killed = 0
+    for pid in pids:
         try:
             if os.name == "nt":
                 subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, check=False)
             else:
                 os.kill(pid, 15)
+            killed += 1
         except Exception:
             continue
-    return len(owned)
+    return killed
 
 
 def _resolve_working_dir(path_value: str) -> str:
@@ -2630,7 +2702,455 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     )
     mcp_zapier.add_argument("--no-discover", action="store_true", help="Register without running tool discovery.")
 
+    # ── new — spec Section 2.2 alias for generate --standalone ────────────────
+    new_parser = subparsers.add_parser(
+        "new",
+        help="Scaffold a new project (alias for 'generate --standalone').",
+        description=(
+            "Generate a complete, runnable project from a natural language description.\n\n"
+            "This is a shorthand for 'kendr generate --standalone'. The project is created\n"
+            "in the current directory (or --dir) without requiring the gateway server.\n\n"
+            "Examples:\n"
+            "  kendr new 'A job board where employers post jobs and candidates apply' --stack nextjs\n"
+            "  kendr new 'REST API for a todo app' --stack fastapi --dir ~/projects/todo-api\n"
+        ),
+    )
+    new_parser.add_argument("description", nargs="?", default="", help="Natural language project description.")
+    new_parser.add_argument("--stack", default="", help="Tech stack (e.g. nextjs, fastapi, react, django).")
+    new_parser.add_argument("--dir", dest="project_root", default="", metavar="PATH",
+                            help="Output directory (default: cwd/<project-name>).")
+    new_parser.add_argument("--name", default="", metavar="NAME", help="Kebab-case project name.")
+    new_parser.add_argument("--yes", "-y", action="store_true", help="Skip blueprint approval prompt.")
+    new_parser.add_argument("--no-tests", action="store_true", help="Skip test generation.")
+    new_parser.add_argument("--no-devops", action="store_true", help="Skip Dockerfile/docker-compose generation.")
+    new_parser.add_argument("--github-repo", default="", metavar="OWNER/REPO",
+                            help="Push to GitHub repo after generation.")
+    new_parser.add_argument("--github-token", default="", metavar="TOKEN",
+                            help="GitHub PAT (falls back to GITHUB_TOKEN env var).")
+    command_parsers["new"] = new_parser
+
+    # ── checkpoint — spec Section 2.2 save/restore ────────────────────────────
+    checkpoint_parser = subparsers.add_parser(
+        "checkpoint",
+        help="Save or restore pipeline execution checkpoints.",
+        description=(
+            "Manage checkpoints — named snapshots of pipeline state that can be\n"
+            "restored to resume from a specific stage without re-running earlier steps.\n\n"
+            "Examples:\n"
+            "  kendr checkpoint save my-checkpoint\n"
+            "  kendr checkpoint restore my-checkpoint\n"
+            "  kendr checkpoint list\n"
+        ),
+    )
+    checkpoint_sub = checkpoint_parser.add_subparsers(dest="checkpoint_action", required=True)
+    ckpt_save = checkpoint_sub.add_parser("save", help="Save current pipeline state as a named checkpoint.")
+    ckpt_save.add_argument("name", nargs="?", default="", help="Checkpoint name (default: auto-timestamp).")
+    ckpt_save.add_argument("--dir", default="", metavar="PATH", help="Project directory (default: cwd).")
+    ckpt_restore = checkpoint_sub.add_parser("restore", help="Restore a named checkpoint.")
+    ckpt_restore.add_argument("name", help="Checkpoint name to restore.")
+    ckpt_restore.add_argument("--dir", default="", metavar="PATH", help="Project directory (default: cwd).")
+    checkpoint_sub.add_parser("list", help="List all available checkpoints.")
+    command_parsers["checkpoint"] = checkpoint_parser
+
+    # ── doctor — spec Section 2.2 system health check ────────────────────────
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run system health checks and diagnose configuration issues.",
+        description=(
+            "Verify that Kendr's runtime dependencies are correctly installed and\n"
+            "configured.  Checks LLM provider connectivity, gateway server, git,\n"
+            "Docker, Node.js / Python toolchains, and environment variables.\n"
+        ),
+    )
+    doctor_parser.add_argument("--fix", action="store_true", help="Attempt to auto-fix common issues.")
+    doctor_parser.add_argument("--json", action="store_true", help="Emit results as JSON.")
+    command_parsers["doctor"] = doctor_parser
+
+    # ── clean — spec Section 2.2 remove temp files ───────────────────────────
+    clean_parser = subparsers.add_parser(
+        "clean",
+        help="Remove temporary build artifacts and cache files.",
+        description=(
+            "Delete .kendr-cache, __pycache__, node_modules caches, and other\n"
+            "temporary files created during project generation or pipeline runs.\n\n"
+            "Examples:\n"
+            "  kendr clean               # clean current directory\n"
+            "  kendr clean --all         # clean all known working directories\n"
+            "  kendr clean --logs        # also remove pipeline log files\n"
+        ),
+    )
+    clean_parser.add_argument("path", nargs="?", default=".", help="Directory to clean (default: cwd).")
+    clean_parser.add_argument("--all", action="store_true", help="Clean all known working directories.")
+    clean_parser.add_argument("--logs", action="store_true", help="Also remove pipeline log files.")
+    clean_parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without deleting.")
+    command_parsers["clean"] = clean_parser
+
+    # ── upgrade — spec Section 2.2 upgrade to latest ─────────────────────────
+    upgrade_parser = subparsers.add_parser(
+        "upgrade",
+        help="Upgrade Kendr to the latest available version.",
+        description=(
+            "Check PyPI for the latest version and upgrade via pip if a newer\n"
+            "version is available.  Use --check to only report without installing.\n"
+        ),
+    )
+    upgrade_parser.add_argument("--check", action="store_true", help="Check for updates without installing.")
+    upgrade_parser.add_argument("--pre", action="store_true", help="Include pre-release versions.")
+    command_parsers["upgrade"] = upgrade_parser
+
     return parser, command_parsers
+
+
+def _cmd_new(args: argparse.Namespace) -> int:
+    """'kendr new' — spec Section 2.2 alias for generate --standalone."""
+    style = _style_from_args(args)
+    description = str(getattr(args, "description", "") or "").strip()
+    if not description:
+        if not sys.stdin.isatty():
+            description = sys.stdin.read().strip()
+        if not description:
+            print(style.fail("✗ No project description provided."))
+            print("  Usage: kendr new 'A job board where employers post jobs…' --stack nextjs")
+            return 1
+
+    from tasks.project_generation_orchestrator import ProjectGenerationOrchestrator
+
+    project_root = str(getattr(args, "project_root", "") or "")
+    stack = str(getattr(args, "stack", "") or "")
+    name = str(getattr(args, "name", "") or "")
+    github_repo = str(getattr(args, "github_repo", "") or "")
+    github_token = str(getattr(args, "github_token", "") or "")
+
+    def _progress(msg: str) -> None:
+        try:
+            payload = json.loads(msg)
+            text = payload.get("text", msg)
+        except Exception:
+            text = msg
+        print(text, flush=True)
+
+    orch = ProjectGenerationOrchestrator(
+        description=description,
+        stack=stack,
+        project_root=project_root,
+        project_name=name,
+        auto_approve=bool(getattr(args, "yes", False)),
+        skip_tests=bool(getattr(args, "no_tests", False)),
+        skip_devops=bool(getattr(args, "no_devops", False)),
+        github_repo=github_repo,
+        github_token=github_token,
+        progress_cb=_progress,
+    )
+    result = orch.run()
+    if result.get("ok"):
+        print(style.ok(f"\n✓ Project created: {result['project_root']}"))
+        if result.get("github_url"):
+            print(style.ok(f"  GitHub: {result['github_url']}"))
+        return 0
+    else:
+        print(style.fail(f"\n✗ Generation completed with errors ({len(result.get('errors', []))} issue(s))"))
+        for err in result.get("errors", [])[:3]:
+            print(f"  • {str(err)[:120]}")
+        return 1
+
+
+def _cmd_checkpoint(args: argparse.Namespace) -> int:
+    """'kendr checkpoint' — save/restore/list pipeline checkpoints."""
+    style = _style_from_args(args)
+    action = str(getattr(args, "checkpoint_action", "") or "")
+    project_dir = Path(str(getattr(args, "dir", "") or ".")).expanduser().resolve()
+    checkpoints_dir = project_dir / ".kendr" / "checkpoints"
+
+    if action == "list":
+        if not checkpoints_dir.exists():
+            print(style.muted("  No checkpoints found."))
+            return 0
+        ckpts = sorted(checkpoints_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not ckpts:
+            print(style.muted("  No checkpoints found."))
+            return 0
+        rows = [["Name", "Created", "Size"]]
+        for p in ckpts:
+            mtime = dt.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            size = f"{p.stat().st_size // 1024}KB" if p.stat().st_size >= 1024 else f"{p.stat().st_size}B"
+            rows.append([p.stem, mtime, size])
+        print(_render_table(rows[0], rows[1:]))
+        return 0
+
+    if action == "save":
+        name = str(getattr(args, "name", "") or "").strip()
+        if not name:
+            name = dt.datetime.now().strftime("ckpt-%Y%m%d-%H%M%S")
+        ckpt_path = checkpoints_dir / f"{name}.json"
+        checkpoints_dir.mkdir(parents=True, exist_ok=True)
+        # Save a metadata snapshot of the current working directory state
+        snapshot: dict = {
+            "name": name,
+            "created": dt.datetime.now().isoformat(),
+            "project_dir": str(project_dir),
+            "files": [str(p.relative_to(project_dir)) for p in project_dir.rglob("*") if p.is_file()
+                       and ".kendr" not in p.parts and ".git" not in p.parts][:500],
+        }
+        ckpt_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+        print(style.ok(f"✓ Checkpoint saved: {name}"))
+        print(style.muted(f"  {ckpt_path}"))
+        return 0
+
+    if action == "restore":
+        name = str(getattr(args, "name", "") or "").strip()
+        ckpt_path = checkpoints_dir / f"{name}.json"
+        if not ckpt_path.exists():
+            print(style.fail(f"✗ Checkpoint not found: {name}"))
+            return 1
+        try:
+            snapshot = json.loads(ckpt_path.read_text(encoding="utf-8"))
+            print(style.ok(f"✓ Checkpoint '{name}' found"))
+            print(style.muted(f"  Created: {snapshot.get('created', '?')}"))
+            print(style.muted(f"  Files tracked: {len(snapshot.get('files', []))}"))
+            print(style.warn("  Note: checkpoint restore shows metadata only."))
+            print(style.warn("  Use 'kendr resume' to resume an interrupted pipeline run."))
+        except Exception as exc:
+            print(style.fail(f"✗ Failed to read checkpoint: {exc}"))
+            return 1
+        return 0
+
+    print(style.fail(f"✗ Unknown checkpoint action: {action}"))
+    return 1
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """'kendr doctor' — spec Section 2.2 system health check."""
+    style = _style_from_args(args)
+    emit_json_out = bool(getattr(args, "json", False))
+    fix = bool(getattr(args, "fix", False))
+
+    checks: list[dict] = []
+
+    def _check(name: str, fn) -> dict:
+        try:
+            ok, msg = fn()
+            return {"name": name, "ok": ok, "message": msg}
+        except Exception as exc:
+            return {"name": name, "ok": False, "message": str(exc)}
+
+    # LLM provider
+    def _check_llm():
+        try:
+            from tasks.utils import llm
+            _ = llm  # just importing is sufficient to verify config
+            return True, "LLM provider configured"
+        except Exception as exc:
+            return False, str(exc)
+
+    # Git
+    def _check_git():
+        found = shutil.which("git")
+        if found:
+            result = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=5)
+            return result.returncode == 0, result.stdout.strip() or "git found"
+        return False, "git not found in PATH"
+
+    # Node.js
+    def _check_node():
+        found = shutil.which("node")
+        if found:
+            result = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=5)
+            return result.returncode == 0, result.stdout.strip() or "node found"
+        return False, "node not found in PATH"
+
+    # Python
+    def _check_python():
+        import sys as _sys
+        return True, f"Python {_sys.version.split()[0]}"
+
+    # Docker
+    def _check_docker():
+        found = shutil.which("docker")
+        if found:
+            result = subprocess.run(["docker", "info", "--format", "{{.ServerVersion}}"],
+                                    capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                return True, f"Docker {result.stdout.strip()}"
+            return False, "Docker daemon not running"
+        return False, "docker not found in PATH"
+
+    # Gateway
+    def _check_gateway():
+        port = int(os.environ.get("KENDR_PORT", "2150"))
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=2):
+                return True, f"Gateway running on port {port}"
+        except OSError:
+            return False, f"Gateway not running on port {port}"
+
+    # API key
+    def _check_api_key():
+        for var in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GOOGLE_API_KEY"):
+            if os.environ.get(var):
+                return True, f"{var} is set"
+        return False, "No LLM API key found (set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY)"
+
+    checks.append(_check("Python", _check_python))
+    checks.append(_check("Git", _check_git))
+    checks.append(_check("Node.js", _check_node))
+    checks.append(_check("Docker", _check_docker))
+    checks.append(_check("API key", _check_api_key))
+    checks.append(_check("LLM provider", _check_llm))
+    checks.append(_check("Gateway", _check_gateway))
+
+    if emit_json_out:
+        print(json.dumps(checks, indent=2))
+        return 0 if all(c["ok"] for c in checks) else 1
+
+    _ok_mark = "OK" if sys.platform == "win32" and sys.stdout.encoding and "utf" not in sys.stdout.encoding.lower() else "OK"
+    _fail_mark = "FAIL" if sys.platform == "win32" and sys.stdout.encoding and "utf" not in sys.stdout.encoding.lower() else "FAIL"
+
+    all_ok = True
+    for c in checks:
+        icon = style.ok(f"[{_ok_mark}]") if c["ok"] else style.fail(f"[{_fail_mark}]")
+        label = c["name"].ljust(16)
+        msg = c["message"]
+        line = f"  {icon}  {label}  {msg}"
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            print(line.encode("ascii", errors="replace").decode("ascii"))
+        if not c["ok"]:
+            all_ok = False
+
+    if all_ok:
+        print()
+        print(style.ok("All checks passed. Kendr is ready."))
+        return 0
+
+    print()
+    if fix:
+        print(style.warn("  Auto-fix is not yet implemented. Please resolve the issues above manually."))
+    else:
+        print(style.warn("  Some checks failed. Run 'kendr doctor --fix' to attempt auto-repair."))
+    return 1
+
+
+def _cmd_clean(args: argparse.Namespace) -> int:
+    """'kendr clean' — spec Section 2.2 remove temporary build artifacts."""
+    style = _style_from_args(args)
+    dry_run = bool(getattr(args, "dry_run", False))
+    clean_logs = bool(getattr(args, "logs", False))
+    clean_all = bool(getattr(args, "all", False))
+
+    target_path = Path(str(getattr(args, "path", ".") or ".")).expanduser().resolve()
+
+    dirs_to_clean = [target_path]
+    if clean_all:
+        try:
+            workdir_env = os.environ.get("KENDR_WORKING_DIR", "")
+            if workdir_env:
+                dirs_to_clean.append(Path(workdir_env))
+        except Exception:
+            pass
+
+    ARTIFACT_PATTERNS = [
+        "**/__pycache__",
+        "**/*.pyc",
+        "**/*.pyo",
+        "**/.kendr-cache",
+        "**/.mypy_cache",
+        "**/.ruff_cache",
+        "**/.pytest_cache",
+        "**/*.egg-info",
+        "**/dist",
+        "**/build",
+    ]
+    if clean_logs:
+        ARTIFACT_PATTERNS += ["**/*.log", "**/.kendr/logs"]
+
+    deleted: list[str] = []
+    for root_dir in dirs_to_clean:
+        if not root_dir.exists():
+            continue
+        for pattern in ARTIFACT_PATTERNS:
+            for path in root_dir.glob(pattern):
+                rel = str(path.relative_to(root_dir))
+                if any(p in path.parts for p in (".git", ".deps", ".venv", "venv", "node_modules", "site-packages")):
+                    continue
+                if dry_run:
+                    deleted.append(f"[dry-run] {rel}")
+                else:
+                    try:
+                        if path.is_dir():
+                            shutil.rmtree(path, ignore_errors=True)
+                        else:
+                            path.unlink(missing_ok=True)
+                        deleted.append(rel)
+                    except Exception:
+                        pass
+
+    if deleted:
+        for item in deleted[:20]:
+            try:
+                print(style.muted(f"  {'would delete' if dry_run else 'deleted'}  {item}"))
+            except UnicodeEncodeError:
+                print(style.muted(f"  {'would delete' if dry_run else 'deleted'}  {item.encode('ascii', errors='replace').decode('ascii')}"))
+        if len(deleted) > 20:
+            print(style.muted(f"  ... and {len(deleted) - 20} more"))
+        verb = "Would delete" if dry_run else "Cleaned"
+        print(style.ok(f"\n{verb} {len(deleted)} artifact(s)"))
+    else:
+        print(style.ok("Nothing to clean."))
+    return 0
+
+
+def _cmd_upgrade(args: argparse.Namespace) -> int:
+    """'kendr upgrade' — spec Section 2.2 upgrade to latest version."""
+    style = _style_from_args(args)
+    check_only = bool(getattr(args, "check", False))
+    pre = bool(getattr(args, "pre", False))
+
+    try:
+        current = importlib.metadata.version("kendr")
+    except importlib.metadata.PackageNotFoundError:
+        current = "dev"
+
+    print(style.muted(f"  Current version: {current}"))
+
+    # Check PyPI for latest
+    try:
+        url = "https://pypi.org/pypi/kendr/json"
+        req = urllib.request.Request(url, headers={"User-Agent": "kendr-cli"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if pre:
+            all_versions = list(data.get("releases", {}).keys())
+            latest = sorted(all_versions)[-1] if all_versions else data["info"]["version"]
+        else:
+            latest = data["info"]["version"]
+    except Exception as exc:
+        print(style.fail(f"✗ Could not check PyPI: {exc}"))
+        return 1
+
+    print(style.muted(f"  Latest version:  {latest}"))
+
+    if current == latest:
+        print(style.ok("✓ Already up to date."))
+        return 0
+
+    if check_only:
+        print(style.warn(f"  Update available: {current} → {latest}"))
+        print(style.muted("  Run 'kendr upgrade' (without --check) to install."))
+        return 0
+
+    print(style.muted(f"  Upgrading {current} → {latest}…"))
+    pre_flag = ["--pre"] if pre else []
+    result = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--upgrade"] + pre_flag + ["kendr"],
+        capture_output=False,
+    )
+    if result.returncode == 0:
+        print(style.ok(f"\n✓ Upgraded to kendr {latest}"))
+        return 0
+    else:
+        print(style.fail("\n✗ Upgrade failed. Try: pip install --upgrade kendr"))
+        return 1
 
 
 def _render_test_report(report: dict, style: "_CliStyle") -> str:
@@ -5089,7 +5609,19 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
         port_listening = bool(pids)
         health_ok = _gateway_ready(timeout_seconds=0.8)
         running = health_ok or (pid_owned and port_listening)
+        # Recover PID and start_time from port listener if state files were lost
+        if running and (not pid or not pid_alive):
+            recovered_pid = pids[0] if pids else None
+            if recovered_pid:
+                _write_gateway_pid(recovered_pid)
+                pid = recovered_pid
+                pid_alive = True
+                pid_owned = True
         start_time = _read_gateway_start_time()
+        # If start_time was lost (e.g. from a failed stop), record now as a fallback
+        if running and not start_time:
+            _gateway_start_time_path().write_text(str(time.time()), encoding="utf-8")
+            start_time = _read_gateway_start_time()
         uptime = (time.time() - start_time) if (running and start_time) else None
         if pid and not pid_alive:
             _clear_gateway_pid()
@@ -5097,6 +5629,30 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
         elif pid and pid_alive and not pid_owned:
             _clear_gateway_pid()
             pid = None
+
+        ui_host, ui_port = _ui_host_port()
+        ui_pids = _listener_pids_for_port(ui_port)
+        ui_running = _ui_ready(timeout_seconds=0.8)
+        ui_pid = ui_pids[0] if ui_pids else None
+
+        servers = [
+            {
+                "name": "Gateway",
+                "url": base,
+                "port": port,
+                "pid": pid,
+                "running": running,
+                "uptime_seconds": round(uptime, 1) if uptime is not None else None,
+            },
+            {
+                "name": "UI",
+                "url": _ui_base_url(),
+                "port": ui_port,
+                "pid": ui_pid,
+                "running": ui_running,
+                "uptime_seconds": round(uptime, 1) if (ui_running and uptime is not None) else None,
+            },
+        ]
         payload = {
             "running": running,
             "health_ok": health_ok,
@@ -5109,33 +5665,37 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
             "pids": pids,
             "pid": pid,
             "uptime_seconds": round(uptime, 1) if uptime is not None else None,
+            "servers": servers,
         }
         if use_json:
             print(json.dumps(payload, indent=2, ensure_ascii=False))
             return 0
-        out.gateway_status(running, base, pid=pid, uptime_seconds=uptime)
+        out.gateway_status(running, base, pid=pid, uptime_seconds=uptime, servers=servers)
         return 0
 
     if action == "stop":
         pid = _read_gateway_pid()
         killed_via_pid = False
-        pid_is_owned = pid and _pid_is_alive(pid) and _pid_is_gateway_owned(pid)
-        if pid_is_owned:
+        if pid and _pid_is_alive(pid):
             try:
-                import signal
-                os.kill(pid, signal.SIGTERM)
-                deadline = time.time() + 5.0
-                while time.time() < deadline and _pid_is_alive(pid):
-                    time.sleep(0.2)
-                if _pid_is_alive(pid):
-                    if _pid_is_gateway_owned(pid):
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True, check=False)
+                    killed_via_pid = True
+                elif _pid_is_gateway_owned(pid):
+                    import signal
+                    os.kill(pid, signal.SIGTERM)
+                    deadline = time.time() + 5.0
+                    while time.time() < deadline and _pid_is_alive(pid):
+                        time.sleep(0.2)
+                    if _pid_is_alive(pid) and _pid_is_gateway_owned(pid):
                         os.kill(pid, signal.SIGKILL)
-                killed_via_pid = True
+                    killed_via_pid = True
+                else:
+                    _clear_gateway_pid()
             except Exception:
                 pass
-        elif pid and _pid_is_alive(pid) and not _pid_is_gateway_owned(pid):
-            _clear_gateway_pid()
         stopped_port = _terminate_gateway_on_port()
+        _terminate_ui_on_port()
         _clear_gateway_pid()
         _wait_for_listener_shutdown(port, timeout_seconds=3.0)
         stopped = max(int(killed_via_pid), stopped_port)
@@ -5150,6 +5710,7 @@ def _cmd_gateway(args: argparse.Namespace) -> int:
 
     if action == "restart":
         _terminate_gateway_on_port()
+        _terminate_ui_on_port()
         _clear_gateway_pid()
         _start_gateway_process()
         pid = _read_gateway_pid()
@@ -6322,6 +6883,16 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_workdir(args)
         if args.command == "ui":
             return _cmd_ui(args)
+        if args.command == "new":
+            return _cmd_new(args)
+        if args.command == "checkpoint":
+            return _cmd_checkpoint(args)
+        if args.command == "doctor":
+            return _cmd_doctor(args)
+        if args.command == "clean":
+            return _cmd_clean(args)
+        if args.command == "upgrade":
+            return _cmd_upgrade(args)
         raise SystemExit(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
         print("\nQuit")

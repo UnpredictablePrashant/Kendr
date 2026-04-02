@@ -259,21 +259,50 @@ def gateway_not_running(base_url: str) -> None:
     )
 
 
-def gateway_status(running: bool, base_url: str, pid: int | None, uptime_seconds: float | None) -> None:
-    if running:
+def _fmt_uptime(uptime_seconds: float | None) -> str:
+    if uptime_seconds is None:
+        return "-"
+    m, s = divmod(int(uptime_seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m{s:02d}s"
+    elif m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def gateway_status(
+    running: bool,
+    base_url: str,
+    pid: int | None,
+    uptime_seconds: float | None,
+    servers: list[dict] | None = None,
+) -> None:
+    if servers:
+        table = Table(box=None, pad_edge=False, show_header=True, header_style=f"bold {_GREY}")
+        table.add_column("Server", style="bold", min_width=10)
+        table.add_column("Status", min_width=10)
+        table.add_column("URL", min_width=25)
+        table.add_column("Port", justify="right", min_width=6)
+        table.add_column("PID", justify="right", min_width=7)
+        table.add_column("Uptime", justify="right", min_width=10)
+        for srv in servers:
+            is_up = bool(srv.get("running"))
+            status_text = Text("● running", style=f"bold {_TEAL}") if is_up else Text("○ stopped", style=_AMBER)
+            table.add_row(
+                srv.get("name", ""),
+                status_text,
+                str(srv.get("url", "")),
+                str(srv.get("port", "")),
+                str(srv.get("pid", "") or "-"),
+                _fmt_uptime(srv.get("uptime_seconds")),
+            )
+        _console.print(table)
+    elif running:
         parts = [f"✓ running  {base_url}"]
         if pid:
-            parts.append(f"  pid={pid}")
-        if uptime_seconds is not None:
-            m, s = divmod(int(uptime_seconds), 60)
-            h, m = divmod(m, 60)
-            if h:
-                uptime_str = f"{h}h{m:02d}m{s:02d}s"
-            elif m:
-                uptime_str = f"{m}m{s:02d}s"
-            else:
-                uptime_str = f"{s}s"
-            parts.append(f"  uptime={uptime_str}")
+            parts.append(f"pid={pid}")
+        parts.append(f"uptime={_fmt_uptime(uptime_seconds)}")
         _console.print(Text("  ".join(parts), style=f"bold {_TEAL}"))
     else:
         _console.print(Text(f"  stopped  {base_url}", style=_AMBER))
