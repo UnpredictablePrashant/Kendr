@@ -16,7 +16,6 @@ PYTHON = sys.executable
 COMPILE_TARGETS = [
     "app.py",
     "gateway_server.py",
-    "setup_ui.py",
     "kendr",
     "tasks",
     "mcp_servers",

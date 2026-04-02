@@ -761,7 +761,7 @@ def _pid_is_gateway_owned(pid: int) -> bool:
         try:
             with open(cmdline_path, "rb") as f:
                 cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="replace")
-            gateway_keywords = ("kendr", "gateway", "serve", "uvicorn", "setup_ui")
+            gateway_keywords = ("kendr", "gateway", "serve", "uvicorn")
             return any(kw in cmdline for kw in gateway_keywords)
         except Exception:
             return False

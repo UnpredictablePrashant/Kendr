@@ -773,13 +773,13 @@ def setup_component_catalog() -> list[dict]:
             "docs_path": "docs/install.md",
         },
         {
-            "id": "setup_ui",
-            "title": "Setup UI",
+            "id": "kendr_ui",
+            "title": "Kendr Web UI",
             "category": "Runtime",
-            "description": "Configuration web UI bind settings.",
+            "description": "Web UI bind settings (chat, setup, run history, MCP servers, projects).",
             "fields": [
-                asdict(_field("SETUP_UI_HOST", "Host", "Setup UI bind host.", default="127.0.0.1")),
-                asdict(_field("SETUP_UI_PORT", "Port", "Setup UI bind port.", default="8787")),
+                asdict(_field("KENDR_UI_HOST", "Host", "Web UI bind host.", default="0.0.0.0")),
+                asdict(_field("KENDR_UI_PORT", "Port", "Web UI bind port.", default="5000")),
             ],
             "docs_path": "docs/install.md",
         },

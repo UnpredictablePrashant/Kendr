@@ -10,7 +10,6 @@ class ImportSmokeTests(unittest.TestCase):
     def test_import_runtime_entrypoints(self):
         import app  # noqa: F401
         import gateway_server  # noqa: F401
-        import setup_ui  # noqa: F401
         import plugin_templates.project_stacks  # noqa: F401
         import kendr.domain.local_drive  # noqa: F401
         import kendr.setup.catalog  # noqa: F401
