@@ -148,6 +148,8 @@ Or copy `.env.example` to `.env` and fill in the values manually.
 
 ```bash
 kendr ui
+# or the shorter alias:
+kendr web
 ```
 
 Opens the web interface at **http://localhost:5000** with:

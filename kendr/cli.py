@@ -2095,7 +2095,10 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         help="Gateway action. 'serve' runs in foreground.",
     )
     gateway_parser.add_argument("--json", action="store_true", help="Emit machine-readable status output.")
-    subparsers.add_parser("web", help="Alias for gateway server.")
+    web_parser = subparsers.add_parser("web", help="Launch the Kendr Web UI (alias for 'kendr ui').")
+    web_parser.add_argument("--port", type=int, default=0, help="Override port (default: KENDR_UI_PORT or 2151).")
+    web_parser.add_argument("--host", default="", help="Override bind host.")
+    web_parser.add_argument("--no-browser", action="store_true", help="Do not open a browser tab.")
     subparsers.add_parser("setup-ui", help="Run the OAuth/setup UI.")
     ui_parser = subparsers.add_parser("ui", help="Launch the Kendr Web Chat & Config UI on port 2151.")
     command_parsers["ui"] = ui_parser
@@ -6199,7 +6202,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "gateway":
             return _cmd_gateway(args)
         if args.command == "web":
-            return _cmd_gateway(argparse.Namespace(action="serve"))
+            return _cmd_ui(args)
         if args.command == "setup-ui":
             from .setup_ui import main as setup_main
 
