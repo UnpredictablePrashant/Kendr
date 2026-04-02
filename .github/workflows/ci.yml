@@ -91,7 +91,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run Trivy filesystem scan
-        uses: aquasecurity/trivy-action@v2
+        uses: aquasecurity/trivy-action@v0.35.0
         with:
           scan-type: fs
           format: table
@@ -109,7 +109,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run GitHub Secret Scanning
-        uses: github/secret-scanning-action@v1
+      - name: Run Secret Scanning Review
+        uses: advanced-security/secret-scanning-review-action@v2.2.0
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SECRET_SCAN_REVIEW_GITHUB_TOKEN }}
+          fail-on-alert: true
+          fail-on-alert-exclude-closed: true

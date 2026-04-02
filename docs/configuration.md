@@ -16,6 +16,7 @@ The minimum required set for any Kendr run.
 | `OUTPUT_DIR` | no | `output` | Default top-level output directory relative to working directory. | `output` |
 | `RESEARCH_USER_AGENT` | no | `multi-agent-research-bot/1.0 (+https://localhost)` | HTTP User-Agent sent by the web crawl / research infrastructure. | `mybot/2.0 (+https://mysite.com)` |
 | `KENDR_MODEL` | no | _(falls back to `OPENAI_MODEL`)_ | Short-form model override applied to all agents that don't have an explicit model set. | `gpt-4o` |
+| `KENDR_SHELL` | no | _(auto-detected)_ | Unix-style shell executable (bash, sh, pwsh, etc.). Kand terminal uses this when present instead of the platform default. | `C:\Program Files\Git\bin\bash.exe` |
 
 ---
 

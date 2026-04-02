@@ -112,8 +112,9 @@ class CliSmokeTests(unittest.TestCase):
                 cli._clear_transient_status_line()
 
         output = stderr.getvalue()
+        clean_output = cli._ANSI_ESCAPE_RE.sub("", output)
         self.assertIn("\r", output)
-        self.assertIn("[run]\n", output)
+        self.assertIn("[run]\n", clean_output)
         self.assertIn("|- status: running", output)
         self.assertIn("|- agent: worker_agent", output)
         self.assertIn("`- step: 1", output)

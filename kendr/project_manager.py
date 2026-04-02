@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import signal
+import shutil
 import socket
 import subprocess
 import threading
@@ -420,26 +421,65 @@ def read_file_content(file_path: str, project_root: str = "") -> dict:
 def _build_shell_env() -> dict:
     """Build a rich environment for shell commands including all nix/system paths."""
     base = dict(os.environ)
-    path_parts = base.get("PATH", "").split(":")
-    extra_paths = [
-        "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
-        "/nix/var/nix/profiles/default/bin",
-    ]
+    path_parts = base.get("PATH", "").split(os.pathsep)
+    if os.name == "nt":
+        extra_paths = [
+            r"C:\Windows\System32",
+            r"C:\Windows",
+            r"C:\Windows\System32\Wbem",
+            r"C:\Windows\System32\WindowsPowerShell\v1.0",
+        ]
+    else:
+        extra_paths = [
+            "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+            "/nix/var/nix/profiles/default/bin",
+        ]
     for p in extra_paths:
         if p and p not in path_parts:
             path_parts.append(p)
-    base["PATH"] = ":".join(p for p in path_parts if p)
+    base["PATH"] = os.pathsep.join(p for p in path_parts if p)
     base.setdefault("TERM", "xterm-256color")
     base.setdefault("LANG", "en_US.UTF-8")
     return base
 
 
+def _shell_args_for_path(shell_path: str, command: str) -> list[str]:
+    """Return subprocess arguments for the given shell binary."""
+    clean = shell_path.lower()
+    if os.name == "nt":
+        if "bash" in clean or clean.endswith("bash.exe"):
+            return [shell_path, "-lc", command]
+        if "powershell" in clean or "pwsh" in clean:
+            return [shell_path, "-NoLogo", "-NoProfile", "-Command", command]
+        return [shell_path, "/d", "/s", "/c", command]
+    return [shell_path, "-c", command]
+
+
+def _resolve_shell_args(command: str) -> list[str]:
+    """Pick an appropriate shell executable for the running platform."""
+    preferred = str(os.environ.get("KENDR_SHELL") or "").strip()
+    if preferred:
+        shell_path = shutil.which(preferred) or preferred
+        return _shell_args_for_path(shell_path, command)
+    if os.name == "nt":
+        candidate = str(os.environ.get("COMSPEC") or "cmd.exe")
+        shell_path = shutil.which(candidate) or candidate
+        return _shell_args_for_path(shell_path, command)
+    shell = os.environ.get("SHELL")
+    if shell:
+        shell_path = shutil.which(shell)
+        if shell_path:
+            return _shell_args_for_path(shell_path, command)
+    shell_path = shutil.which("bash") or shutil.which("sh") or "/bin/bash"
+    return _shell_args_for_path(shell_path, command)
+
+
 def run_shell(command: str, cwd: str, timeout: int = 60) -> dict:
-    """Run a shell command in the given directory via bash. Returns stdout, stderr, exit code."""
+    """Run a shell command in the given directory via an OS-appropriate shell."""
     cwd = _normalize_path(cwd)
     try:
         result = subprocess.run(
-            ["/bin/bash", "-c", command],
+            _resolve_shell_args(command),
             cwd=cwd,
             capture_output=True,
             text=True,
