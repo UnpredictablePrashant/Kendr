@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -154,6 +155,13 @@ def _safe_int(value: Any, default: int, minimum: int, maximum: int) -> int:
     except Exception:
         parsed = default
     return max(minimum, min(maximum, parsed))
+
+
+def _parallelism(value: Any, *, env_key: str, default: int, minimum: int, maximum: int) -> int:
+    candidate = value
+    if candidate is None or str(candidate).strip() == "":
+        candidate = os.getenv(env_key, str(default))
+    return _safe_int(candidate, default, minimum, maximum)
 
 
 def _normalize_title(value: str, fallback: str) -> str:
@@ -469,29 +477,13 @@ def _sources_from_url_entries(entries: list[dict]) -> list[dict]:
     return sources
 
 
-def _collect_user_url_evidence(objective: str, state: dict, *, max_items: int = 12) -> list[dict]:
-    urls = _normalize_research_urls(state.get("deep_research_source_urls", []))
-    if not urls:
-        return []
-    fetch_started_at = _trace_now()
-    _trace_research_event(
-        state,
-        title="Extracting provided URLs",
-        detail=f"Fetching and summarizing {min(len(urls), max_items)} user-provided URLs.",
-        command="\n".join(urls[:max_items]),
-        status="running",
-        started_at=fetch_started_at,
-        metadata={"phase": "provided_urls", "urls": _trace_url_list(urls[:max_items])},
-        subtask="Fetch provided URLs",
-    )
-    entries = []
-    for url in urls[:max_items]:
-        try:
-            page = fetch_url_content(url, timeout=20)
-            page_text = _trim_text(str(page.get("text", "")).strip(), 8000)
-            if page_text:
-                summary = llm_text(
-                    f"""
+def _collect_single_user_url_entry(objective: str, url: str) -> dict:
+    try:
+        page = fetch_url_content(url, timeout=20)
+        page_text = _trim_text(str(page.get("text", "")).strip(), 8000)
+        if page_text:
+            summary = llm_text(
+                f"""
 You are summarizing a user-provided URL for a deep research report.
 
 Primary objective:
@@ -509,34 +501,74 @@ Write a concise evidence summary covering:
 - relevance to the objective
 - any credibility or freshness concerns
 """
-                ).strip()
-            else:
-                summary = "No readable text was extracted from this URL."
-            entries.append(
-                {
-                    "source_type": "provided_url",
-                    "url": url,
-                    "label": _source_label(url),
-                    "content_type": str(page.get("content_type", "")).strip(),
-                    "char_count": len(str(page.get("text", "")).strip()),
-                    "summary": summary,
-                    "excerpt": _trim_text(page_text, 2500),
-                    "error": "",
-                }
-            )
-        except Exception as exc:
-            entries.append(
-                {
-                    "source_type": "provided_url",
-                    "url": url,
-                    "label": _source_label(url),
-                    "content_type": "",
-                    "char_count": 0,
-                    "summary": "",
-                    "excerpt": "",
-                    "error": str(exc),
-                }
-            )
+            ).strip()
+        else:
+            summary = "No readable text was extracted from this URL."
+        return {
+            "source_type": "provided_url",
+            "url": url,
+            "label": _source_label(url),
+            "content_type": str(page.get("content_type", "")).strip(),
+            "char_count": len(str(page.get("text", "")).strip()),
+            "summary": summary,
+            "excerpt": _trim_text(page_text, 2500),
+            "error": "",
+        }
+    except Exception as exc:
+        return {
+            "source_type": "provided_url",
+            "url": url,
+            "label": _source_label(url),
+            "content_type": "",
+            "char_count": 0,
+            "summary": "",
+            "excerpt": "",
+            "error": str(exc),
+        }
+
+
+def _collect_user_url_evidence(objective: str, state: dict, *, max_items: int = 12) -> list[dict]:
+    urls = _normalize_research_urls(state.get("deep_research_source_urls", []))
+    if not urls:
+        return []
+    bounded_urls = urls[:max_items]
+    fetch_parallelism = min(
+        len(bounded_urls),
+        _parallelism(
+            state.get("research_url_fetch_concurrency"),
+            env_key="KENDR_RESEARCH_URL_FETCH_CONCURRENCY",
+            default=4,
+            minimum=1,
+            maximum=12,
+        ),
+    )
+    fetch_started_at = _trace_now()
+    _trace_research_event(
+        state,
+        title="Extracting provided URLs",
+        detail=(
+            f"Fetching and summarizing {len(bounded_urls)} user-provided URLs"
+            + (f" with {fetch_parallelism} parallel workers." if fetch_parallelism > 1 else ".")
+        ),
+        command="\n".join(bounded_urls),
+        status="running",
+        started_at=fetch_started_at,
+        metadata={"phase": "provided_urls", "urls": _trace_url_list(bounded_urls), "parallelism": fetch_parallelism},
+        subtask="Fetch provided URLs",
+    )
+    indexed_entries: dict[int, dict] = {}
+    if fetch_parallelism <= 1:
+        for index, url in enumerate(bounded_urls):
+            indexed_entries[index] = _collect_single_user_url_entry(objective, url)
+    else:
+        with ThreadPoolExecutor(max_workers=fetch_parallelism, thread_name_prefix="kendr-url") as executor:
+            future_map = {
+                executor.submit(_collect_single_user_url_entry, objective, url): index
+                for index, url in enumerate(bounded_urls)
+            }
+            for future in as_completed(future_map):
+                indexed_entries[future_map[future]] = future.result()
+    entries = [indexed_entries[index] for index in sorted(indexed_entries)]
     ok_urls = [str(item.get("url", "")).strip() for item in entries if not str(item.get("error", "")).strip()]
     failed_urls = [str(item.get("url", "")).strip() for item in entries if str(item.get("error", "")).strip()]
     _trace_research_event(
@@ -546,7 +578,7 @@ Write a concise evidence summary covering:
             f"Extracted {len(ok_urls)} URL(s)"
             + (f"; {len(failed_urls)} failed." if failed_urls else ".")
         ),
-        command="\n".join(urls[:max_items]),
+        command="\n".join(bounded_urls),
         status="completed" if not failed_urls else ("failed" if not ok_urls else "completed"),
         started_at=fetch_started_at,
         completed_at=_trace_now(),
@@ -554,6 +586,7 @@ Write a concise evidence summary covering:
             "phase": "provided_urls",
             "urls": _trace_url_list(ok_urls or urls[:max_items]),
             "failed_urls": _trace_url_list(failed_urls),
+            "parallelism": fetch_parallelism,
         },
         subtask="Fetch provided URLs",
     )
@@ -1822,6 +1855,226 @@ def _run_research_pass(
     }
 
 
+def _collect_section_research_package(
+    *,
+    api_key: str,
+    objective: str,
+    section: dict,
+    section_index: int,
+    total_sections: int,
+    section_pages: int,
+    use_section_search: bool,
+    section_search_results_count: int,
+    collect_sources_first: bool,
+    evidence_excerpt: str,
+    evidence_sources: list[dict],
+    explicit_source_entries: list[dict],
+    local_entries: list[dict],
+    url_entries: list[dict],
+    continuity_notes: list[str],
+    coherence_context_md: str,
+    web_search_enabled: bool,
+    research_model: str,
+    research_instructions: str,
+    max_tool_calls: int,
+    max_output_tokens_int: int | None,
+    poll_interval_seconds: int,
+    max_wait_seconds: int,
+    heartbeat_seconds: int,
+    max_sources: int,
+) -> dict[str, Any]:
+    section_title = str(section.get("title", f"Section {section_index}")).strip() or f"Section {section_index}"
+    section_objective = str(section.get("objective", objective)).strip() or objective
+    section_questions = section.get("key_questions", [])
+    if not isinstance(section_questions, list):
+        section_questions = []
+    target_section_pages = _safe_int(section.get("target_pages"), section_pages, 1, 30)
+
+    search_query = ""
+    section_search_results: dict[str, Any] = {}
+    section_search_sources: list[dict] = []
+    section_search_text = ""
+    if use_section_search:
+        search_query = f"{section_title} {section_objective}"
+        section_search_results = _collect_google_search_evidence(search_query, num=section_search_results_count)
+        section_search_sources = _sources_from_search_results(section_search_results.get("results", []))
+        section_search_text = _search_results_markdown(section_search_results.get("results", []))
+
+    local_section_notes = (
+        _build_local_only_research_notes(
+            objective=objective,
+            focus=f"section {section_index}: {section_title} - {section_objective}",
+            local_entries=local_entries,
+            url_entries=url_entries,
+            continuity_notes=continuity_notes,
+        )
+        if explicit_source_entries
+        else ""
+    )
+
+    if collect_sources_first and evidence_excerpt:
+        research_pass = {
+            "response_id": "evidence_bank" if web_search_enabled else f"local_only_section_{section_index}",
+            "status": "evidence_bank" if web_search_enabled else "local_only",
+            "elapsed_seconds": 0,
+            "output_text": local_section_notes or evidence_excerpt,
+            "raw": {"evidence_bank_path": ""},
+        }
+        research_output = local_section_notes or evidence_excerpt
+        if section_search_text:
+            research_output = f"{section_search_text}\n\n{research_output}"
+        section_sources = _merge_sources(list(evidence_sources), section_search_sources)
+    else:
+        if web_search_enabled:
+            query_lines = [
+                f"Global objective: {objective}",
+                f"Section {section_index} title: {section_title}",
+                f"Section objective: {section_objective}",
+                "Key questions:",
+                *[f"- {item}" for item in section_questions[:12]],
+                "Continuity notes from previous sections:",
+                *[f"- {item}" for item in continuity_notes[-10:]],
+                "Markdown coherence anchors:",
+                _trim_text(coherence_context_md, 4000),
+            ]
+            research_pass = _run_research_pass(
+                OpenAI(api_key=api_key),
+                query="\n".join(query_lines),
+                model=research_model,
+                instructions=research_instructions,
+                max_tool_calls=max_tool_calls,
+                max_output_tokens=max_output_tokens_int,
+                poll_interval_seconds=poll_interval_seconds,
+                max_wait_seconds=max_wait_seconds,
+                heartbeat_interval_seconds=heartbeat_seconds,
+                heartbeat_label=f"Section {section_index} research in progress",
+            )
+            research_output = str(research_pass.get("output_text", "")).strip()
+        else:
+            research_pass = {
+                "response_id": f"local_only_section_{section_index}",
+                "status": "local_only",
+                "elapsed_seconds": 0,
+                "output_text": local_section_notes,
+                "raw": {"reason": "web_search_disabled"},
+            }
+            research_output = local_section_notes
+        if section_search_text:
+            research_output = f"{section_search_text}\n\n{research_output}".strip()
+        if not research_output:
+            research_output = (
+                section_search_text
+                or "Research output was empty. Use only explicitly supported claims and call out uncertainty."
+            )
+
+        section_sources = _merge_sources(explicit_source_entries, _extract_source_entries(research_pass))
+        section_sources = _merge_sources(section_sources, section_search_sources)
+
+    if max_sources > 0:
+        section_sources = section_sources[:max_sources]
+    source_ledger_md = _source_ledger_markdown(section_sources)
+    return {
+        "index": section_index,
+        "title": section_title,
+        "objective": section_objective,
+        "key_questions": section_questions,
+        "target_pages": target_section_pages,
+        "research_pass": research_pass,
+        "research_text": research_output,
+        "sources": section_sources,
+        "source_ledger_md": source_ledger_md,
+        "search_query": search_query,
+        "section_search_results": section_search_results,
+    }
+
+
+def _record_section_research_package(
+    state: dict,
+    *,
+    package: dict[str, Any],
+    total_sections: int,
+    artifact_dir: str,
+    research_log_lines: list[str],
+    section_research_started_at: str,
+) -> dict[str, Any]:
+    index = int(package.get("index", 0) or 0)
+    section_title = str(package.get("title", f"Section {index}")).strip() or f"Section {index}"
+    research_pass = package.get("research_pass", {}) if isinstance(package.get("research_pass"), dict) else {}
+    section_sources = package.get("sources", []) if isinstance(package.get("sources"), list) else []
+    search_query = str(package.get("search_query", "")).strip()
+    section_search_results = (
+        package.get("section_search_results", {}) if isinstance(package.get("section_search_results"), dict) else {}
+    )
+
+    if search_query:
+        _trace_research_event(
+            state,
+            title=f"Google search results for section {index}",
+            detail=f"{section_title} returned {len((section_search_results or {}).get('results', []))} result(s).",
+            command=search_query,
+            status="completed" if not str((section_search_results or {}).get("error", "")).strip() else "failed",
+            metadata={
+                "phase": "section_search",
+                "section_index": index,
+                "section_title": section_title,
+                "search_query": search_query,
+                "urls": _trace_url_list(
+                    [str(item.get("url", "")).strip() for item in (section_search_results or {}).get("results", [])]
+                ),
+            },
+            subtask=f"Search for {section_title}",
+        )
+        if str((section_search_results or {}).get("error", "")).strip():
+            log_task_update(DEEP_RESEARCH_LABEL, f"Section {index} web search error: {section_search_results.get('error')}")
+
+    section_research_status = str(research_pass.get("status", "")).strip() or "completed"
+    if section_research_status not in {"completed", "", "local_only", "evidence_bank"}:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Section {index} research status: {research_pass.get('status')}")
+
+    _trace_research_event(
+        state,
+        title=f"Researching section {index}/{total_sections}",
+        detail=(
+            f"{section_title} completed with {len(section_sources)} sources."
+            if section_research_status in {"completed", "local_only", "evidence_bank"}
+            else f"{section_title} finished with status '{section_research_status}'. Using partial research output."
+        ),
+        command=str(package.get("objective", "")).strip(),
+        status="completed" if section_research_status in {"completed", "local_only", "evidence_bank"} else "failed",
+        started_at=section_research_started_at,
+        completed_at=_trace_now(),
+        metadata={
+            "phase": "section_research",
+            "section_index": index,
+            "section_title": section_title,
+            "response_status": section_research_status,
+            "sources": len(section_sources),
+            "elapsed_seconds": int(research_pass.get("elapsed_seconds", 0) or 0),
+            "search_query": search_query,
+            "urls": _trace_url_list([str(item.get("url", "")).strip() for item in section_sources]),
+        },
+        subtask=f"Gather evidence for {section_title}",
+    )
+
+    write_text_file(
+        _artifact_file(artifact_dir, f"section_{index:02d}/research.json"),
+        json.dumps(research_pass, indent=2, ensure_ascii=False),
+    )
+    write_text_file(
+        _artifact_file(artifact_dir, f"section_{index:02d}/sources.json"),
+        json.dumps(section_sources, indent=2, ensure_ascii=False),
+    )
+    write_text_file(
+        _artifact_file(artifact_dir, f"section_{index:02d}/sources.md"),
+        _references_markdown(section_sources),
+    )
+    research_log_lines.append(f"Researched section {index}: {section_title} ({len(section_sources)} sources)")
+
+    package = dict(package)
+    package.pop("section_search_results", None)
+    return package
+
+
 def _format_section_prompt(
     *,
     global_objective: str,
@@ -2804,7 +3057,147 @@ def long_document_agent(state):
     coherence_context_md = _coherence_base_context(state, objective)
     write_text_file(_artifact_file(artifact_dir, "deep_research_coherence_base.md"), coherence_context_md)
 
-    sections = outline.get("sections", []) if isinstance(outline.get("sections", []), list) else []
+    parallel_sections = outline.get("sections", []) if isinstance(outline.get("sections", []), list) else []
+    total_parallel_sections = len(parallel_sections)
+    section_parallelism = min(
+        max(total_parallel_sections, 1),
+        _parallelism(
+            state.get("research_section_concurrency"),
+            env_key="KENDR_RESEARCH_SECTION_CONCURRENCY",
+            default=3,
+            minimum=1,
+            maximum=8,
+        ),
+    )
+    if total_parallel_sections:
+        log_task_update(
+            DEEP_RESEARCH_LABEL,
+            f"Phase 1/4 - researching {total_parallel_sections} sections with {section_parallelism} worker(s).",
+        )
+        section_started_at_by_index: dict[int, str] = {}
+        completed_section_packages: dict[int, dict[str, Any]] = {}
+
+        def _finalize_section_package(package: dict[str, Any]) -> None:
+            recorded = _record_section_research_package(
+                state,
+                package=package,
+                total_sections=total_parallel_sections,
+                artifact_dir=artifact_dir,
+                research_log_lines=research_log_lines,
+                section_research_started_at=section_started_at_by_index.get(int(package.get("index", 0) or 0), _trace_now()),
+            )
+            completed_section_packages[int(recorded.get("index", 0) or 0)] = recorded
+
+        if section_parallelism <= 1:
+            for index, section in enumerate(parallel_sections, start=1):
+                section_title = str(section.get("title", f"Section {index}")).strip() or f"Section {index}"
+                section_objective = str(section.get("objective", objective)).strip() or objective
+                log_task_update(
+                    DEEP_RESEARCH_LABEL,
+                    f"Phase 1/4 - researching section {index}/{total_parallel_sections}: {section_title}",
+                )
+                section_started_at_by_index[index] = _trace_now()
+                _trace_research_event(
+                    state,
+                    title=f"Researching section {index}/{total_parallel_sections}",
+                    detail=section_title,
+                    command=section_objective,
+                    status="running",
+                    started_at=section_started_at_by_index[index],
+                    metadata={"phase": "section_research", "section_index": index, "section_title": section_title},
+                    subtask=f"Gather evidence for {section_title}",
+                )
+                _finalize_section_package(
+                    _collect_section_research_package(
+                        api_key=api_key,
+                        objective=objective,
+                        section=section,
+                        section_index=index,
+                        total_sections=total_parallel_sections,
+                        section_pages=section_pages,
+                        use_section_search=use_section_search,
+                        section_search_results_count=section_search_results_count,
+                        collect_sources_first=collect_sources_first,
+                        evidence_excerpt=evidence_excerpt,
+                        evidence_sources=evidence_sources,
+                        explicit_source_entries=explicit_source_entries,
+                        local_entries=local_entries,
+                        url_entries=url_entries,
+                        continuity_notes=continuity_notes,
+                        coherence_context_md=coherence_context_md,
+                        web_search_enabled=web_search_enabled,
+                        research_model=research_model,
+                        research_instructions=research_instructions,
+                        max_tool_calls=max_tool_calls,
+                        max_output_tokens_int=max_output_tokens_int,
+                        poll_interval_seconds=poll_interval_seconds,
+                        max_wait_seconds=max_wait_seconds,
+                        heartbeat_seconds=heartbeat_seconds,
+                        max_sources=max_sources,
+                    )
+                )
+        else:
+            with ThreadPoolExecutor(max_workers=section_parallelism, thread_name_prefix="kendr-section") as executor:
+                future_map = {}
+                for index, section in enumerate(parallel_sections, start=1):
+                    section_title = str(section.get("title", f"Section {index}")).strip() or f"Section {index}"
+                    section_objective = str(section.get("objective", objective)).strip() or objective
+                    log_task_update(
+                        DEEP_RESEARCH_LABEL,
+                        f"Phase 1/4 - queued section {index}/{total_parallel_sections}: {section_title}",
+                    )
+                    section_started_at_by_index[index] = _trace_now()
+                    _trace_research_event(
+                        state,
+                        title=f"Researching section {index}/{total_parallel_sections}",
+                        detail=f"{section_title} queued on the research worker pool.",
+                        command=section_objective,
+                        status="running",
+                        started_at=section_started_at_by_index[index],
+                        metadata={
+                            "phase": "section_research",
+                            "section_index": index,
+                            "section_title": section_title,
+                            "parallelism": section_parallelism,
+                        },
+                        subtask=f"Gather evidence for {section_title}",
+                    )
+                    future = executor.submit(
+                        _collect_section_research_package,
+                        api_key=api_key,
+                        objective=objective,
+                        section=section,
+                        section_index=index,
+                        total_sections=total_parallel_sections,
+                        section_pages=section_pages,
+                        use_section_search=use_section_search,
+                        section_search_results_count=section_search_results_count,
+                        collect_sources_first=collect_sources_first,
+                        evidence_excerpt=evidence_excerpt,
+                        evidence_sources=evidence_sources,
+                        explicit_source_entries=explicit_source_entries,
+                        local_entries=local_entries,
+                        url_entries=url_entries,
+                        continuity_notes=continuity_notes,
+                        coherence_context_md=coherence_context_md,
+                        web_search_enabled=web_search_enabled,
+                        research_model=research_model,
+                        research_instructions=research_instructions,
+                        max_tool_calls=max_tool_calls,
+                        max_output_tokens_int=max_output_tokens_int,
+                        poll_interval_seconds=poll_interval_seconds,
+                        max_wait_seconds=max_wait_seconds,
+                        heartbeat_seconds=heartbeat_seconds,
+                        max_sources=max_sources,
+                    )
+                    future_map[future] = index
+
+                for future in as_completed(future_map):
+                    _finalize_section_package(future.result())
+
+        section_packages = [completed_section_packages[index] for index in sorted(completed_section_packages)]
+
+    sections: list[dict[str, Any]] = []
     total_sections = len(sections)
     for index, section in enumerate(sections, start=1):
         section_title = str(section.get("title", f"Section {index}")).strip() or f"Section {index}"

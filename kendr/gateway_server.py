@@ -305,6 +305,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if self.path != "/resume":
             state_overrides = {
                 "run_id": str(payload.get("run_id", "")).strip(),
+                "workflow_id": str(payload.get("workflow_id", "")).strip() or str(payload.get("run_id", "")).strip(),
+                "attempt_id": str(payload.get("attempt_id", "")).strip() or str(payload.get("run_id", "")).strip(),
                 "max_steps": int(payload.get("max_steps", 20)),
                 "incoming_channel": payload.get("channel", "webchat"),
                 "incoming_sender_id": payload.get("sender_id", ""),
@@ -324,6 +326,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             state_overrides["incoming_text"] = text
             state_overrides["incoming_mentions_assistant"] = bool(payload.get("mentions_assistant", False))
             state_overrides["incoming_payload"] = payload
+            explicit_workflow_id = str(payload.get("workflow_id", "")).strip()
+            explicit_attempt_id = str(payload.get("attempt_id", "")).strip()
+            explicit_run_id = str(payload.get("run_id", "")).strip()
+            if explicit_workflow_id:
+                state_overrides["workflow_id"] = explicit_workflow_id
+            elif explicit_run_id and not str(state_overrides.get("workflow_id", "")).strip():
+                state_overrides["workflow_id"] = explicit_run_id
+            if explicit_attempt_id:
+                state_overrides["attempt_id"] = explicit_attempt_id
+            elif explicit_run_id and not str(state_overrides.get("attempt_id", "")).strip():
+                state_overrides["attempt_id"] = explicit_run_id
+            if explicit_run_id:
+                state_overrides["run_id"] = explicit_run_id
         normalized_channel = normalize_incoming_message(
             payload,
             channel=str(state_overrides.get("incoming_channel") or payload.get("channel") or "webchat"),

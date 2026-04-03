@@ -44,6 +44,8 @@ def insert_run(
     started_at: str,
     status: str,
     *,
+    workflow_id: str = "",
+    attempt_id: str = "",
     updated_at: str | None = None,
     working_directory: str = "",
     run_output_dir: str = "",
@@ -58,13 +60,15 @@ def insert_run(
         conn.execute(
             """
             INSERT OR REPLACE INTO runs (
-                run_id, user_query, started_at, updated_at, status,
+                run_id, workflow_id, attempt_id, user_query, started_at, updated_at, status,
                 working_directory, run_output_dir, session_id, parent_run_id, resumable, checkpoint_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
+                workflow_id or run_id,
+                attempt_id or run_id,
                 user_query,
                 started_at,
                 updated_at or started_at,
@@ -82,6 +86,8 @@ def insert_run(
 def update_run(
     run_id: str,
     *,
+    workflow_id: str | None = None,
+    attempt_id: str | None = None,
     status: str | None = None,
     updated_at: str | None = None,
     completed_at: str | None = None,
@@ -97,6 +103,12 @@ def update_run(
     initialize_db(db_path)
     fields = []
     values = []
+    if workflow_id is not None:
+        fields.append("workflow_id = ?")
+        values.append(workflow_id)
+    if attempt_id is not None:
+        fields.append("attempt_id = ?")
+        values.append(attempt_id)
     if status is not None:
         fields.append("status = ?")
         values.append(status)
@@ -140,7 +152,7 @@ def get_run(run_id: str, db_path: str = DB_PATH) -> dict | None:
     with _connect(db_path) as conn:
         row = conn.execute(
             """
-            SELECT run_id, user_query, started_at, updated_at, completed_at, status, final_output,
+            SELECT run_id, workflow_id, attempt_id, user_query, started_at, updated_at, completed_at, status, final_output,
                    working_directory, run_output_dir, session_id, parent_run_id, resumable, checkpoint_json
             FROM runs
             WHERE run_id = ?
@@ -315,11 +327,13 @@ def upsert_task_session(session: dict, db_path: str = DB_PATH):
         conn.execute(
             """
             INSERT INTO task_sessions (
-                session_id, run_id, channel, session_key, started_at, updated_at,
+                session_id, run_id, workflow_id, attempt_id, channel, session_key, started_at, updated_at,
                 completed_at, status, active_agent, step_count, summary_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
                 run_id=excluded.run_id,
+                workflow_id=excluded.workflow_id,
+                attempt_id=excluded.attempt_id,
                 channel=excluded.channel,
                 session_key=excluded.session_key,
                 started_at=excluded.started_at,
@@ -333,6 +347,8 @@ def upsert_task_session(session: dict, db_path: str = DB_PATH):
             (
                 session.get("session_id", ""),
                 session.get("run_id", ""),
+                session.get("workflow_id", ""),
+                session.get("attempt_id", ""),
                 session.get("channel", ""),
                 session.get("session_key", ""),
                 session.get("started_at", ""),
@@ -555,7 +571,7 @@ def list_recent_runs(limit: int = 20, db_path: str = DB_PATH) -> list[dict]:
     with _connect(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT run_id, user_query, started_at, updated_at, completed_at, status, final_output,
+            SELECT run_id, workflow_id, attempt_id, user_query, started_at, updated_at, completed_at, status, final_output,
                    working_directory, run_output_dir, session_id, parent_run_id, resumable
             FROM runs
             ORDER BY COALESCE(updated_at, started_at) DESC
@@ -656,7 +672,7 @@ def list_task_sessions(limit: int = 50, db_path: str = DB_PATH) -> list[dict]:
     with _connect(db_path) as conn:
         rows = conn.execute(
             """
-            SELECT session_id, run_id, channel, session_key, started_at, updated_at,
+            SELECT session_id, run_id, workflow_id, attempt_id, channel, session_key, started_at, updated_at,
                    completed_at, status, active_agent, step_count, summary_json
             FROM task_sessions
             ORDER BY updated_at DESC, started_at DESC
@@ -672,7 +688,7 @@ def get_task_session_by_run(run_id: str, db_path: str = DB_PATH) -> dict | None:
     with _connect(db_path) as conn:
         row = conn.execute(
             """
-            SELECT session_id, run_id, channel, session_key, started_at, updated_at,
+            SELECT session_id, run_id, workflow_id, attempt_id, channel, session_key, started_at, updated_at,
                    completed_at, status, active_agent, step_count, summary_json
             FROM task_sessions
             WHERE run_id = ?

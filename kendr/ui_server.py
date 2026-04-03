@@ -644,8 +644,23 @@ def _pending_run_state(
     completed_at = ""
     if resolved_status not in {"running", "started"}:
         completed_at = str(previous.get("completed_at") or now).strip() or now
+    result_data = result if isinstance(result, dict) else (previous.get("result") if isinstance(previous.get("result"), dict) else {})
+    workflow_id = (
+        str((result_data or {}).get("workflow_id", "")).strip()
+        or str(base_payload.get("workflow_id", "")).strip()
+        or str(previous.get("workflow_id", "")).strip()
+        or run_id
+    )
+    attempt_id = (
+        str((result_data or {}).get("attempt_id", "")).strip()
+        or str(base_payload.get("attempt_id", "")).strip()
+        or str(previous.get("attempt_id", "")).strip()
+        or run_id
+    )
     return {
         "run_id": run_id,
+        "workflow_id": workflow_id,
+        "attempt_id": attempt_id,
         "status": resolved_status,
         "started_at": started_at,
         "updated_at": now,
@@ -664,6 +679,18 @@ def _overlay_run_with_pending(run_row: dict | None, pending: dict | None) -> dic
     payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
     if pending:
         base["run_id"] = base.get("run_id") or pending.get("run_id")
+        base["workflow_id"] = (
+            base.get("workflow_id")
+            or pending.get("workflow_id")
+            or payload.get("workflow_id")
+            or base.get("run_id")
+        )
+        base["attempt_id"] = (
+            base.get("attempt_id")
+            or pending.get("attempt_id")
+            or payload.get("attempt_id")
+            or base.get("run_id")
+        )
         base["status"] = pending.get("status") or base.get("status") or "running"
         base["started_at"] = pending.get("started_at") or base.get("started_at") or base.get("created_at") or ""
         base["updated_at"] = pending.get("updated_at") or base.get("updated_at") or base.get("started_at") or ""
@@ -680,7 +707,12 @@ def _overlay_run_with_pending(run_row: dict | None, pending: dict | None) -> dic
         base["working_directory"] = base.get("working_directory") or payload.get("working_directory") or payload.get("project_root") or ""
         base["session_id"] = base.get("session_id") or payload.get("chat_id") or ""
         base["channel"] = base.get("channel") or payload.get("channel") or ""
+        base["workflow_id"] = base.get("workflow_id") or payload.get("workflow_id") or base.get("run_id") or ""
+        base["attempt_id"] = base.get("attempt_id") or payload.get("attempt_id") or base.get("run_id") or ""
     result = base.get("result") if isinstance(base.get("result"), dict) else {}
+    if result:
+        base["workflow_id"] = base.get("workflow_id") or result.get("workflow_id") or base.get("run_id") or ""
+        base["attempt_id"] = base.get("attempt_id") or result.get("attempt_id") or base.get("run_id") or ""
     awaiting = bool(
         base.get("awaiting_user_input")
         or result.get("awaiting_user_input")
@@ -708,6 +740,24 @@ def _live_recent_runs(runs: list[dict] | None) -> list[dict]:
     for run_id, pending in pending_snapshot.items():
         merged[run_id] = _overlay_run_with_pending(merged.get(run_id), pending) or {}
     rows = [row for row in merged.values() if isinstance(row, dict) and str(row.get("run_id") or "").strip()]
+    latest_by_workflow: dict[str, dict] = {}
+    for row in rows:
+        workflow_id = str(row.get("workflow_id") or row.get("run_id") or "").strip()
+        if not workflow_id:
+            continue
+        previous = latest_by_workflow.get(workflow_id)
+        if previous is None:
+            latest_by_workflow[workflow_id] = row
+            continue
+        row_status = str(row.get("status") or "").strip().lower()
+        previous_status = str(previous.get("status") or "").strip().lower()
+        row_rank = 0 if row_status in {"running", "started", "awaiting_user_input"} else 1
+        previous_rank = 0 if previous_status in {"running", "started", "awaiting_user_input"} else 1
+        row_ts = str(row.get("updated_at") or row.get("started_at") or row.get("created_at") or "")
+        previous_ts = str(previous.get("updated_at") or previous.get("started_at") or previous.get("created_at") or "")
+        if row_rank < previous_rank or (row_rank == previous_rank and row_ts >= previous_ts):
+            latest_by_workflow[workflow_id] = row
+    rows = list(latest_by_workflow.values())
     rows.sort(
         key=lambda row: (
             0 if str(row.get("status") or "").strip().lower() in {"running", "started", "awaiting_user_input"} else 1,
@@ -1294,14 +1344,14 @@ a:hover { text-decoration: underline; }
 .chat-activity-status.failed { color: var(--crimson); background: rgba(255,71,87,0.12); }
 .chat-activity-status.pending, .chat-activity-status.queued, .chat-activity-status.info { color: var(--muted); background: rgba(255,255,255,0.06); }
 .chat-command-preview { min-height: 70px; padding: 10px 12px; border-radius: 10px; background: rgba(0,0,0,0.18); border: 1px solid var(--border); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: #d7e3ff; white-space: pre-wrap; word-break: break-word; }
-.approval-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:2200; align-items:center; justify-content:center; padding:20px; }
+.approval-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:2200; align-items:center; justify-content:center; padding:20px; overflow:auto; }
 .approval-overlay.open { display:flex; }
-.approval-modal { width:min(560px, 100%); background:var(--surface); border:1px solid var(--border); border-radius:16px; box-shadow:0 24px 60px rgba(0,0,0,0.45); overflow:hidden; }
+.approval-modal { width:min(560px, 100%); max-height:min(84vh, 920px); display:flex; flex-direction:column; background:var(--surface); border:1px solid var(--border); border-radius:16px; box-shadow:0 24px 60px rgba(0,0,0,0.45); overflow:hidden; }
 .approval-modal-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:18px 20px 14px; border-bottom:1px solid var(--border); }
 .approval-modal-title { font-size:15px; font-weight:700; color:var(--text); }
 .approval-modal-sub { font-size:11px; color:var(--muted); margin-top:4px; }
 .approval-modal-close { background:none; border:none; color:var(--muted); font-size:20px; cursor:pointer; line-height:1; }
-.approval-modal-body { padding:18px 20px; }
+.approval-modal-body { padding:18px 20px; overflow-y:auto; min-height:0; }
 .approval-scope { display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:999px; background:rgba(83,82,237,0.14); border:1px solid rgba(83,82,237,0.35); color:#b8b7ff; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; }
 .approval-prompt { margin-top:12px; font-size:13px; color:var(--text); line-height:1.6; white-space:pre-wrap; }
 .approval-help { margin-top:10px; font-size:12px; color:var(--muted); line-height:1.5; }
@@ -1606,6 +1656,7 @@ a:hover { text-decoration: underline; }
 <script>
 const API = '';
 let currentRunId = null;
+let currentWorkflowId = null;
 let isRunning = false;
 let isAwaitingInput = false;
 let gatewayOnline = false;
@@ -1738,7 +1789,7 @@ function _recordChatActivity(item, defaults = {}) {
 function _resetChatInspectorState() {
   _chatActivityFeed = [];
   _chatPlanState = { total: 0, completed: 0, running: 0, failed: 0 };
-  _chatRunState = { runId: '', status: 'idle', title: '', task: '', startedAt: '', completedAt: '', lastCommand: '', lastCommandMeta: '' };
+  _chatRunState = { runId: '', workflowId: '', attemptId: '', status: 'idle', title: '', task: '', startedAt: '', completedAt: '', lastCommand: '', lastCommandMeta: '' };
   _renderChatActivityList();
   _renderChatInspector();
 }
@@ -1773,7 +1824,11 @@ function _renderChatInspector() {
   }
   if (statusEl) statusEl.textContent = _chatStatusLabel(_chatRunState.status);
   if (modeEl) modeEl.textContent = researchMode === 'deep_research' ? 'Deep Research' : 'Auto';
-  if (runIdEl) runIdEl.textContent = _chatRunState.runId || '-';
+  if (runIdEl) {
+    const workflowText = _chatRunState.workflowId || _chatRunState.runId || '-';
+    const attemptText = _chatRunState.attemptId && _chatRunState.attemptId !== workflowText ? ' / ' + _chatRunState.attemptId : '';
+    runIdEl.textContent = workflowText + attemptText;
+  }
   if (gatewayEl) gatewayEl.textContent = gatewayOnline ? 'Online' : 'Offline';
   if (taskEl) taskEl.textContent = _chatRunState.task || 'No active task';
   if (taskMetaEl) {
@@ -2248,10 +2303,14 @@ function _toggleChatApprovalSuggestion() {
 function _setChatAwaitingContext(meta) {
   _chatAwaitingContext = Object.assign({
     runId: currentRunId || '',
+    workflowId: currentWorkflowId || currentRunId || '',
+    attemptId: currentRunId || '',
     workingDir: workingDir || _pendingResumeDir || '',
     prompt: '',
     pendingKind: '',
     scope: '',
+    task: _chatRunState.task || _chatRunState.title || '',
+    title: _chatRunState.title || _chatRunState.task || '',
   }, meta || {});
   isAwaitingInput = true;
   _showAwaitingBanner();
@@ -2371,7 +2430,8 @@ async function loadRuns() {
     chatRuns.slice(0, 30).forEach(run => {
       const div = document.createElement('div');
       const status = (run.status || 'completed').toLowerCase();
-      const isActive = run.run_id === currentRunId;
+      const workflowId = run.workflow_id || run.run_id || '';
+      const isActive = workflowId === (currentWorkflowId || currentRunId) || run.run_id === currentRunId;
       const isRunning = status === 'running' || status === 'started';
       const isAwaiting = status === 'awaiting_user_input';
       div.className = 'run-item' + (isActive ? ' active' : '');
@@ -2442,6 +2502,7 @@ async function loadRun(runId) {
   _removeAwaitingBanner();
   document.getElementById('sendBtn').disabled = false;
   currentRunId = runId;
+  currentWorkflowId = null;
   const myToken = ++_loadRunToken;
   loadRuns();
 
@@ -2455,11 +2516,14 @@ async function loadRun(runId) {
     const query = d.user_query || d.query || d.text || '';
     const output = d.final_output || d.output || d.draft_response || '';
     const status = (d.status || 'completed').toLowerCase();
+    currentWorkflowId = d.workflow_id || runId;
     const lastAgent = d.last_agent || '';
     const createdAt = d.created_at ? new Date(d.created_at).toLocaleString() : '';
     const completedAt = d.completed_at ? new Date(d.completed_at).toLocaleString() : '';
     _chatRunState = {
       runId,
+      workflowId: d.workflow_id || runId,
+      attemptId: d.attempt_id || runId,
       status,
       title: query ? (query.substring(0, 80) + (query.length > 80 ? '…' : '')) : 'Loaded run',
       task: query || '',
@@ -2500,18 +2564,15 @@ async function loadRun(runId) {
 
     if (status === 'awaiting_user_input') {
       const runWorkDir = d.working_directory || d.run_output_dir || '';
-      const banner = document.createElement('div');
-      banner.style.cssText = 'margin:8px 0 0 52px;padding:10px 14px;background:rgba(83,82,237,0.1);border:1px solid rgba(83,82,237,0.3);border-radius:8px;font-size:13px;color:var(--text);display:flex;align-items:center;gap:12px;flex-wrap:wrap';
-      banner.innerHTML = '<span><span style="color:#8b8af0;font-weight:600">&#x23F3; Awaiting your input</span> &mdash; this run is paused and waiting for a response.</span>' +
-        '<button onclick="continueRun(' + JSON.stringify(runId) + ',' + JSON.stringify(runWorkDir) + ')" style="padding:5px 12px;border-radius:6px;border:1px solid rgba(83,82,237,0.5);background:rgba(83,82,237,0.15);color:#8b8af0;font-size:12px;font-weight:600;cursor:pointer">&#x25B6; Continue This Run</button>';
-      msgs.appendChild(banner);
-      _chatAwaitingContext = {
+      _setChatAwaitingContext({
         runId,
+        workflowId: d.workflow_id || runId,
+        attemptId: d.attempt_id || runId,
         workingDir: runWorkDir,
-        prompt: output || 'This run is waiting for your approval or feedback.',
+        prompt: d.pending_user_question || output || 'This run is waiting for your approval or feedback.',
         pendingKind: ((d.task_session || {}).pending_user_input_kind || ''),
         scope: ((d.task_session || {}).approval_pending_scope || ''),
-      };
+      });
     }
 
     try {
@@ -2550,6 +2611,7 @@ function esc(s) {
 function newChat() {
   _loadRunToken++;
   currentRunId = null;
+  currentWorkflowId = null;
   isAwaitingInput = false;
   deepResearchUploadedRoots = [];
   deepResearchLocalPaths = [];
@@ -2584,6 +2646,7 @@ async function deleteChat() {
   isRunning = false;
   document.getElementById('sendBtn').disabled = false;
   currentRunId = null;
+  currentWorkflowId = null;
   _removeAwaitingBanner();
   _closeChatApprovalModal();
   _chatAwaitingContext = null;
@@ -2625,6 +2688,7 @@ async function deleteRun(runId, itemEl) {
     if (d.ok) {
       if (currentRunId === runId) {
         currentRunId = null;
+        currentWorkflowId = null;
         _chatAwaitingContext = null;
         _closeChatApprovalModal();
         _resetChatInspectorState();
@@ -3393,12 +3457,17 @@ function openEventStream(runId) {
       const d = JSON.parse(e.data);
       const output = d.final_output || d.output || d.draft_response || '';
       const awaiting = d.awaiting_user_input || d.plan_waiting_for_approval || d.plan_needs_clarification || false;
+      currentWorkflowId = d.workflow_id || currentWorkflowId || runId;
+      _chatRunState.workflowId = currentWorkflowId;
+      _chatRunState.attemptId = d.attempt_id || runId;
       _chatRunState.status = awaiting ? 'awaiting_user_input' : 'completed';
       updateStreamStatus(runId, awaiting ? 'Awaiting your input\u2026' : 'Completed.');
       finalizeStreamRow(runId, output, '', d.artifact_files || [], d.test_report || null, d.mcp_invocations || null, d.long_document_exports || null, d.deep_research_result_card || null);
       if (awaiting) {
         _setChatAwaitingContext({
           runId: d.run_id || runId,
+          workflowId: d.workflow_id || currentWorkflowId || runId,
+          attemptId: d.attempt_id || runId,
           workingDir: d.working_directory || workingDir || _pendingResumeDir || '',
           prompt: d.pending_user_question || output || 'This run is waiting for your approval or feedback.',
           pendingKind: d.pending_user_input_kind || '',
@@ -3477,16 +3546,25 @@ async function sendMessage() {
   document.getElementById('sendBtn').disabled = true;
 
   const isContinuation = isAwaitingInput;
+  const continuationContext = isContinuation ? Object.assign({}, _chatAwaitingContext || {}) : null;
+  const continuationRunId = continuationContext && continuationContext.runId ? continuationContext.runId : '';
+  const continuationWorkflowId = continuationContext && continuationContext.workflowId ? continuationContext.workflowId : '';
+  const continuationTask = continuationContext && continuationContext.task ? continuationContext.task : (_chatRunState.task || '');
+  const continuationTitle = continuationContext && continuationContext.title ? continuationContext.title : (_chatRunState.title || '');
   isAwaitingInput = false;
   _closeChatApprovalModal();
   _removeAwaitingBanner();
 
   appendUserMsg(text);
-  const runId = 'ui-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  const runId = continuationRunId || ('ui-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+  const workflowId = continuationWorkflowId || runId;
   currentRunId = runId;
+  currentWorkflowId = workflowId;
   sessionStorage.setItem('kendr_active_run_id', runId);
   _chatRunState = {
     runId,
+    workflowId,
+    attemptId: runId,
     status: 'running',
     title: text.substring(0, 80) + (text.length > 80 ? '…' : ''),
     task: text,
@@ -3495,20 +3573,24 @@ async function sendMessage() {
     lastCommand: '',
     lastCommandMeta: '',
   };
+  if (isContinuation) {
+    _chatRunState.title = continuationTitle || continuationTask || 'Continuing paused run';
+    _chatRunState.task = continuationTask || continuationTitle || text;
+  }
   _chatPlanState = { total: 0, completed: 0, running: 0, failed: 0 };
   _chatActivityFeed = [];
   _renderChatActivityList();
   _recordChatActivity({
-    title: 'User request submitted',
+    title: isContinuation ? 'Approval reply submitted' : 'User request submitted',
     status: 'running',
     detail: text,
     started_at: _chatRunState.startedAt,
-    task: text,
+    task: _chatRunState.task || text,
   });
   if (!isContinuation) {
     document.getElementById('chatTitle').textContent = text.substring(0, 40) + (text.length > 40 ? '...' : '');
   }
-  createStreamingRow(runId, text);
+  createStreamingRow(runId, isContinuation ? (_chatRunState.task || text) : text);
 
   try {
     const resumeDir = _pendingResumeDir;
@@ -3520,6 +3602,8 @@ async function sendMessage() {
       sender_id: 'ui_user',
       chat_id: chatSessionId,
       run_id: runId,
+      workflow_id: workflowId,
+      attempt_id: runId,
       working_directory: workingDir
     };
     if (researchMode === 'deep_research') {
@@ -3608,11 +3692,14 @@ setInterval(loadProjContext, 60000);
     const status = (run.status || '').toLowerCase();
     if (status === 'running' || status === 'started') {
       currentRunId = run.run_id;
+      currentWorkflowId = run.workflow_id || run.run_id;
       const query = run.user_query || run.query || 'Running…';
       document.getElementById('chatTitle').textContent = query.substring(0, 40) + (query.length > 40 ? '...' : '');
       document.getElementById('clearChatBtn').style.display = '';
       _chatRunState = {
         runId: run.run_id,
+        workflowId: run.workflow_id || run.run_id,
+        attemptId: run.attempt_id || run.run_id,
         status: 'running',
         title: query.substring(0, 80) + (query.length > 80 ? '…' : ''),
         task: query,
@@ -4112,14 +4199,14 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
 .form-field textarea { min-height: 84px; resize: vertical; }
 .form-field input:focus, .form-field select:focus, .form-field textarea:focus { border-color: var(--teal); }
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
-.approval-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.72); z-index:2400; align-items:center; justify-content:center; padding:20px; }
+.approval-overlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.72); z-index:2400; align-items:center; justify-content:center; padding:20px; overflow:auto; }
 .approval-overlay.open { display:flex; }
-.approval-box { width:min(560px, 100%); background:var(--surface); border:1px solid var(--border); border-radius:16px; box-shadow:0 24px 60px rgba(0,0,0,.45); overflow:hidden; }
+.approval-box { width:min(560px, 100%); max-height:min(84vh, 920px); display:flex; flex-direction:column; background:var(--surface); border:1px solid var(--border); border-radius:16px; box-shadow:0 24px 60px rgba(0,0,0,.45); overflow:hidden; }
 .approval-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:18px 20px 14px; border-bottom:1px solid var(--border); }
 .approval-title { font-size:15px; font-weight:700; color:var(--text); }
 .approval-subtitle { font-size:11px; color:var(--muted); margin-top:4px; }
 .approval-close { background:none; border:none; color:var(--muted); font-size:20px; cursor:pointer; line-height:1; }
-.approval-body { padding:18px 20px; }
+.approval-body { padding:18px 20px; overflow-y:auto; min-height:0; }
 .approval-scope-pill { display:inline-flex; align-items:center; gap:6px; padding:4px 9px; border-radius:999px; background:rgba(83,82,237,.14); border:1px solid rgba(83,82,237,.35); color:#b8b7ff; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; }
 .approval-copy { margin-top:12px; font-size:13px; color:var(--text); line-height:1.6; white-space:pre-wrap; }
 .approval-hint { margin-top:10px; font-size:12px; color:var(--muted); line-height:1.5; }
@@ -5918,6 +6005,8 @@ function _streamProjectRuntime(runId, bubble) {
           });
           _projectAwaitingContext = {
             runId: data.run_id || runId,
+            workflowId: data.workflow_id || runId,
+            attemptId: data.attempt_id || runId,
             workingDir: data.working_directory || _activeProjectPath || '',
             prompt: data.pending_user_question || output || 'This project run is waiting for your response.',
             pendingKind: data.pending_user_input_kind || '',
@@ -5982,13 +6071,16 @@ async function _sendProjectResume(replyText, approvalContext, existingBubble, ap
     return created;
   })();
   bubble.innerHTML = '<span class="spinner"></span>';
-  const runId = 'project-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  const runId = (context && context.runId) ? context.runId : ('project-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
+  const workflowId = (context && context.workflowId) ? context.workflowId : runId;
   const payload = {
     text: replyText,
     channel: 'project_ui',
     sender_id: 'project_ui_user',
     chat_id: _activeProjectId || '',
     run_id: runId,
+    workflow_id: workflowId,
+    attempt_id: runId,
     resume_dir: context.workingDir || _activeProjectPath || '',
     working_directory: context.workingDir || _activeProjectPath || '',
     project_id: _activeProjectId || '',
@@ -6065,12 +6157,15 @@ function _submitProjectApproval(action) {
 
 async function _sendProjectRuntime(text, bubble) {
   const runId = 'project-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  const workflowId = runId;
   const payload = {
     text,
     channel: 'project_ui',
     sender_id: 'project_ui_user',
     chat_id: _activeProjectId || '',
     run_id: runId,
+    workflow_id: workflowId,
+    attempt_id: runId,
     project_id: _activeProjectId || '',
     project_root: _activeProjectPath || '',
     project_name: _activeProjectName || '',
@@ -9892,6 +9987,8 @@ strong { color: var(--text); }
             _persist_project_chat_user_request(payload, text)
         run_id = str(body.get("run_id") or "").strip() or f"ui-{uuid.uuid4().hex[:8]}"
         payload["run_id"] = run_id
+        payload["workflow_id"] = str(body.get("workflow_id") or "").strip() or run_id
+        payload["attempt_id"] = str(body.get("attempt_id") or "").strip() or run_id
 
         q: "queue.Queue[dict]" = queue.Queue()
         with _pending_lock:
@@ -9903,7 +10000,16 @@ strong { color: var(--text); }
             _start_standalone_run_background(run_id, payload)
         else:
             _start_run_background(run_id, payload)
-        self._json(200, {"run_id": run_id, "streaming": True, "status": "started"})
+        self._json(
+            200,
+            {
+                "run_id": run_id,
+                "workflow_id": str(payload.get("workflow_id") or run_id),
+                "attempt_id": str(payload.get("attempt_id") or run_id),
+                "streaming": True,
+                "status": "started",
+            },
+        )
 
     def _handle_chat_resume(self, body: dict) -> None:
         text = str(body.get("text") or body.get("message") or "").strip()
@@ -9918,10 +10024,16 @@ strong { color: var(--text); }
             self._json(503, {"error": "Gateway not running", "detail": "Start it with: kendr gateway start"})
             return
         run_id = str(body.get("run_id") or "").strip() or f"ui-{uuid.uuid4().hex[:8]}"
+        workflow_id = str(body.get("workflow_id") or "").strip() or run_id
+        attempt_id = str(body.get("attempt_id") or "").strip() or run_id
         q: "queue.Queue[dict]" = queue.Queue()
         with _pending_lock:
             _run_event_queues[run_id] = q
-            _pending_runs[run_id] = _pending_run_state(run_id, payload={"text": text, **body, "working_directory": resume_dir}, status="running")
+            _pending_runs[run_id] = _pending_run_state(
+                run_id,
+                payload={"text": text, **body, "working_directory": resume_dir, "workflow_id": workflow_id, "attempt_id": attempt_id},
+                status="running",
+            )
 
         def _run() -> None:
             _push_event(run_id, "status", {"status": "running", "message": "Resuming run..."})
@@ -9935,6 +10047,8 @@ strong { color: var(--text); }
                     "sender_id": str(body.get("sender_id", "ui_user")),
                     "chat_id": str(body.get("chat_id", "")),
                     "run_id": run_id,
+                    "workflow_id": workflow_id,
+                    "attempt_id": attempt_id,
                 }
                 for key in ("provider", "model", "project_id", "project_root", "project_name"):
                     value = body.get(key)
@@ -9973,7 +10087,16 @@ strong { color: var(--text); }
         import threading as _threading
         t = _threading.Thread(target=_run, daemon=True)
         t.start()
-        self._json(200, {"run_id": run_id, "streaming": True, "status": "started"})
+        self._json(
+            200,
+            {
+                "run_id": run_id,
+                "workflow_id": workflow_id,
+                "attempt_id": attempt_id,
+                "streaming": True,
+                "status": "started",
+            },
+        )
 
     def _handle_sse(self, run_id: str) -> None:
         self.send_response(200)

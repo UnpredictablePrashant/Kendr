@@ -176,6 +176,8 @@ class ResumeStateOverrides(TypedDict, total=False):
     resume_checkpoint_payload: dict[str, Any]
     resume_mode: str
     parent_run_id: str
+    workflow_id: str
+    attempt_id: str
     incoming_channel: str
     incoming_workspace_id: str
     incoming_sender_id: str

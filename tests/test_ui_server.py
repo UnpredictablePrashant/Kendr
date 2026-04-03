@@ -250,6 +250,13 @@ class TestChatHtmlExecutionLens(unittest.TestCase):
         self.assertIn("chatApprovalModal", ui_server._CHAT_HTML)
         self.assertIn("_submitChatApproval('approve')", ui_server._CHAT_HTML)
         self.assertIn("Send Suggestion", ui_server._CHAT_HTML)
+        self.assertIn("max-height:min(84vh, 920px)", ui_server._CHAT_HTML)
+        self.assertIn("overflow-y:auto", ui_server._CHAT_HTML)
+        self.assertIn("_setChatAwaitingContext({", ui_server._CHAT_HTML)
+        self.assertIn("continuationRunId", ui_server._CHAT_HTML)
+        self.assertIn("workflow_id: workflowId", ui_server._CHAT_HTML)
+        self.assertIn("currentWorkflowId", ui_server._CHAT_HTML)
+        self.assertIn("Approval reply submitted", ui_server._CHAT_HTML)
 
 
 class TestProjectsHtmlApprovalModal(unittest.TestCase):
@@ -259,6 +266,9 @@ class TestProjectsHtmlApprovalModal(unittest.TestCase):
         self.assertIn("projectApprovalModal", ui_server._PROJECTS_HTML)
         self.assertIn("_submitProjectApproval('approve')", ui_server._PROJECTS_HTML)
         self.assertIn("Suggestion", ui_server._PROJECTS_HTML)
+        self.assertIn("max-height:min(84vh, 920px)", ui_server._PROJECTS_HTML)
+        self.assertIn("overflow-y:auto", ui_server._PROJECTS_HTML)
+        self.assertIn("(context && context.runId)", ui_server._PROJECTS_HTML)
 
 
 class TestGatewayTimeoutHelpers(unittest.TestCase):
@@ -298,6 +308,42 @@ class TestLiveRunOverlay(unittest.TestCase):
         self.assertEqual(merged[0]["user_query"], "Old query")
         self.assertEqual(merged[0]["working_directory"], "/tmp/demo")
         self.assertEqual(merged[0]["completed_at"], "")
+        self.assertEqual(merged[0]["workflow_id"], "run-1")
+        self.assertEqual(merged[0]["attempt_id"], "run-1")
+
+    def test_live_recent_runs_collapses_attempts_into_single_workflow(self):
+        import kendr.ui_server as ui_server
+
+        runs = [
+            {
+                "run_id": "attempt-1",
+                "workflow_id": "workflow-1",
+                "attempt_id": "attempt-1",
+                "user_query": "Research bananas",
+                "status": "completed",
+                "started_at": "2026-04-03T10:00:00+00:00",
+                "updated_at": "2026-04-03T10:05:00+00:00",
+                "completed_at": "2026-04-03T10:05:00+00:00",
+            },
+            {
+                "run_id": "attempt-2",
+                "workflow_id": "workflow-1",
+                "attempt_id": "attempt-2",
+                "user_query": "Research bananas",
+                "status": "awaiting_user_input",
+                "started_at": "2026-04-03T10:06:00+00:00",
+                "updated_at": "2026-04-03T10:07:00+00:00",
+                "completed_at": "",
+            },
+        ]
+
+        merged = ui_server._live_recent_runs(runs)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["run_id"], "attempt-2")
+        self.assertEqual(merged[0]["workflow_id"], "workflow-1")
+        self.assertEqual(merged[0]["attempt_id"], "attempt-2")
+        self.assertEqual(merged[0]["status"], "awaiting_user_input")
 
     def test_live_run_marks_awaiting_input_from_pending_result(self):
         import kendr.ui_server as ui_server

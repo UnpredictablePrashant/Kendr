@@ -657,6 +657,8 @@ class AgentRuntime:
         return {
             "session_id": state.get("session_id", ""),
             "run_id": state.get("run_id", ""),
+            "workflow_id": state.get("workflow_id", state.get("run_id", "")),
+            "attempt_id": state.get("attempt_id", state.get("run_id", "")),
             "channel": state.get("incoming_channel", ""),
             "session_key": channel_session.get("session_key", ""),
             "started_at": state.get("session_started_at", ""),
@@ -667,6 +669,8 @@ class AgentRuntime:
             "step_count": self._display_step_count(state, status=status, active_agent=active_agent),
             "summary": {
                 "objective": state.get("current_objective", ""),
+                "workflow_id": state.get("workflow_id", state.get("run_id", "")),
+                "attempt_id": state.get("attempt_id", state.get("run_id", "")),
                 "last_agent": state.get("last_agent", ""),
                 "last_status": state.get("last_agent_status", ""),
                 "last_error": state.get("last_error", ""),
@@ -758,6 +762,8 @@ class AgentRuntime:
                 **previous_state,
                 "last_text": state.get("user_query", ""),
                 "last_run_id": state.get("run_id", ""),
+                "last_workflow_id": state.get("workflow_id", state.get("run_id", "")),
+                "last_attempt_id": state.get("attempt_id", state.get("run_id", "")),
                 "last_objective": state.get("current_objective", state.get("user_query", "")),
                 "last_plan": state.get("plan", ""),
                 "last_plan_data": state.get("plan_data", {}),
@@ -828,6 +834,8 @@ class AgentRuntime:
             resumable = bool(summary.get("resumable", False))
         update_run(
             run_id,
+            workflow_id=str(state.get("workflow_id", state.get("run_id", ""))).strip(),
+            attempt_id=str(state.get("attempt_id", state.get("run_id", ""))).strip(),
             status=status,
             updated_at=datetime.now(timezone.utc).isoformat(),
             working_directory=str(state.get("working_directory", "")).strip(),
@@ -3374,9 +3382,13 @@ Return ONLY valid JSON in this exact schema:
 
     def build_initial_state(self, user_query: str, **overrides: Any) -> RuntimeState:
         resolved_run_id = overrides.get("run_id", self.new_run_id())
+        resolved_workflow_id = overrides.get("workflow_id", resolved_run_id)
+        resolved_attempt_id = overrides.get("attempt_id", resolved_run_id)
         session_started_at = overrides.get("session_started_at") or datetime.now(timezone.utc).isoformat()
         initial_state: RuntimeState = {
             "run_id": resolved_run_id,
+            "workflow_id": resolved_workflow_id,
+            "attempt_id": resolved_attempt_id,
             "session_id": overrides.get("session_id") or f"session_{resolved_run_id}",
             "session_started_at": session_started_at,
             "work_notes_file": overrides.get("work_notes_file", "agent_work_notes.txt"),
@@ -3691,6 +3703,8 @@ Return ONLY valid JSON in this exact schema:
             user_query,
             started_at,
             "running",
+            workflow_id=str(overrides.get("workflow_id", "")).strip() or run_id,
+            attempt_id=str(overrides.get("attempt_id", "")).strip() or run_id,
             updated_at=started_at,
             working_directory=working_directory,
             run_output_dir=run_output_dir,
@@ -3705,6 +3719,8 @@ Return ONLY valid JSON in this exact schema:
             reset_text_file("agent_work_notes.txt", work_note_header)
         initial_state_overrides = dict(overrides)
         initial_state_overrides["run_id"] = run_id
+        initial_state_overrides["workflow_id"] = str(overrides.get("workflow_id", "")).strip() or run_id
+        initial_state_overrides["attempt_id"] = str(overrides.get("attempt_id", "")).strip() or run_id
         initial_state_overrides["run_output_dir"] = run_output_dir
         initial_state_overrides["working_directory"] = working_directory
         initial_state = self.build_initial_state(

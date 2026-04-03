@@ -1,4 +1,5 @@
 import os
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -255,6 +256,111 @@ class LongDocumentPlanningTests(unittest.TestCase):
         self.assertIn("https://example.com/market-report", evidence_search.get("metadata", {}).get("urls", []))
         self.assertEqual(section_search.get("command"), "Market Structure Explain market structure and major players.")
         self.assertIn("https://example.com/market-report", section_search.get("metadata", {}).get("urls", []))
+
+    def test_long_document_agent_parallel_section_research_preserves_section_order(self):
+        state = {
+            "current_objective": "Create a two-section report.",
+            "user_query": "Create a two-section report.",
+            "memory_soul_file": __file__,
+            "deep_research_mode": True,
+            "deep_research_confirmed": True,
+            "long_document_mode": True,
+            "long_document_pages": 20,
+            "long_document_plan_status": "approved",
+            "long_document_collect_sources_first": False,
+            "research_web_search_enabled": True,
+            "research_section_concurrency": 2,
+            "deep_research_analysis": {
+                "tier": 3,
+                "requires_deep_research": True,
+                "estimated_pages": 20,
+                "estimated_sources": 8,
+                "estimated_duration_minutes": 20,
+                "subtopics": ["Section One", "Section Two"],
+            },
+            "long_document_outline": {
+                "title": "Parallel Report",
+                "sections": [
+                    {
+                        "id": 1,
+                        "title": "Section One",
+                        "objective": "First objective.",
+                        "key_questions": ["Q1"],
+                        "target_pages": 3,
+                    },
+                    {
+                        "id": 2,
+                        "title": "Section Two",
+                        "objective": "Second objective.",
+                        "key_questions": ["Q2"],
+                        "target_pages": 3,
+                    },
+                ],
+            },
+        }
+
+        def _fake_llm_text(prompt: str) -> str:
+            prompt = str(prompt)
+            if "Create a concise executive summary" in prompt:
+                return "Parallel executive summary."
+            return "## Draft\n\nSection content. [S1]"
+
+        def _fake_collect_section_package(**kwargs):
+            index = int(kwargs["section_index"])
+            if index == 1:
+                time.sleep(0.05)
+            return {
+                "index": index,
+                "title": str(kwargs["section"].get("title", f"Section {index}")),
+                "objective": str(kwargs["section"].get("objective", "")),
+                "key_questions": list(kwargs["section"].get("key_questions", [])),
+                "target_pages": int(kwargs["section"].get("target_pages", 3)),
+                "research_pass": {
+                    "response_id": f"resp-{index}",
+                    "status": "completed",
+                    "elapsed_seconds": index,
+                    "output_text": f"Research output for section {index}.",
+                    "raw": {},
+                },
+                "research_text": f"Research output for section {index}.",
+                "sources": [{"id": f"S{index}", "url": f"https://example.com/{index}", "label": f"Source {index}"}],
+                "source_ledger_md": f"- [S{index}] Source {index}",
+                "search_query": f"query {index}",
+                "section_search_results": {"results": [{"url": f"https://example.com/{index}"}], "error": ""},
+            }
+
+        def _fake_record_section_package(*args, **kwargs):
+            package = dict(kwargs["package"])
+            package.pop("section_search_results", None)
+            return package
+
+        correlation = {
+            "briefing": "Correlation briefing",
+            "knowledge_graph": {"nodes": [], "edges": []},
+            "cross_cutting_themes": [],
+            "contradictions": [],
+            "section_order": ["Section One", "Section Two"],
+        }
+
+        with (
+            patch("tasks.long_document_tasks.OpenAI", return_value=Mock()),
+            patch("tasks.long_document_tasks.llm_text", side_effect=_fake_llm_text),
+            patch("tasks.long_document_tasks._collect_google_search_evidence", return_value={"results": [], "error": ""}),
+            patch("tasks.long_document_tasks._collect_section_research_package", side_effect=_fake_collect_section_package),
+            patch("tasks.long_document_tasks._record_section_research_package", side_effect=_fake_record_section_package),
+            patch("tasks.long_document_tasks._build_correlation_package", return_value=correlation) as mock_correlation,
+            patch("tasks.long_document_tasks._build_plagiarism_report", return_value={"overall_score": 0.0, "ai_content_score": 0.0, "status": "PASS", "sections": []}),
+            patch("tasks.long_document_tasks._generate_visual_assets", return_value={"tables": [], "flowcharts": [], "notes": ""}),
+            patch("tasks.long_document_tasks._export_long_document_formats", return_value={}),
+            patch("tasks.long_document_tasks.write_text_file"),
+            patch("tasks.long_document_tasks.update_planning_file"),
+            patch("tasks.long_document_tasks.log_task_update"),
+            patch("tasks.long_document_tasks.publish_agent_output", side_effect=lambda current_state, *args, **kwargs: current_state),
+        ):
+            long_document_agent(state)
+
+        section_packages = mock_correlation.call_args.args[1]
+        self.assertEqual([item["index"] for item in section_packages], [1, 2])
 
 
 if __name__ == "__main__":

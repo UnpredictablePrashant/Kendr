@@ -43,6 +43,8 @@ def initialize_db(db_path: str = DB_PATH):
             """
             CREATE TABLE IF NOT EXISTS runs (
                 run_id TEXT PRIMARY KEY,
+                workflow_id TEXT,
+                attempt_id TEXT,
                 user_query TEXT,
                 started_at TEXT,
                 updated_at TEXT,
@@ -141,6 +143,8 @@ def initialize_db(db_path: str = DB_PATH):
             CREATE TABLE IF NOT EXISTS task_sessions (
                 session_id TEXT PRIMARY KEY,
                 run_id TEXT,
+                workflow_id TEXT,
+                attempt_id TEXT,
                 channel TEXT,
                 session_key TEXT,
                 started_at TEXT,
@@ -309,6 +313,10 @@ def initialize_db(db_path: str = DB_PATH):
             );
             """
         )
+        _ensure_column(conn, "runs", "workflow_id", "TEXT")
+        _ensure_column(conn, "runs", "attempt_id", "TEXT")
+        _ensure_column(conn, "task_sessions", "workflow_id", "TEXT")
+        _ensure_column(conn, "task_sessions", "attempt_id", "TEXT")
         _ensure_column(conn, "runs", "updated_at", "TEXT")
         _ensure_column(conn, "runs", "working_directory", "TEXT")
         _ensure_column(conn, "runs", "run_output_dir", "TEXT")

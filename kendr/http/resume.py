@@ -49,6 +49,7 @@ def build_resume_state_overrides(
         "resume_checkpoint_payload": dict(candidate.get("checkpoint", {}) or {}),
         "resume_mode": "branch" if branch else "resume",
         "parent_run_id": str(candidate.get("run_id", "") or ""),
+        "workflow_id": str(candidate.get("workflow_id", "") or candidate.get("run_id", "") or ""),
         "incoming_channel": incoming_channel,
         "incoming_workspace_id": incoming_workspace_id,
         "incoming_sender_id": incoming_sender_id,
@@ -59,6 +60,7 @@ def build_resume_state_overrides(
         overrides["memory_force_new_session"] = True
     else:
         overrides["run_id"] = str(candidate.get("run_id", "") or "")
+        overrides["attempt_id"] = str(candidate.get("attempt_id", "") or candidate.get("run_id", "") or "")
         overrides["session_id"] = str(candidate.get("session_id", "") or "")
         overrides["resume_output_dir"] = str(candidate.get("run_output_dir", "") or "")
         channel_session_key = str(candidate.get("channel_session_key", "") or "").strip()

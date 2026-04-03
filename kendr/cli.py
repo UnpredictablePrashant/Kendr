@@ -462,15 +462,21 @@ def _decorate_status_message(message: str, *, transient: bool = False) -> str:
             multiline=True,
         )
 
-    run_accepted_match = re.match(r"^\[run\]\s+accepted request run_id=(\S+)\s+\|\s+working_directory=(.+)$", text)
+    run_accepted_match = re.match(
+        r"^\[run\]\s+accepted request run_id=(\S+)(?:\s+workflow_id=(\S+))?\s+\|\s+working_directory=(.+)$",
+        text,
+    )
     if run_accepted_match:
+        workflow_value = run_accepted_match.group(2)
+        workflow_line = f"workflow: {workflow_value}" if workflow_value else ""
         return _render_tree(
             "[run]",
-            [
+            [item for item in [
                 f"accepted: {run_accepted_match.group(1)}",
-                f"workdir: {run_accepted_match.group(2).strip()}",
+                workflow_line,
+                f"workdir: {run_accepted_match.group(3).strip()}",
                 "note: paperwork filed, chaos authorized.",
-            ],
+            ] if item],
             multiline=True,
         )
 
@@ -492,17 +498,22 @@ def _decorate_status_message(message: str, *, transient: bool = False) -> str:
             scope=scope_match.group(1).strip() if scope_match else "",
         )
 
-    run_terminal_match = re.match(r"^\[run\]\s+(paused|completed)\s+run_id=(\S+)\s+last_agent=(\S+)$", text)
+    run_terminal_match = re.match(
+        r"^\[run\]\s+(paused|completed)\s+run_id=(\S+)(?:\s+workflow_id=(\S+))?\s+last_agent=(\S+)$",
+        text,
+    )
     if run_terminal_match:
         terminal = run_terminal_match.group(1)
+        workflow_value = run_terminal_match.group(3)
         return _render_tree(
             "[run]",
-            [
+            [item for item in [
                 f"status: {terminal}",
                 f"run_id: {run_terminal_match.group(2)}",
-                f"last_agent: {run_terminal_match.group(3)}",
+                f"workflow: {workflow_value}" if workflow_value else "",
+                f"last_agent: {run_terminal_match.group(4)}",
                 f"note: {_status_persona(terminal)}",
-            ],
+            ] if item],
             multiline=True,
         )
 
@@ -5357,12 +5368,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
     def _build_ingest_payload(run_id: str, text: str, *, include_new_session: bool) -> dict:
         payload = dict(base_ingest_payload)
         payload["run_id"] = run_id
+        payload["workflow_id"] = active_workflow_id or run_id
+        payload["attempt_id"] = run_id
         payload["text"] = text
         if include_new_session:
             payload["new_session"] = True
         return payload
 
     def _build_resume_payload(text: str, output_dir: str | None) -> dict:
+        resume_attempt_id = active_attempt_id or active_workflow_id or _new_client_run_id()
+        resume_workflow_id = active_workflow_id or resume_attempt_id
         payload = {
             "output_folder": output_dir or "",
             "working_directory": resolved_working_dir,
@@ -5374,6 +5389,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "chat_id": chat_id,
             "is_group": is_group_session,
             "max_steps": args.max_steps,
+            "run_id": resume_attempt_id,
+            "workflow_id": resume_workflow_id,
+            "attempt_id": resume_attempt_id,
         }
         return {key: value for key, value in payload.items() if value not in ("", None)}
 
@@ -5501,7 +5519,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         except socket.timeout:
             return {"run_id": client_run_id, "_ingest_timed_out": True}
 
-    def _resume_once(resume_payload: dict, client_run_id: str) -> dict:
+    def _resume_once(resume_payload: dict, monitored_run_id: str) -> dict:
         request = urllib.request.Request(
             f"{gateway_base}/resume",
             data=json.dumps(resume_payload).encode("utf-8"),
@@ -5529,12 +5547,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
             raise SystemExit(f"Gateway resume failed ({exc.code}): {detail}") from exc
         except urllib.error.URLError as exc:
             if _is_timeout_error(exc):
-                return {"run_id": client_run_id, "_ingest_timed_out": True}
+                return {"run_id": monitored_run_id, "_ingest_timed_out": True}
             raise SystemExit(f"Gateway resume failed: {exc.reason}") from exc
         except TimeoutError:
-            return {"run_id": client_run_id, "_ingest_timed_out": True}
+            return {"run_id": monitored_run_id, "_ingest_timed_out": True}
         except socket.timeout:
-            return {"run_id": client_run_id, "_ingest_timed_out": True}
+            return {"run_id": monitored_run_id, "_ingest_timed_out": True}
 
     def _poll_task_session_progress(run_id: str, previous_message: str) -> str:
         try:
@@ -5565,7 +5583,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
         _emit_status(
             args,
-            f"[run] accepted request run_id={client_run_id} | working_directory={resolved_working_dir}",
+            f"[run] accepted request run_id={client_run_id} workflow_id={ingest_payload.get('workflow_id', client_run_id)} | working_directory={resolved_working_dir}",
         )
         started_wait = time.time()
         last_progress = ""
@@ -5608,6 +5626,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     if status in {"completed", "awaiting_user_input"}:
                         result = {
                             "run_id": run_record.get("run_id", client_run_id),
+                            "workflow_id": run_record.get("workflow_id", ingest_payload.get("workflow_id", client_run_id)),
+                            "attempt_id": run_record.get("attempt_id", run_record.get("run_id", monitored_run_id)),
                             "final_output": run_record.get("final_output", ""),
                             "last_agent": "",
                             "status": status,
@@ -5636,10 +5656,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     def _submit_resume(resume_payload: dict, client_run_id: str) -> dict:
         holder: dict[str, object] = {"result": None, "error": None}
+        monitored_run_id = str(resume_payload.get("run_id") or client_run_id).strip() or client_run_id
 
         def _submit_resume_request() -> None:
             try:
-                holder["result"] = _resume_once(resume_payload, client_run_id)
+                holder["result"] = _resume_once(resume_payload, monitored_run_id)
             except BaseException as exc:  # noqa: BLE001
                 holder["error"] = exc
 
@@ -5648,15 +5669,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
         _emit_status(
             args,
-            f"[run] accepted resume run_id={client_run_id} | working_directory={resolved_working_dir}",
+            f"[run] accepted request run_id={monitored_run_id} workflow_id={resume_payload.get('workflow_id', monitored_run_id)} | working_directory={resolved_working_dir}",
         )
         started_wait = time.time()
         last_progress = ""
         last_wait_emit = 0.0
         while worker.is_alive():
             worker.join(timeout=1.0)
-            last_progress = _poll_task_session_progress(client_run_id, last_progress)
-            _tail_run_logs(client_run_id)
+            last_progress = _poll_task_session_progress(monitored_run_id, last_progress)
+            _tail_run_logs(monitored_run_id)
 
             now = time.time()
             if now - last_wait_emit >= 8:
@@ -5675,8 +5696,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
         if bool(result.get("_ingest_timed_out")):
             _emit_status(args, "[run] resume connection timed out; continuing to monitor run by run_id...")
-            target_run_id = _resolve_latest_session_run_id(channel_session_key) or client_run_id
-            if target_run_id != client_run_id:
+            target_run_id = _resolve_latest_session_run_id(channel_session_key) or monitored_run_id
+            if target_run_id != monitored_run_id:
                 _emit_status(args, f"[run] monitoring active session run_id={target_run_id}")
             while True:
                 run_record: dict[str, object] | None = None
@@ -5693,7 +5714,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
                     status = str(run_record.get("status", "")).strip().lower()
                     if status in {"completed", "awaiting_user_input"}:
                         result = {
-                            "run_id": run_record.get("run_id", client_run_id),
+                            "run_id": run_record.get("run_id", monitored_run_id),
+                            "workflow_id": run_record.get("workflow_id", resume_payload.get("workflow_id", monitored_run_id)),
+                            "attempt_id": run_record.get("attempt_id", run_record.get("run_id", client_run_id)),
                             "final_output": run_record.get("final_output", ""),
                             "last_agent": "",
                             "status": status,
@@ -5722,6 +5745,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
     current_query = query
     include_new_session = bool(args.new_session)
     use_resume = False
+    active_workflow_id = ""
+    active_attempt_id = ""
 
     try:
         while True:
@@ -5737,11 +5762,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 )
                 include_new_session = False
                 result = _submit_run(ingest_payload, client_run_id)
+            active_workflow_id = str(result.get("workflow_id") or active_workflow_id or result.get("run_id") or client_run_id).strip()
+            active_attempt_id = str(result.get("attempt_id") or result.get("run_id") or active_attempt_id or client_run_id).strip()
             paused = bool(result.get("awaiting_user_input")) or str(result.get("status", "")).strip().lower() == "awaiting_user_input"
             terminal_state = "paused" if paused else "completed"
             _emit_status(
                 args,
-                f"[run] {terminal_state} run_id={result.get('run_id', client_run_id)} "
+                f"[run] {terminal_state} run_id={result.get('run_id', client_run_id)} workflow_id={active_workflow_id} "
                 f"last_agent={result.get('last_agent', '') or '-'}",
             )
             if result.get("output_dir"):

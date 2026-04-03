@@ -111,6 +111,8 @@ def build_recovery_payloads(
     summary = {
         "schema_version": RECOVERY_SCHEMA_VERSION,
         "run_id": state.get("run_id", ""),
+        "workflow_id": state.get("workflow_id", state.get("run_id", "")),
+        "attempt_id": state.get("attempt_id", state.get("run_id", "")),
         "session_id": state.get("session_id", ""),
         "session_started_at": state.get("session_started_at", ""),
         "status": status,
@@ -156,6 +158,8 @@ def build_recovery_payloads(
     heartbeat = {
         "schema_version": RECOVERY_SCHEMA_VERSION,
         "run_id": summary["run_id"],
+        "workflow_id": summary["workflow_id"],
+        "attempt_id": summary["attempt_id"],
         "session_id": summary["session_id"],
         "status": status,
         "active_agent": summary["active_agent"],
@@ -165,6 +169,8 @@ def build_recovery_payloads(
     resume_summary = {
         "schema_version": RECOVERY_SCHEMA_VERSION,
         "run_id": summary["run_id"],
+        "workflow_id": summary["workflow_id"],
+        "attempt_id": summary["attempt_id"],
         "status": summary["resume_status"],
         "resumable": summary["resumable"],
         "branchable": summary["branchable"],
@@ -239,6 +245,8 @@ def _candidate_from_run_dir(run_dir: Path, *, stale_after_seconds: int = DEFAULT
     resume_status, resumable, branchable, resume_strategy = _classify_status(summary, stale_after_seconds=stale_after_seconds)
     candidate = {
         "run_id": str(summary.get("run_id", "")).strip(),
+        "workflow_id": str(summary.get("workflow_id", "")).strip() or str(summary.get("run_id", "")).strip(),
+        "attempt_id": str(summary.get("attempt_id", "")).strip() or str(summary.get("run_id", "")).strip(),
         "session_id": str(summary.get("session_id", "")).strip(),
         "status": str(summary.get("status", "")).strip(),
         "resume_status": resume_status,
