@@ -6,17 +6,17 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/kendr-ai/kendr/releases"><img src="https://img.shields.io/badge/version-0.2.0-teal" alt="Version"></a>
+  <a href="https://github.com/UnpredictablePrashant/Kendr/releases"><img src="https://img.shields.io/badge/version-0.2.0-teal" alt="Version"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/kendr-ai/kendr/stargazers"><img src="https://img.shields.io/github/stars/kendr-ai/kendr" alt="GitHub stars" /></a>
-  <a href="https://github.com/kendr-ai/kendr/network/members"><img src="https://img.shields.io/github/forks/kendr-ai/kendr" alt="GitHub forks" /></a>
-  <a href="https://github.com/kendr-ai/kendr/watchers"><img src="https://img.shields.io/github/watchers/kendr-ai/kendr" alt="GitHub watchers" /></a>
-  <a href="https://github.com/kendr-ai/kendr/issues"><img src="https://img.shields.io/github/issues/kendr-ai/kendr" alt="GitHub issues" /></a>
-  <a href="https://github.com/kendr-ai/kendr/actions"><img src="https://img.shields.io/github/actions/workflow/status/kendr-ai/kendr/ci.yml?branch=main" alt="GitHub workflow" /></a>
+  <a href="https://github.com/UnpredictablePrashant/Kendr/stargazers"><img src="https://img.shields.io/github/stars/UnpredictablePrashant/Kendr" alt="GitHub stars" /></a>
+  <a href="https://github.com/UnpredictablePrashant/Kendr/network/members"><img src="https://img.shields.io/github/forks/UnpredictablePrashant/Kendr" alt="GitHub forks" /></a>
+  <a href="https://github.com/UnpredictablePrashant/Kendr/watchers"><img src="https://img.shields.io/github/watchers/UnpredictablePrashant/Kendr" alt="GitHub watchers" /></a>
+  <a href="https://github.com/UnpredictablePrashant/Kendr/issues"><img src="https://img.shields.io/github/issues/UnpredictablePrashant/Kendr" alt="GitHub issues" /></a>
+  <a href="https://github.com/UnpredictablePrashant/Kendr/actions"><img src="https://img.shields.io/github/actions/workflow/status/UnpredictablePrashant/Kendr/ci.yml?branch=main" alt="GitHub workflow" /></a>
   <a href="https://discord.gg/GgU8UEdn"><img src="https://img.shields.io/badge/discord-join-blue?logo=discord" alt="Discord" /></a>
 </p>
 
@@ -43,8 +43,8 @@ Kendr is a Python runtime that combines specialized AI agents, a web-based chat 
 ### macOS / Linux — one command
 
 ```bash
-git clone https://github.com/kendr-ai/kendr.git
-cd kendr
+git clone https://github.com/UnpredictablePrashant/Kendr.git
+cd Kendr
 ./scripts/install.sh
 ```
 
@@ -65,8 +65,8 @@ kendr --help
 Open **PowerShell** (not CMD) and run:
 
 ```powershell
-git clone https://github.com/kendr-ai/kendr.git
-cd kendr
+git clone https://github.com/UnpredictablePrashant/Kendr.git
+cd Kendr
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
@@ -83,8 +83,8 @@ kendr --help
 If you prefer to control the environment yourself:
 
 ```bash
-git clone https://github.com/kendr-ai/kendr.git
-cd kendr
+git clone https://github.com/UnpredictablePrashant/Kendr.git
+cd Kendr
 
 # Create and activate a virtual environment
 python3 -m venv .venv
@@ -307,13 +307,13 @@ Contribution baseline:
 ## Community
 
 - Join the **Kendr Discord** community for live chat, collaboration, Q&A, and announcements: [https://discord.gg/GgU8UEdn](https://discord.gg/GgU8UEdn)
-- Track ongoing work, open issues/feedback, and CI results on the [GitHub project view](https://github.com/kendr-ai/kendr)
+- Track ongoing work, open issues/feedback, and CI results on the [GitHub project view](https://github.com/UnpredictablePrashant/Kendr)
 - The badges above pull live GitHub metrics (stars, forks, watchers, issues, workflows + more) so you can see how the project is performing in real time.
 
 ## Contributors
 
 <p align="center">
-  <a href="https://github.com/kendr-ai/kendr/graphs/contributors"><img src="https://contrib.rocks/image?repo=kendr-ai/kendr" alt="Top contributors" /></a>
+  <a href="https://github.com/UnpredictablePrashant/Kendr/graphs/contributors"><img src="https://contrib.rocks/image?repo=UnpredictablePrashant/Kendr" alt="Top contributors" /></a>
 </p>
 
 Names and avatars shown above are generated automatically from GitHub contributions, so the list reflects the latest community participation without manual updates.
