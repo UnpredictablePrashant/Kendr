@@ -5413,6 +5413,21 @@ def _cmd_run(args: argparse.Namespace) -> int:
     def _pending_question(result: dict) -> str:
         return _approval_prompt_text(result)
 
+    def _emit_run_storage_hint(result_payload: dict) -> None:
+        output_dir = str(
+            result_payload.get("output_dir")
+            or result_payload.get("run_output_dir")
+            or ""
+        ).strip()
+        if output_dir:
+            _emit_status(args, f"[run] output folder: {output_dir}")
+        log_paths = result_payload.get("log_paths") if isinstance(result_payload.get("log_paths"), dict) else {}
+        if isinstance(log_paths, dict) and log_paths:
+            for key in ("execution_log", "agent_work_notes", "final_output", "privileged_audit", "run_manifest", "checkpoint"):
+                path = str(log_paths.get(key) or "").strip()
+                if path:
+                    _emit_status(args, f"[run] {key}: {path}")
+
     def _fetch_task_session(run_id: str) -> dict:
         try:
             payload = _http_json_get(f"{gateway_base}/task-sessions/by-run/{run_id}", timeout_seconds=1.5)
@@ -5642,8 +5657,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
                         result = {
                             "run_id": run_record.get("run_id", client_run_id),
                             "workflow_id": run_record.get("workflow_id", ingest_payload.get("workflow_id", client_run_id)),
-                            "attempt_id": run_record.get("attempt_id", run_record.get("run_id", monitored_run_id)),
+                            "attempt_id": run_record.get("attempt_id", run_record.get("run_id", client_run_id)),
                             "final_output": run_record.get("final_output", ""),
+                            "output_dir": run_record.get("run_output_dir", ""),
+                            "run_output_dir": run_record.get("run_output_dir", ""),
+                            "log_paths": run_record.get("log_paths", {}),
                             "last_agent": "",
                             "status": status,
                             "awaiting_user_input": status == "awaiting_user_input",
@@ -5734,6 +5752,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
                             "workflow_id": run_record.get("workflow_id", resume_payload.get("workflow_id", monitored_run_id)),
                             "attempt_id": run_record.get("attempt_id", run_record.get("run_id", client_run_id)),
                             "final_output": run_record.get("final_output", ""),
+                            "output_dir": run_record.get("run_output_dir", ""),
+                            "run_output_dir": run_record.get("run_output_dir", ""),
+                            "log_paths": run_record.get("log_paths", {}),
                             "last_agent": "",
                             "status": status,
                             "awaiting_user_input": status == "awaiting_user_input",
@@ -5788,6 +5809,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 f"[run] {terminal_state} run_id={result.get('run_id', client_run_id)} workflow_id={active_workflow_id} "
                 f"last_agent={result.get('last_agent', '') or '-'}",
             )
+            _emit_run_storage_hint(result)
             if result.get("output_dir"):
                 resume_output_dir = str(result.get("output_dir") or "").strip() or resume_output_dir
 
@@ -7139,6 +7161,7 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
         print(f"Channel:     {stored.get('channel', '')}")
         print(f"Workspace:   {stored.get('workspace_id', '')}")
         print(f"Chat:        {stored.get('chat_id', '')}")
+        print(f"Scope:       {stored.get('scope', 'main')}")
         return 0
 
     if action == "clear":
@@ -7183,6 +7206,9 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
     rows = []
     for item in sessions:
         state = item.get("state", {}) if isinstance(item.get("state"), dict) else {}
+        run_id = str(state.get("last_run_id", "")).strip()
+        active_agent = str(state.get("last_active_agent", "")).strip()
+        run_output_dir = str(state.get("run_output_dir", "")).strip()
         rows.append(
             [
                 str(item.get("session_key", "")),
@@ -7190,11 +7216,19 @@ def _cmd_sessions(args: argparse.Namespace) -> int:
                 str(item.get("workspace_id", "")),
                 str(item.get("chat_id", "")),
                 str(state.get("last_status", "")),
+                run_id,
+                active_agent,
+                _truncate_status_text(run_output_dir, limit=48),
                 str(item.get("updated_at", "")),
             ]
         )
     print(style.heading(f"Sessions ({len(rows)}):"))
-    print(_render_table(["SESSION_KEY", "CHANNEL", "WORKSPACE", "CHAT", "STATUS", "UPDATED_AT"], rows))
+    print(
+        _render_table(
+            ["SESSION_KEY", "CHANNEL", "WORKSPACE", "CHAT", "STATUS", "RUN_ID", "ACTIVE_AGENT", "OUTPUT_DIR", "UPDATED_AT"],
+            rows,
+        )
+    )
     return 0
 
 

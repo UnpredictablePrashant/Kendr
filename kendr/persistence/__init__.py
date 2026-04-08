@@ -1,4 +1,10 @@
-from .core import DB_PATH, initialize_db
+from .core import (
+    DB_PATH,
+    initialize_db,
+    list_legacy_databases,
+    migrate_legacy_databases,
+    resolve_db_path,
+)
 from .run_store import (
     cleanup_stale_runs,
     delete_chat_session,
@@ -80,6 +86,9 @@ __all__ = [
     "get_setup_provider_tokens",
     "get_superrag_session",
     "initialize_db",
+    "list_legacy_databases",
+    "migrate_legacy_databases",
+    "resolve_db_path",
     "insert_agent_execution",
     "insert_artifact",
     "insert_heartbeat_event",

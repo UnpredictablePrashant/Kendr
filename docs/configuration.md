@@ -18,6 +18,19 @@ The minimum required set for any Kendr run.
 | `KENDR_MODEL` | no | _(falls back to `OPENAI_MODEL`)_ | Short-form model override applied to all agents that don't have an explicit model set. | `gpt-4o` |
 | `KENDR_SHELL` | no | _(auto-detected)_ | Unix-style shell executable (bash, sh, pwsh, etc.). Kand terminal uses this when present instead of the platform default. | `C:\Program Files\Git\bin\bash.exe` |
 
+## Persistence (SQLite)
+
+Kendr uses one centralized SQLite file for runtime/setup/superRAG state.
+
+| Variable | Required | Default | Description | Example |
+|---|---|---|---|---|
+| `KENDR_DB_PATH` | no | `KENDR_HOME/agent_workflow.sqlite3` (if `KENDR_HOME` is set), else `<repo>/output/agent_workflow.sqlite3` | Absolute path to the canonical SQLite DB file. | `/home/user/.kendr/agent_workflow.sqlite3` |
+| `KENDR_DB_AUTO_MIGRATE` | no | `true` | Auto-migrate rows from discovered legacy DB files into `KENDR_DB_PATH` at startup. | `true` |
+| `KENDR_DB_LEGACY_PATHS` | no | _(empty)_ | Path-separator list of known legacy DB files to migrate first. | `/tmp/old1.sqlite3:/tmp/old2.sqlite3` |
+| `KENDR_DB_SEARCH_ROOTS` | no | _(empty)_ | Path-separator list of directories to recursively scan for `agent_workflow.sqlite3` files. | `/mnt/d/superagentTasks` |
+| `KENDR_DB_ENABLE_RECURSIVE_SEARCH` | no | `false` | If true (and no search roots are set), recursively scans `KENDR_WORKING_DIR`. | `false` |
+| `KENDR_DB_DELETE_LEGACY` | no | `false` | Delete migrated legacy DB files after successful copy. | `false` |
+
 ---
 
 ## OpenAI

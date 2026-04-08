@@ -582,6 +582,112 @@ def list_recent_runs(limit: int = 20, db_path: str = DB_PATH) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def _get_manifest_scan_dirs(db_path: str = DB_PATH) -> list[str]:
+    """Derive directories to scan for run manifests from DB run_output_dir values."""
+    dirs: dict[str, None] = {}
+    default_runs = Path("output/runs").resolve()
+    if default_runs.is_dir():
+        dirs[str(default_runs)] = None
+    try:
+        initialize_db(db_path)
+        with _connect(db_path) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT run_output_dir FROM runs WHERE run_output_dir IS NOT NULL AND run_output_dir != ''"
+            ).fetchall()
+            for row in rows:
+                parent = Path(str(row[0])).parent
+                if parent.is_dir():
+                    dirs[str(parent)] = None
+    except Exception:
+        pass
+    return list(dirs)
+
+
+def _normalize_manifest_status(status: str, updated_at: str) -> str:
+    """Treat old manifests with non-terminal status as failed (stale)."""
+    if status not in ("running", "started", "awaiting_user_input", "cancelling"):
+        return status
+    if not updated_at:
+        return "failed"
+    try:
+        import datetime as _dt
+        dt = _dt.datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        dt_naive = dt.replace(tzinfo=None) if dt.tzinfo else dt
+        age_hours = (_dt.datetime.utcnow() - dt_naive).total_seconds() / 3600
+        if age_hours > 2:
+            return "failed"
+    except Exception:
+        pass
+    return status
+
+
+def scan_manifest_runs(known_run_ids: set[str] | None = None, db_path: str = DB_PATH) -> list[dict]:
+    """Scan run directories for run_manifest.json files and return records for runs not in the DB."""
+    scan_dirs = _get_manifest_scan_dirs(db_path)
+    results: list[dict] = []
+    for scan_dir in scan_dirs:
+        base = Path(scan_dir)
+        if not base.is_dir():
+            continue
+        try:
+            candidates = list(base.glob("*/run_manifest.json"))
+        except Exception:
+            continue
+        for manifest_path in candidates:
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                summary = manifest.get("summary", manifest)
+                run_id = str(summary.get("run_id", "")).strip()
+                if not run_id:
+                    continue
+                if known_run_ids is not None and run_id in known_run_ids:
+                    continue
+                updated_at = summary.get("updated_at", "")
+                raw_status = summary.get("status", "unknown")
+                status = _normalize_manifest_status(raw_status, updated_at)
+                results.append({
+                    "run_id": run_id,
+                    "workflow_id": summary.get("workflow_id", run_id),
+                    "attempt_id": summary.get("attempt_id", run_id),
+                    "user_query": summary.get("user_query") or summary.get("objective", ""),
+                    "started_at": summary.get("session_started_at", ""),
+                    "updated_at": updated_at,
+                    "completed_at": summary.get("completed_at", ""),
+                    "status": status,
+                    "final_output": "",
+                    "working_directory": summary.get("working_directory", ""),
+                    "run_output_dir": summary.get("run_output_dir", str(manifest_path.parent)),
+                    "session_id": summary.get("session_id") or summary.get("channel_session_key", ""),
+                    "parent_run_id": summary.get("parent_run_id", ""),
+                    "resumable": 1 if summary.get("resumable") else 0,
+                })
+            except Exception:
+                continue
+    return results
+
+
+def get_run_output_dir_from_manifest(run_id: str, db_path: str = DB_PATH) -> str:
+    """Find the run_output_dir for a run_id by scanning manifest files (fallback when not in DB)."""
+    scan_dirs = _get_manifest_scan_dirs(db_path)
+    for scan_dir in scan_dirs:
+        base = Path(scan_dir)
+        if not base.is_dir():
+            continue
+        try:
+            for candidate in base.glob(f"{run_id}_*/run_manifest.json"):
+                try:
+                    manifest = json.loads(candidate.read_text(encoding="utf-8"))
+                    summary = manifest.get("summary", manifest)
+                    run_out = str(summary.get("run_output_dir", "") or str(candidate.parent))
+                    if run_out:
+                        return run_out
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return ""
+
+
 def cleanup_stale_runs(stale_minutes: int = 20, db_path: str = DB_PATH) -> int:
     """Mark runs that have been stuck in 'running'/'started' status for too long as failed."""
     import datetime as _dt

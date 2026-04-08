@@ -21,6 +21,7 @@ from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, urlparse
 
 _log = logging.getLogger("kendr.ui")
+from kendr.path_utils import normalize_host_path_str
 
 from tasks.setup_config_store import (
     apply_setup_env_defaults,
@@ -43,6 +44,7 @@ try:
         get_run as _db_get_run,
         upsert_channel_session as _db_upsert_channel_session,
     )
+    from kendr.persistence.run_store import get_run_output_dir_from_manifest as _get_run_output_dir_from_manifest
     _HAS_PERSISTENCE = True
 except Exception:
     _HAS_PERSISTENCE = False
@@ -64,6 +66,8 @@ except Exception:
         return None
     def _db_upsert_channel_session(session_key, payload, **kw):  # type: ignore[misc]
         return None
+    def _get_run_output_dir_from_manifest(run_id, **kw):  # type: ignore[misc]
+        return ""
 
 try:
     from kendr.providers import (
@@ -341,6 +345,10 @@ def _normalise_project_chat_message(message: dict) -> dict | None:
     }
     if message.get("run_id"):
         item["run_id"] = str(message.get("run_id"))
+    if message.get("long_document_exports") and isinstance(message["long_document_exports"], list):
+        item["long_document_exports"] = message["long_document_exports"]
+    if message.get("deep_research_result_card") and isinstance(message["deep_research_result_card"], dict):
+        item["deep_research_result_card"] = message["deep_research_result_card"]
     return item
 
 
@@ -524,17 +532,25 @@ def _persist_project_chat_result(
         content = _project_chat_result_text(result or {})
     if not content:
         return
+    message: dict = {
+        "role": "agent",
+        "content": content,
+        "content_format": _project_chat_guess_format(content),
+        "run_id": run_id,
+    }
+    if result:
+        doc_exports = result.get("long_document_exports")
+        if doc_exports and isinstance(doc_exports, list):
+            message["long_document_exports"] = doc_exports
+        dr_card = result.get("deep_research_result_card")
+        if dr_card and isinstance(dr_card, dict):
+            message["deep_research_result_card"] = dr_card
     try:
         _append_project_chat_messages(
             project_id,
             project_path=project_path,
             project_name=project_name,
-            messages=[{
-                "role": "agent",
-                "content": content,
-                "content_format": _project_chat_guess_format(content),
-                "run_id": run_id,
-            }],
+            messages=[message],
         )
     except Exception as exc:
         _log.debug("Project chat result persistence failed for %s: %s", project_id, exc)
@@ -545,6 +561,8 @@ def _resolve_run_artifact_path(run_id: str, name: str) -> str:
     try:
         run_row = _db_get_run(run_id)
         output_dir = run_row.get("run_output_dir", "") if run_row else ""
+        if not output_dir:
+            output_dir = _get_run_output_dir_from_manifest(run_id)
         if output_dir:
             candidate = os.path.join(output_dir, name)
             if os.path.isfile(candidate):
@@ -620,6 +638,11 @@ _pending_runs: dict[str, dict] = {}
 _run_event_queues: dict[str, "queue.Queue[dict]"] = {}
 _pending_lock = threading.Lock()
 _OAUTH_PENDING_STATES: dict[str, str] = {}
+_PENDING_TERMINAL_TTL_SECONDS = max(
+    0,
+    int(str(os.getenv("KENDR_UI_PENDING_TERMINAL_TTL_SECONDS", "180") or "180")),
+)
+_PENDING_TERMINAL_STATES = {"completed", "failed", "cancelled"}
 
 
 def _run_control_dir() -> str:
@@ -690,6 +713,50 @@ def _terminal_run_status(*, result: dict | None = None, error: str = "", default
     if explicit in {"cancelled", "canceled", "failed", "completed", "cancelling"}:
         return "cancelled" if explicit == "canceled" else explicit
     return default
+
+
+def _run_log_paths(run_output_dir: str) -> dict[str, str]:
+    base = str(run_output_dir or "").strip()
+    if not base:
+        return {}
+    resolved = os.path.abspath(os.path.expanduser(base))
+    return {
+        "run_output_dir": resolved,
+        "execution_log": os.path.join(resolved, "execution.log"),
+        "agent_work_notes": os.path.join(resolved, "agent_work_notes.txt"),
+        "final_output": os.path.join(resolved, "final_output.txt"),
+        "privileged_audit": os.path.join(resolved, "privileged_audit.log"),
+        "run_manifest": os.path.join(resolved, "run_manifest.json"),
+        "checkpoint": os.path.join(resolved, "checkpoint.json"),
+        "resume_summary": os.path.join(resolved, "resume_summary.json"),
+        "heartbeat": os.path.join(resolved, "heartbeat.json"),
+    }
+
+
+def _prune_pending_runs_locked() -> None:
+    if not _pending_runs:
+        return
+    if _PENDING_TERMINAL_TTL_SECONDS <= 0:
+        for run_id, state in list(_pending_runs.items()):
+            status = str((state or {}).get("status", "")).strip().lower()
+            if status in _PENDING_TERMINAL_STATES:
+                _pending_runs.pop(run_id, None)
+        return
+    now = datetime.now(timezone.utc)
+    for run_id, state in list(_pending_runs.items()):
+        status = str((state or {}).get("status", "")).strip().lower()
+        if status not in _PENDING_TERMINAL_STATES:
+            continue
+        updated_at = str((state or {}).get("updated_at") or (state or {}).get("completed_at") or "").strip()
+        updated_dt = _parse_iso_timestamp(updated_at)
+        if updated_dt is None:
+            _pending_runs.pop(run_id, None)
+            continue
+        if updated_dt.tzinfo is None:
+            updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+        age_seconds = (now - updated_dt).total_seconds()
+        if age_seconds >= _PENDING_TERMINAL_TTL_SECONDS:
+            _pending_runs.pop(run_id, None)
 
 
 def _push_event(run_id: str, event_type: str, data: dict) -> None:
@@ -794,11 +861,32 @@ def _overlay_run_with_pending(run_row: dict | None, pending: dict | None) -> dic
         base["user_query"] = base.get("user_query") or payload.get("text") or payload.get("message") or ""
         base["working_directory"] = base.get("working_directory") or payload.get("working_directory") or payload.get("project_root") or ""
         base["resume_output_dir"] = base.get("resume_output_dir") or payload.get("output_folder") or payload.get("resume_output_dir") or ""
-        base["session_id"] = base.get("session_id") or payload.get("chat_id") or ""
+        resolved_session_id = str(base.get("session_id") or "").strip()
+        if not resolved_session_id:
+            payload_session_id = str(payload.get("session_id") or "").strip()
+            if payload_session_id:
+                resolved_session_id = payload_session_id
+            else:
+                channel = str(payload.get("channel") or "webchat").strip().lower() or "webchat"
+                workspace_id = str(payload.get("workspace_id") or "default").strip() or "default"
+                chat_id = str(payload.get("chat_id") or payload.get("sender_id") or "").strip()
+                if chat_id:
+                    scope = "group" if bool(payload.get("is_group")) else "main"
+                    resolved_session_id = ":".join([channel, workspace_id, chat_id, scope])
+        base["session_id"] = resolved_session_id
         base["channel"] = base.get("channel") or payload.get("channel") or ""
         base["workflow_id"] = base.get("workflow_id") or payload.get("workflow_id") or base.get("run_id") or ""
         base["attempt_id"] = base.get("attempt_id") or payload.get("attempt_id") or base.get("run_id") or ""
         base["workflow_type"] = base.get("workflow_type") or payload.get("workflow_type") or ""
+        base["run_output_dir"] = (
+            base.get("run_output_dir")
+            or payload.get("output_folder")
+            or payload.get("resume_output_dir")
+            or ""
+        )
+    if str(base.get("run_output_dir") or "").strip():
+        if not isinstance(base.get("log_paths"), dict) or not base.get("log_paths"):
+            base["log_paths"] = _run_log_paths(str(base.get("run_output_dir") or ""))
     result = base.get("result") if isinstance(base.get("result"), dict) else {}
     if result:
         base["workflow_id"] = base.get("workflow_id") or result.get("workflow_id") or base.get("run_id") or ""
@@ -854,18 +942,26 @@ def _live_recent_runs_with_pending(
             continue
         merged[run_id] = dict(run)
     with _pending_lock:
+        _prune_pending_runs_locked()
         pending_snapshot = {rid: dict(data) for rid, data in _pending_runs.items()}
     for run_id, pending in pending_snapshot.items():
+        # Keep pending data as an overlay for persisted runs only.
+        # Long-running visibility must come from durable DB/session state.
+        if run_id not in merged:
+            continue
         merged[run_id] = _overlay_run_with_pending(merged.get(run_id), pending) or {}
     rows = [row for row in merged.values() if isinstance(row, dict) and str(row.get("run_id") or "").strip()]
+    _active_statuses = {"running", "started", "cancelling", "awaiting_user_input"}
+
+    def _run_sort_key(row: dict) -> tuple:
+        status = str(row.get("status") or "").strip().lower()
+        # Active runs first (rank 1), then terminal runs by timestamp descending
+        active_rank = 1 if status in _active_statuses else 0
+        ts = str(row.get("updated_at") or row.get("started_at") or "")
+        return (active_rank, ts)
+
     if not collapse_workflows:
-        rows.sort(
-            key=lambda row: (
-                0 if str(row.get("status") or "").strip().lower() in {"running", "started", "cancelling", "awaiting_user_input"} else 1,
-                str(row.get("updated_at") or row.get("started_at") or ""),
-            ),
-            reverse=True,
-        )
+        rows.sort(key=_run_sort_key, reverse=True)
         return rows
     latest_by_workflow: dict[str, dict] = {}
     for row in rows:
@@ -876,22 +972,12 @@ def _live_recent_runs_with_pending(
         if previous is None:
             latest_by_workflow[workflow_id] = row
             continue
-        row_status = str(row.get("status") or "").strip().lower()
-        previous_status = str(previous.get("status") or "").strip().lower()
-        row_rank = 0 if row_status in {"running", "started", "cancelling", "awaiting_user_input"} else 1
-        previous_rank = 0 if previous_status in {"running", "started", "cancelling", "awaiting_user_input"} else 1
-        row_ts = str(row.get("updated_at") or row.get("started_at") or row.get("created_at") or "")
-        previous_ts = str(previous.get("updated_at") or previous.get("started_at") or previous.get("created_at") or "")
-        if row_rank < previous_rank or (row_rank == previous_rank and row_ts >= previous_ts):
+        row_key = _run_sort_key(row)
+        prev_key = _run_sort_key(previous)
+        if row_key >= prev_key:
             latest_by_workflow[workflow_id] = row
     rows = list(latest_by_workflow.values())
-    rows.sort(
-        key=lambda row: (
-            0 if str(row.get("status") or "").strip().lower() in {"running", "started", "cancelling", "awaiting_user_input"} else 1,
-            str(row.get("updated_at") or row.get("started_at") or ""),
-        ),
-        reverse=True,
-    )
+    rows.sort(key=_run_sort_key, reverse=True)
     return rows
 
 
@@ -924,7 +1010,7 @@ def _is_chat_control_reply(text: str) -> bool:
     }
 
 
-def _live_recent_chat_threads(runs: list[dict] | None) -> list[dict]:
+def _live_recent_chat_threads(runs: list[dict] | None, sessions: list[dict] | None = None) -> list[dict]:
     rows = _live_recent_runs_with_pending(runs, collapse_workflows=False)
     threads: dict[str, dict] = {}
     for row in rows:
@@ -950,6 +1036,8 @@ def _live_recent_chat_threads(runs: list[dict] | None) -> list[dict]:
                 "updated_at": str(row.get("updated_at") or row.get("started_at") or "").strip(),
                 "completed_at": str(row.get("completed_at") or "").strip(),
                 "working_directory": str(row.get("working_directory") or "").strip(),
+                "run_output_dir": str(row.get("run_output_dir") or row.get("output_dir") or "").strip(),
+                "log_paths": row.get("log_paths") if isinstance(row.get("log_paths"), dict) else {},
                 "user_query": str(row.get("user_query") or "").strip(),
                 "_queries": [],
             }
@@ -974,8 +1062,63 @@ def _live_recent_chat_threads(runs: list[dict] | None) -> list[dict]:
                     "updated_at": current_ts or entry.get("updated_at", ""),
                     "completed_at": str(row.get("completed_at") or "").strip(),
                     "working_directory": str(row.get("working_directory") or "").strip() or entry.get("working_directory", ""),
+                    "run_output_dir": str(row.get("run_output_dir") or row.get("output_dir") or "").strip() or entry.get("run_output_dir", ""),
                 }
             )
+            if isinstance(row.get("log_paths"), dict) and row.get("log_paths"):
+                entry["log_paths"] = dict(row.get("log_paths"))
+
+    for session in sessions or []:
+        if not isinstance(session, dict):
+            continue
+        channel = str(session.get("channel") or "").strip().lower()
+        if channel in {"project_ui", "projectui", "project"}:
+            continue
+        chat_session_id = str(session.get("chat_id") or "").strip()
+        if not chat_session_id:
+            continue
+        state = session.get("state") if isinstance(session.get("state"), dict) else {}
+        session_run_id = str(state.get("last_run_id") or "").strip()
+        session_status = str(state.get("last_status") or "").strip()
+        session_updated_at = str(session.get("updated_at") or "").strip()
+        session_objective = str(state.get("last_objective") or state.get("last_text") or "").strip()
+        session_run_output_dir = str(state.get("run_output_dir") or "").strip()
+        session_log_paths = state.get("log_paths") if isinstance(state.get("log_paths"), dict) else {}
+        entry = threads.get(chat_session_id)
+        if entry is None:
+            entry = {
+                "chat_session_id": chat_session_id,
+                "session_id": str(session.get("session_key") or "").strip(),
+                "latest_run_id": session_run_id,
+                "run_id": session_run_id,
+                "workflow_id": str(state.get("last_workflow_id") or session_run_id).strip(),
+                "attempt_id": str(state.get("last_attempt_id") or session_run_id).strip(),
+                "status": session_status,
+                "started_at": "",
+                "updated_at": session_updated_at,
+                "completed_at": str(state.get("completed_at") or "").strip(),
+                "working_directory": "",
+                "run_output_dir": session_run_output_dir,
+                "log_paths": dict(session_log_paths) if session_log_paths else (_run_log_paths(session_run_output_dir) if session_run_output_dir else {}),
+                "user_query": session_objective,
+                "_queries": [session_objective] if session_objective else [],
+            }
+            threads[chat_session_id] = entry
+            continue
+        existing_ts = str(entry.get("updated_at") or entry.get("started_at") or "").strip()
+        if session_updated_at >= existing_ts:
+            if session_run_id:
+                entry["latest_run_id"] = session_run_id
+                entry["run_id"] = session_run_id
+            if session_status:
+                entry["status"] = session_status
+            entry["updated_at"] = session_updated_at or entry.get("updated_at", "")
+            if session_run_output_dir:
+                entry["run_output_dir"] = session_run_output_dir
+            if session_log_paths:
+                entry["log_paths"] = dict(session_log_paths)
+        if session_objective and not str(entry.get("user_query") or "").strip():
+            entry["user_query"] = session_objective
 
     results: list[dict] = []
     for entry in threads.values():
@@ -988,15 +1131,21 @@ def _live_recent_chat_threads(runs: list[dict] | None) -> list[dict]:
         if not representative and queries:
             representative = queries[0]
         entry["user_query"] = representative or str(entry.get("user_query") or "").strip()
+        if not entry["user_query"]:
+            status_label = str(entry.get("status") or "").strip().lower().replace("_", " ")
+            entry["user_query"] = status_label.capitalize() + " run" if status_label else "Untitled run"
+        if (not isinstance(entry.get("log_paths"), dict) or not entry.get("log_paths")) and str(entry.get("run_output_dir") or "").strip():
+            entry["log_paths"] = _run_log_paths(str(entry.get("run_output_dir") or ""))
         results.append(entry)
 
-    results.sort(
-        key=lambda row: (
-            0 if str(row.get("status") or "").strip().lower() in {"running", "started", "cancelling", "awaiting_user_input"} else 1,
-            str(row.get("updated_at") or row.get("started_at") or ""),
-        ),
-        reverse=True,
-    )
+    def _thread_sort_key(row: dict) -> tuple:
+        status = str(row.get("status") or "").strip().lower()
+        # Active runs float to top; among terminal runs (completed/failed/cancelled) sort purely by time
+        active_rank = 1 if status in {"running", "started", "cancelling", "awaiting_user_input"} else 0
+        ts = str(row.get("updated_at") or row.get("started_at") or "")
+        return (active_rank, ts)
+
+    results.sort(key=_thread_sort_key, reverse=True)
     return results
 
 
@@ -1379,7 +1528,7 @@ _CHAT_HTML = r"""<!doctype html>
   --text: #e6edf3; --muted: #7d8590; --sidebar-w: 280px; --inspector-w: 320px;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; overflow: hidden; }
+body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; height: 100dvh; display: flex; overflow: hidden; }
 a { color: var(--teal); text-decoration: none; }
 a:hover { text-decoration: underline; }
 .sidebar { width: var(--sidebar-w); min-width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
@@ -1436,7 +1585,7 @@ a:hover { text-decoration: underline; }
 .kdmd-save { background: var(--teal); color: #0d1117; border: none; border-radius: 8px; padding: 8px 20px; font-size: 13px; font-weight: 700; cursor: pointer; }
 .kdmd-save:hover { opacity: .85; }
 .kdmd-cancel { background: var(--surface2); border: 1px solid var(--border); color: var(--muted); border-radius: 8px; padding: 8px 16px; font-size: 13px; cursor: pointer; }
-.chat-main { flex: 1; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
+.chat-main { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
 .chat-header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; background: var(--surface); }
 .chat-title { font-size: 15px; font-weight: 600; color: var(--text); }
 .chat-subtitle { font-size: 12px; color: var(--muted); }
@@ -1475,7 +1624,7 @@ a:hover { text-decoration: underline; }
 .terminal-step-header { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; font-size: 12px; font-weight: 600; }
 .shell-mode-banner { display: none; background: rgba(255,179,71,0.08); border: 1px solid rgba(255,179,71,0.25); border-radius: 8px; padding: 8px 14px; margin: 8px 0 0; font-size: 12px; color: var(--amber); }
 .shell-mode-banner.visible { display: flex; align-items: center; gap: 8px; }
-.messages { flex: 1; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; scroll-behavior: smooth; }
+.messages { flex: 1; min-height: 0; overflow-y: auto; padding: 24px; display: flex; flex-direction: column; gap: 16px; scroll-behavior: smooth; }
 .message-row { display: flex; gap: 12px; max-width: 900px; }
 .message-row.user { flex-direction: row-reverse; margin-left: auto; }
 .message-row.user .bubble { background: rgba(83,82,237,0.2); border-color: rgba(83,82,237,0.4); border-radius: 18px 4px 18px 18px; }
@@ -1533,20 +1682,23 @@ a:hover { text-decoration: underline; }
 .suggestions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 8px; }
 .suggest-chip { padding: 8px 16px; border: 1px solid var(--border); border-radius: 20px; font-size: 13px; color: var(--muted); cursor: pointer; transition: all 0.15s; background: var(--surface); }
 .suggest-chip:hover { border-color: var(--teal); color: var(--teal); background: rgba(0,201,167,0.06); }
-.input-area { padding: 16px 24px 20px; border-top: 1px solid var(--border); background: var(--surface); }
+.input-area { padding: 16px 24px 20px; border-top: 1px solid var(--border); background: var(--surface); max-height: min(58vh, 680px); overflow-y: auto; overscroll-behavior: contain; }
 .mode-row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:12px; }
 .mode-pill { border:1px solid var(--border); background:var(--bg); color:var(--muted); border-radius:999px; padding:7px 12px; font-size:12px; font-weight:600; cursor:pointer; transition:all .15s; }
 .mode-pill:hover { border-color: var(--teal); color: var(--teal); }
 .mode-pill.active { background: rgba(0,201,167,0.12); border-color: rgba(0,201,167,0.45); color: var(--teal); }
 .deep-research-panel { display:none; margin-bottom:12px; padding:14px; border:1px solid rgba(0,201,167,0.18); border-radius:12px; background:linear-gradient(180deg, rgba(0,201,167,0.06), rgba(83,82,237,0.05)); }
-.deep-research-panel.visible { display:block; }
+.deep-research-panel.visible { display:block; max-height:min(46vh, 560px); overflow-y:auto; }
+.deep-research-panel.collapsed { max-height:none; overflow:visible; }
 .deep-research-panel.collapsed .dr-body { display:none; }
-.dr-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:10px; }
+.dr-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:10px; flex-wrap:wrap; }
+.dr-head > div:first-child { flex:1 1 320px; min-width:0; }
 .dr-title { font-size:12px; font-weight:700; color:var(--teal); letter-spacing:.08em; text-transform:uppercase; }
-.dr-subtitle { font-size:12px; color:var(--muted); line-height:1.5; max-width:620px; }
-.dr-head-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; justify-content:flex-end; }
-.dr-summary-bar { display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end; }
-.dr-summary-pill { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.04); font-size:11px; color:var(--muted); }
+.dr-subtitle { font-size:12px; color:var(--muted); line-height:1.5; max-width:none; }
+.dr-head-actions { display:flex; align-items:center; gap:10px; flex:1 1 260px; flex-wrap:wrap; justify-content:flex-end; }
+.dr-summary-bar { display:flex; flex-wrap:wrap; gap:8px; justify-content:flex-end; min-width:0; }
+.dr-summary-pill { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius:999px; border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.04); font-size:11px; color:var(--muted); max-width:100%; white-space:normal; }
+.dr-summary-pill strong { white-space:nowrap; }
 .dr-toggle-btn { border:1px solid var(--border); background:rgba(0,0,0,0.16); color:var(--text); border-radius:999px; padding:7px 12px; font-size:11px; font-weight:700; cursor:pointer; transition:all .15s; }
 .dr-toggle-btn:hover { border-color: var(--teal); color: var(--teal); }
 .dr-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:10px; }
@@ -1565,12 +1717,12 @@ a:hover { text-decoration: underline; }
 .dr-chip button { border:none; background:transparent; color:var(--muted); cursor:pointer; font-size:12px; padding:0; }
 .dr-chip button:hover { color: var(--crimson); }
 .dr-note { font-size:11px; color:var(--muted); line-height:1.5; }
-.input-row { display: flex; gap: 12px; align-items: flex-end; }
-.input-box { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px; color: var(--text); font-size: 14px; font-family: inherit; resize: none; min-height: 52px; max-height: 200px; overflow-y: auto; line-height: 1.5; transition: border-color 0.15s, opacity 0.15s; outline: none; }
+.input-row { display: flex; gap: 12px; align-items: stretch; }
+.input-box { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 14px; padding: 14px 18px; color: var(--text); font-size: 14px; font-family: inherit; resize: none; min-height: 52px; max-height: min(32vh, 260px); overflow-y: auto; line-height: 1.5; transition: border-color 0.15s, opacity 0.15s; outline: none; }
 .input-box:focus { border-color: var(--teal); }
 .input-box::placeholder { color: var(--muted); }
 .input-box.locked { opacity: 0.75; cursor: not-allowed; }
-.send-btn { width: 48px; height: 48px; border-radius: 12px; background: var(--teal); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; transition: background 0.15s, opacity 0.15s; color: #0d0f14; }
+.send-btn { width: 48px; min-height: 48px; border-radius: 12px; background: var(--teal); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; transition: background 0.15s, opacity 0.15s; color: #0d0f14; align-self: flex-end; }
 .send-btn:hover { background: #00b396; }
 .send-btn.stop-mode { background: rgba(255,71,87,0.92); color: #fff; }
 .send-btn.stop-mode:hover { background: rgba(255,71,87,1); }
@@ -1632,6 +1784,14 @@ a:hover { text-decoration: underline; }
 @media (max-width: 1280px) {
   :root { --inspector-w: 0px; }
   .chat-inspector { display:none; }
+}
+@media (max-height: 900px) {
+  .messages { padding: 16px; gap: 12px; }
+  .welcome { padding: 20px 18px; gap: 12px; }
+  .welcome-logo { font-size: 44px; }
+  .welcome h2 { font-size: 20px; }
+  .input-area { padding: 12px 16px 14px; max-height: min(66vh, 760px); }
+  .deep-research-panel.visible { max-height: min(50vh, 500px); }
 }
 </style>
 </head>
@@ -1936,6 +2096,10 @@ let _chatActivityFeed = [];
 let _chatPlanState = { total: 0, completed: 0, running: 0, failed: 0 };
 let _chatRunState = { runId: '', status: 'idle', title: '', task: '', startedAt: '', completedAt: '', lastCommand: '', lastCommandMeta: '' };
 let _chatAwaitingContext = null;
+// Track the last completed deep research result for inline file-request handling
+let _lastDeepResearchCard = null;
+let _lastDocExports = null;
+let _lastCompletedRunId = '';
 
 function _defaultChatPlaceholder() {
   return researchMode === 'deep_research'
@@ -2461,15 +2625,6 @@ async function loadProjContext() {
       txtEl.textContent = 'kendr.md not generated yet';
       genBtn.textContent = '\u2728 Generate kendr.md';
     }
-    // Update welcome message if we have a project
-    const welcomeEl = document.getElementById('welcome');
-    if (welcomeEl && proj.name) {
-      const h2 = welcomeEl.querySelector('h2');
-      if (h2 && !h2.dataset.customized) {
-        h2.textContent = 'Working on: ' + proj.name;
-        h2.dataset.customized = '1';
-      }
-    }
   } catch (e) {
     // silent - no project system
   }
@@ -2805,6 +2960,9 @@ async function loadRuns() {
       const statusLabel = isRunning ? 'Running' : isCancelling ? 'Stopping' : isAwaiting ? 'Waiting' : isCancelled ? 'Stopped' : status === 'completed' ? 'Completed' : status === 'failed' ? 'Failed' : status;
       const badgeClass = isRunning ? 'running' : isCancelling ? 'cancelling' : isAwaiting ? 'awaiting' : isCancelled ? 'cancelled' : status === 'failed' ? 'failed' : 'completed';
       const wdLabel = run.working_directory ? '<span style="color:var(--muted);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:120px" title="' + esc(run.working_directory) + '">&#x1F4C1; ' + esc(run.working_directory.split('/').pop()) + '</span>' : '';
+      const runDir = String(run.run_output_dir || run.output_dir || run.resume_output_dir || '').trim();
+      const runDirName = runDir ? (runDir.split(/[\\/]/).pop() || runDir) : '';
+      const runDirLabel = runDir ? '<span style="color:var(--muted);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px" title="' + esc(runDir) + '">&#x1F5C2;&#xFE0F; ' + esc(runDirName) + '</span>' : '';
       const delBtn = document.createElement('button');
       delBtn.title = 'Delete this run';
       delBtn.innerHTML = '&#x1F5D1;';
@@ -2821,7 +2979,7 @@ async function loadRuns() {
         + '<span class="run-badge ' + badgeClass + '">' + esc(statusLabel) + '</span>'
         + '<span style="font-size:10px;color:var(--muted)">' + ts + '</span>'
         + '</div>'
-        + (wdLabel ? '<div style="margin-top:2px">' + wdLabel + '</div>' : '');
+        + ((wdLabel || runDirLabel) ? '<div style="margin-top:2px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">' + wdLabel + runDirLabel + '</div>' : '');
       div.appendChild(delBtn);
       div.onmouseenter = () => delBtn.style.display = 'inline';
       div.onmouseleave = () => delBtn.style.display = 'none';
@@ -2999,6 +3157,28 @@ async function loadRun(runId, sessionIdOverride) {
     metaRow.innerHTML = statusPill + agentPill + timePill + idPill;
     msgs.appendChild(metaRow);
 
+    const runOutputDir = String(d.run_output_dir || d.output_dir || d.resume_output_dir || '').trim();
+    const logPaths = (d.log_paths && typeof d.log_paths === 'object') ? d.log_paths : {};
+    const logEntries = Object.entries(logPaths).filter(([key, value]) => key !== 'run_output_dir' && String(value || '').trim());
+    if (runOutputDir || logEntries.length) {
+      const logCard = document.createElement('div');
+      logCard.style.cssText = 'margin:4px 0 10px 52px;padding:10px 12px;background:var(--surface2);border:1px solid var(--border);border-radius:8px;';
+      let html = '<div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:6px">&#x1F4DD; Run Storage</div>';
+      if (runOutputDir) {
+        html += '<div style="font-size:11px;color:var(--text);word-break:break-all"><strong style="color:var(--muted);font-weight:600">Output folder:</strong> ' + esc(runOutputDir) + '</div>';
+      }
+      if (logEntries.length) {
+        html += '<div style="margin-top:6px;display:flex;flex-direction:column;gap:3px">';
+        logEntries.forEach(([key, value]) => {
+          const label = String(key || '').replace(/_/g, ' ');
+          html += '<div style="font-size:11px;color:var(--muted);word-break:break-all"><strong style="font-weight:600;color:var(--text)">' + esc(label) + ':</strong> ' + esc(String(value || '')) + '</div>';
+        });
+        html += '</div>';
+      }
+      logCard.innerHTML = html;
+      msgs.appendChild(logCard);
+    }
+
     if (status === 'awaiting_user_input') {
       const runWorkDir = _chatResumePathFromRun(d);
       _setChatAwaitingContext({
@@ -3165,9 +3345,14 @@ function fillInput(text) {
   if (w) w.style.display = 'none';
 }
 
+function _chatInputMaxHeight() {
+  const viewportCap = Math.floor(window.innerHeight * 0.32);
+  return Math.max(160, Math.min(viewportCap, 300));
+}
+
 function autoResize(el) {
   el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 200) + 'px';
+  el.style.height = Math.min(el.scrollHeight, _chatInputMaxHeight()) + 'px';
 }
 
 function handleKey(e) {
@@ -3582,6 +3767,45 @@ function renderDeepResearchCard(card, runId) {
       html += '<div style="padding:10px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase">' + esc(label) + '</div><div style="font-size:16px;font-weight:700;color:var(--text);margin-top:2px">' + esc(String(val)) + '</div></div>';
     });
     html += '</div>';
+    // Download buttons for available report files
+    const EXT_ICON = { md: '📝', html: '🌐', pdf: '📄', docx: '📘' };
+    const EXT_COLOR = { md: '#4ade80', html: '#fbbf24', pdf: '#f87171', docx: '#60a5fa' };
+    const EXT_LABEL = { md: 'Markdown', html: 'HTML', pdf: 'PDF', docx: 'Word (DOCX)' };
+    const fileEntries = [
+      { ext: 'md', path: card.report_path },
+      { ext: 'html', path: card.html_path },
+      { ext: 'pdf', path: card.pdf_path },
+      { ext: 'docx', path: card.docx_path },
+    ].filter(e => e.path);
+    const exportErrors = card.export_errors || {};
+    const missingFormats = (card.formats || []).filter(fmt => {
+      if (fmt === 'md') return false; // md always available if report exists
+      const pathKey = fmt + '_path';
+      return !card[pathKey];
+    });
+    if (fileEntries.length > 0 || Object.keys(exportErrors).length > 0) {
+      html += '<div style="margin-top:14px">';
+      html += '<div style="font-size:11px;font-weight:700;color:#2dd4bf;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">📥 Download Report</div>';
+      html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+      for (const entry of fileEntries) {
+        const fname = entry.path.replace(/\\\\/g, '/').split('/').pop() || ('report.' + entry.ext);
+        const icon = EXT_ICON[entry.ext] || '📄';
+        const color = EXT_COLOR[entry.ext] || '#a3a3a3';
+        const label = EXT_LABEL[entry.ext] || entry.ext.toUpperCase();
+        html += '<a href="/api/artifacts/download?run_id=' + encodeURIComponent(runId) + '&name=' + encodeURIComponent(fname) + '" download="' + esc(fname) + '" ';
+        html += 'style="display:inline-flex;align-items:center;gap:6px;padding:8px 14px;background:#ffffff12;border:1px solid ' + color + '44;border-radius:7px;color:' + color + ';text-decoration:none;font-size:13px;font-weight:600" ';
+        html += 'onmouseover="this.style.background=\'#ffffff20\'" onmouseout="this.style.background=\'#ffffff12\'">';
+        html += icon + ' ' + esc(label) + '</a>';
+      }
+      // Show failed format errors with re-export option
+      for (const [fmt, errMsg] of Object.entries(exportErrors)) {
+        const icon = EXT_ICON[fmt] || '📄';
+        const label = EXT_LABEL[fmt] || fmt.toUpperCase();
+        html += '<span style="display:inline-flex;align-items:center;gap:6px;padding:8px 14px;background:rgba(239,68,68,0.1);border:1px solid rgba(239,68,68,0.3);border-radius:7px;font-size:12px;color:#f87171" title="' + esc(errMsg) + '">' + icon + ' ' + esc(label) + ' failed</span>';
+        html += '<button onclick="sendQuickReply(\'Re-export the deep research report as ' + fmt.toUpperCase() + '\')" style="padding:7px 12px;background:rgba(251,191,36,0.12);border:1px solid rgba(251,191,36,0.3);border-radius:7px;color:#fbbf24;font-size:12px;font-weight:600;cursor:pointer">↺ Retry ' + esc(label) + '</button>';
+      }
+      html += '</div></div>';
+    }
   }
   html += '<div style="margin-top:12px;font-size:12px;color:var(--muted)">';
   html += 'Web search: <strong style="color:var(--text)">' + (card.web_search_enabled === false ? 'disabled' : 'enabled') + '</strong>';
@@ -3663,6 +3887,9 @@ function finalizeStreamRow(runId, output, error, artifactFiles, testReport, mcpI
     if (docExports && docExports.length > 0) {
       resultEl.innerHTML += renderDocumentDownloadCard(runId, docExports);
     }
+    // Remember last completed run for inline file-request handling
+    if (deepResearchCard && deepResearchCard.kind === 'result') { _lastDeepResearchCard = deepResearchCard; _lastCompletedRunId = runId; }
+    if (docExports && docExports.length) { _lastDocExports = docExports; _lastCompletedRunId = runId; }
     const nonDocFiles = (artifactFiles || []).filter(f => {
       if (!docExports || !docExports.length) return true;
       return !docExports.some(ex => ex.name === f.name);
@@ -3764,11 +3991,9 @@ function _taskSessionSummary(session) {
 
 function _runStatusRank(status) {
   const normalized = String(status || '').toLowerCase();
-  if (normalized === 'running' || normalized === 'started' || normalized === 'cancelling') return 4;
-  if (normalized === 'awaiting_user_input') return 3;
-  if (normalized === 'failed') return 2;
-  if (normalized === 'cancelled') return 1;
-  if (normalized === 'completed') return 1;
+  if (normalized === 'running' || normalized === 'started' || normalized === 'cancelling') return 2;
+  if (normalized === 'awaiting_user_input') return 1;
+  // terminal statuses (completed, failed, cancelled) all rank 0 — sort by time only
   return 0;
 }
 
@@ -4064,6 +4289,65 @@ function handleSendButton() {
   sendMessage();
 }
 
+// Returns HTML string with download cards if the text looks like a file request and we have files,
+// otherwise returns null so the caller can fall through to the normal agent path.
+function _tryHandleFileRequest(text) {
+  const lower = text.toLowerCase();
+  const isAction = /\b(give\s+me|download|get|send\s+me|share|export|show\s+me|fetch|retrieve|provide)\b/.test(lower);
+  const isFileRef = /\b(pdf|docx|doc|word|html|md|markdown|report|document|file|output|result)\b/.test(lower);
+  if (!isAction && !/\b(download|report|file)\b/.test(lower)) return null;
+  if (!isFileRef) return null;
+
+  // Determine which format(s) were requested
+  const wantsPdf  = /\bpdf\b/.test(lower);
+  const wantsDocx = /\b(docx|doc|word)\b/.test(lower);
+  const wantsHtml = /\bhtml\b/.test(lower);
+  const wantsMd   = /\b(md|markdown)\b/.test(lower);
+  const wantsAny  = !wantsPdf && !wantsDocx && !wantsHtml && !wantsMd;
+
+  // Gather files: prefer session state, fall back to persisted project chat history
+  let card = _lastDeepResearchCard;
+  let docExports = _lastDocExports ? _lastDocExports.slice() : [];
+  let runId = _lastCompletedRunId;
+  if (!card && !docExports.length && typeof _projectChatMessages !== 'undefined') {
+    for (let i = (_projectChatMessages || []).length - 1; i >= 0; i--) {
+      const msg = _projectChatMessages[i];
+      if (msg.role === 'agent') {
+        if (!card && msg.deep_research_result_card) { card = msg.deep_research_result_card; runId = msg.run_id || ''; }
+        if (!docExports.length && msg.long_document_exports) { docExports = msg.long_document_exports; runId = msg.run_id || runId; }
+        if (card || docExports.length) break;
+      }
+    }
+  }
+
+  if (!card && !docExports.length) return null;
+
+  // Filter exports to requested formats
+  const filteredExports = wantsAny ? docExports : docExports.filter(ex =>
+    (wantsPdf && ex.ext === 'pdf') || (wantsDocx && ex.ext === 'docx') ||
+    (wantsHtml && ex.ext === 'html') || (wantsMd && ex.ext === 'md')
+  );
+  // Also filter card paths to requested formats when building the card display
+  let displayCard = card;
+  if (card && !wantsAny) {
+    displayCard = Object.assign({}, card);
+    if (!wantsMd) displayCard.report_path = '';
+    if (!wantsHtml) displayCard.html_path = '';
+    if (!wantsPdf) displayCard.pdf_path = '';
+    if (!wantsDocx) displayCard.docx_path = '';
+  }
+
+  let html = '';
+  if (displayCard && displayCard.kind === 'result') html += renderDeepResearchCard(displayCard, runId);
+  if (filteredExports.length) {
+    html += renderDocumentPreviewCard(runId, filteredExports);
+    html += renderDocumentDownloadCard(runId, filteredExports);
+  } else if (!displayCard) {
+    return null; // Nothing to show after filtering
+  }
+  return html || null;
+}
+
 async function sendMessage() {
   const input = document.getElementById('userInput');
   const text = input.value.trim();
@@ -4121,6 +4405,20 @@ async function sendMessage() {
     document.getElementById('chatTitle').textContent = text.substring(0, 40) + (text.length > 40 ? '...' : '');
   }
   createStreamingRow(runId, isContinuation ? (_chatRunState.task || text) : text);
+
+  // Intercept file-download requests: resolve locally without hitting the agent
+  if (!isContinuation) {
+    const fileReqHtml = _tryHandleFileRequest(text);
+    if (fileReqHtml) {
+      const resultEl = document.getElementById('stream-result-' + runId);
+      if (resultEl) resultEl.innerHTML = '<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:10px">Here are the available report files:</div>' + fileReqHtml;
+      finalizeStreamRow(runId, '', '', [], null, null, null, null, 'completed');
+      isRunning = false;
+      isStopping = false;
+      _setChatComposerState();
+      return;
+    }
+  }
 
   try {
     const resumeDir = _pendingResumeDir;
@@ -4212,6 +4510,10 @@ setResearchMode('auto');
 renderDeepResearchSourceSummary();
 _renderChatInspector();
 _setChatComposerState();
+window.addEventListener('resize', () => {
+  const input = document.getElementById('userInput');
+  if (input) autoResize(input);
+});
 setInterval(checkGateway, 30000);
 setInterval(loadRuns, 15000);
 setInterval(loadProjContext, 60000);
@@ -5870,6 +6172,19 @@ function renderProjectChatMessages(messages) {
     row.innerHTML = '<div class="msg-bubble"></div>';
     const bubble = row.querySelector('.msg-bubble');
     setChatBubbleContent(bubble, message.content || '', message.content_format || '', role);
+    // Re-render deep research result card and download links from persisted data
+    if (role === 'agent' && message.deep_research_result_card) {
+      const runId = message.run_id || '';
+      const cardHtml = renderDeepResearchCard(message.deep_research_result_card, runId);
+      if (cardHtml) bubble.insertAdjacentHTML('beforeend', cardHtml);
+    }
+    if (role === 'agent' && message.long_document_exports && message.long_document_exports.length) {
+      const runId = message.run_id || '';
+      const previewHtml = renderDocumentPreviewCard(runId, message.long_document_exports);
+      if (previewHtml) bubble.insertAdjacentHTML('beforeend', previewHtml);
+      const dlHtml = renderDocumentDownloadCard(runId, message.long_document_exports);
+      if (dlHtml) bubble.insertAdjacentHTML('beforeend', dlHtml);
+    }
     if (message.created_at && role !== 'system') {
       const meta = document.createElement('div');
       meta.className = 'msg-ctx';
@@ -6803,6 +7118,16 @@ async function sendChat() {
   btn.disabled = true;
   _closeProjectApprovalModal();
   appendMsg('user', text, isLikelyMarkdown(text) ? 'markdown' : 'text');
+  // Intercept file-download requests: resolve locally without hitting the agent
+  if (!resumingApproval) {
+    const fileReqHtml = _tryHandleFileRequest(text);
+    if (fileReqHtml) {
+      const agentDiv = appendMsg('agent', '');
+      agentDiv.querySelector('.msg-bubble').innerHTML = '<div>Here are the available report files:</div>' + fileReqHtml;
+      btn.disabled = false;
+      return;
+    }
+  }
   const agentDiv = appendMsg('agent', '');
   const bubble = agentDiv.querySelector('.msg-bubble');
   bubble.innerHTML = '<span class="spinner"></span>';
@@ -9638,7 +9963,9 @@ async function load() {
     body.innerHTML = runs.map(run => {
       const status = (run.status || 'completed').toLowerCase();
       const rid = run.run_id || '';
-      return '<tr><td style="max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + esc(run.query||run.text||'') + '">' + esc((run.query||run.text||'\u2014').substring(0,70)) + '</td><td style="font-family:monospace;font-size:11px;color:var(--muted)">' + esc(rid) + '</td><td><span class="badge ' + status + '">' + status + '</span></td><td style="color:var(--muted)">' + esc(run.last_agent||'') + '</td><td style="color:var(--muted);white-space:nowrap">' + esc(run.created_at||'') + '</td><td><button onclick="showArtifacts(\'' + rid + '\', this)" style="background:none;border:1px solid var(--border);color:var(--teal);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px">\ud83d\udcc1</button></td></tr>';
+      const query = run.user_query || run.query || run.text || '';
+      const createdAt = run.started_at || run.created_at || run.updated_at || '';
+      return '<tr><td style="max-width:280px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + esc(query) + '">' + esc((query||'\u2014').substring(0,70)) + '</td><td style="font-family:monospace;font-size:11px;color:var(--muted)">' + esc(rid) + '</td><td><span class="badge ' + status + '">' + status + '</span></td><td style="color:var(--muted)">' + esc(run.last_agent||run.active_task||'') + '</td><td style="color:var(--muted);white-space:nowrap">' + esc(createdAt) + '</td><td><button onclick="showArtifacts(\'' + rid + '\', this)" style="background:none;border:1px solid var(--border);color:var(--teal);border-radius:6px;padding:3px 8px;cursor:pointer;font-size:11px">\ud83d\udcc1</button></td></tr>';
     }).join('');
   } catch(e) { document.getElementById('runBody').innerHTML = '<tr><td colspan="6" style="color:var(--crimson)">Error: ' + String(e) + '</td></tr>'; }
 }
@@ -10039,7 +10366,17 @@ strong { color: var(--text); }
                 runs = _gateway_get("/runs", timeout=5.0)
             except Exception:
                 runs = []
-            self._json(200, _live_recent_chat_threads(runs if isinstance(runs, list) else []))
+            try:
+                sessions = _gateway_get("/sessions", timeout=5.0)
+            except Exception:
+                sessions = []
+            self._json(
+                200,
+                _live_recent_chat_threads(
+                    runs if isinstance(runs, list) else [],
+                    sessions if isinstance(sessions, list) else [],
+                ),
+            )
             return
         if path == "/api/artifacts/download":
             params = parse_qs(parsed.query or "")
@@ -10117,6 +10454,8 @@ strong { color: var(--text); }
                 run_row = _db_get_run(run_id)
                 if run_row:
                     output_dir = run_row.get("run_output_dir", "")
+                if not output_dir:
+                    output_dir = _get_run_output_dir_from_manifest(run_id)
                 db_artifacts, file_list = _collect_artifacts(run_id, output_dir)
             except Exception:
                 pass
@@ -10479,6 +10818,8 @@ strong { color: var(--text); }
         working_directory = str(
             body.get("working_directory") or os.getenv("KENDR_WORKING_DIR", "")
         ).strip()
+        if working_directory:
+            working_directory = normalize_host_path_str(working_directory)
         payload = {
             "text": text,
             "channel": str(body.get("channel", "webchat")),
@@ -10506,8 +10847,16 @@ strong { color: var(--text); }
                     "local_drive_force_long_document"):
             if body.get(key) is not None:
                 payload[key] = body[key]
-        # Auto-inject active project context when caller didn't supply project_root
-        if not payload.get("project_root"):
+        channel_name = str(payload.get("channel") or "").strip().lower()
+
+        # Auto-inject active project context only for project workbench requests.
+        # Generic web chat should remain project-agnostic by default.
+        project_root_value = str(payload.get("project_root") or "").strip()
+        if project_root_value:
+            payload["project_root"] = normalize_host_path_str(project_root_value, base_dir=working_directory)
+        if payload.get("working_directory"):
+            payload["working_directory"] = normalize_host_path_str(str(payload.get("working_directory") or "").strip())
+        if channel_name == "project_ui" and not payload.get("project_root"):
             try:
                 active_proj = _pm_get_active()
                 if active_proj:
@@ -10521,7 +10870,7 @@ strong { color: var(--text); }
                             payload.setdefault("working_directory", proj_path)
             except Exception:
                 pass
-        if str(payload.get("channel") or "").strip().lower() == "project_ui":
+        if channel_name == "project_ui":
             project_id, project_path, project_name = _resolve_project_chat_identity(
                 str(payload.get("project_id") or "").strip(),
                 str(payload.get("project_root") or payload.get("working_directory") or "").strip(),
@@ -10541,7 +10890,7 @@ strong { color: var(--text); }
 
         gateway_up = _gateway_ready(timeout=0.5)
         if not gateway_up and not project_build_mode:
-            if str(payload.get("channel") or "").strip().lower() == "project_ui":
+            if channel_name == "project_ui":
                 _persist_project_chat_user_request(payload, text)
                 _persist_project_chat_result(
                     payload,
@@ -10552,7 +10901,7 @@ strong { color: var(--text); }
                 "detail": "Start it with: kendr gateway start",
             })
             return
-        if str(payload.get("channel") or "").strip().lower() == "project_ui":
+        if channel_name == "project_ui":
             _persist_project_chat_user_request(payload, text)
         run_id = str(body.get("run_id") or "").strip() or f"ui-{uuid.uuid4().hex[:8]}"
         payload["run_id"] = run_id
@@ -10604,6 +10953,8 @@ strong { color: var(--text); }
                     or str(run_row.get("resume_output_dir") or "").strip()
                 )
                 resume_dir = resume_dir or str(run_row.get("working_directory") or "").strip()
+            if not resume_output_dir:
+                resume_output_dir = _get_run_output_dir_from_manifest(run_id)
         if not resume_dir and not resume_output_dir:
             self._json(400, {"error": "missing_resume_dir", "detail": "Provide resume_dir, output_folder, or working_directory."})
             return
@@ -11135,6 +11486,8 @@ strong { color: var(--text); }
             proj = _pm_get_active() if _HAS_PROJECT_MANAGER else None
             proj_id = str(body.get("project_id") or (proj.get("id") if proj else "") or "").strip()
             proj_root = str(body.get("project_root") or (proj.get("path") if proj else "") or "").strip()
+            if proj_root:
+                proj_root = normalize_host_path_str(proj_root)
             proj_name = str(body.get("project_name") or (proj.get("name") if proj else "") or "").strip()
             if not proj_id and proj_root and _HAS_PROJECT_MANAGER:
                 try:
@@ -11534,6 +11887,7 @@ strong { color: var(--text); }
             if not root:
                 self._json(400, {"error": "No active project"})
                 return
+            root = normalize_host_path_str(root)
             name = str((proj or {}).get("name", "") or body.get("project_name", "")).strip()
             extra_notes = str(body.get("notes", "")).strip()
             content = generate_kendr_md(root, name, extra_notes)
@@ -11550,6 +11904,7 @@ strong { color: var(--text); }
             if not root:
                 self._json(400, {"error": "No active project"})
                 return
+            root = normalize_host_path_str(root)
             content = str(body.get("content", "")).strip()
             if not content:
                 self._json(400, {"error": "content is required"})

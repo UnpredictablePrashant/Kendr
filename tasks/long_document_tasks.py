@@ -770,6 +770,272 @@ def _collect_google_search_evidence(query: str, *, num: int = 10) -> dict:
     return {"results": results, "raw": payload, "error": ""}
 
 
+# ---------------------------------------------------------------------------
+# Image collection pipeline
+# ---------------------------------------------------------------------------
+
+_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".bmp"}
+_IMAGE_MAX_BYTES = int(os.getenv("KENDR_IMAGE_MAX_BYTES", str(4 * 1024 * 1024)))  # 4 MB default
+_IMAGE_DOWNLOAD_TIMEOUT = int(os.getenv("KENDR_IMAGE_DOWNLOAD_TIMEOUT", "15"))
+
+
+def _collect_image_search_results(query: str, *, num: int = 10) -> list[dict]:
+    """Search Google Images via SerpAPI and return a list of image candidate dicts."""
+    api_key = os.getenv("SERP_API_KEY", "").strip()
+    if not api_key:
+        log_task_update(DEEP_RESEARCH_LABEL, "Image search skipped: SERP_API_KEY not set.")
+        return []
+    try:
+        from urllib.parse import urlencode
+        from urllib.request import urlopen as _urlopen
+        params = {
+            "engine": "google_images",
+            "q": query,
+            "api_key": api_key,
+            "num": num,
+            "hl": "en",
+            "gl": "us",
+            "safe": "active",
+        }
+        url = f"https://serpapi.com/search.json?{urlencode(params)}"
+        with _urlopen(url, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        candidates = []
+        for item in payload.get("images_results", [])[:num]:
+            original = str(item.get("original", "")).strip()
+            thumbnail = str(item.get("thumbnail", "")).strip()
+            img_url = original or thumbnail
+            if not img_url:
+                continue
+            candidates.append({
+                "url": img_url,
+                "thumbnail": thumbnail,
+                "title": str(item.get("title", "")).strip(),
+                "source": str(item.get("source", "")).strip(),
+                "source_page": str(item.get("link", "")).strip(),
+                "width": int(item.get("original_width", 0) or 0),
+                "height": int(item.get("original_height", 0) or 0),
+            })
+        log_task_update(DEEP_RESEARCH_LABEL, f"Image search '{query[:60]}': {len(candidates)} candidates found.")
+        return candidates
+    except Exception as exc:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Image search failed for '{query[:60]}': {exc}")
+        return []
+
+
+def _download_image(url: str, save_path: str, *, timeout: int = _IMAGE_DOWNLOAD_TIMEOUT, max_bytes: int = _IMAGE_MAX_BYTES) -> bool:
+    """Download an image to save_path. Returns True on success."""
+    try:
+        from urllib.request import Request as _Request, urlopen as _urlopen
+        req = _Request(
+            url,
+            headers={"User-Agent": os.getenv("RESEARCH_USER_AGENT", "multi-agent-research-bot/1.0")},
+        )
+        with _urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if content_type and "image" not in content_type and "octet-stream" not in content_type:
+                log_task_update(DEEP_RESEARCH_LABEL, f"Skipping non-image content-type '{content_type}' for {url[:80]}")
+                return False
+            data = b""
+            chunk_size = 65536
+            while True:
+                chunk = resp.read(chunk_size)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > max_bytes:
+                    log_task_update(DEEP_RESEARCH_LABEL, f"Image too large (>{max_bytes // 1024}KB), skipping: {url[:80]}")
+                    return False
+        if len(data) < 512:
+            log_task_update(DEEP_RESEARCH_LABEL, f"Image too small ({len(data)} bytes), skipping: {url[:80]}")
+            return False
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        Path(save_path).write_bytes(data)
+        log_task_update(DEEP_RESEARCH_LABEL, f"Downloaded image ({len(data) // 1024}KB) → {save_path}")
+        return True
+    except Exception as exc:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Image download failed for {url[:80]}: {exc}")
+        return False
+
+
+def _filter_relevant_images(candidates: list[dict], *, section_title: str, section_text: str, max_images: int = 3) -> list[dict]:
+    """Use an LLM to select the most relevant diagrams/charts/visuals from image candidates."""
+    if not candidates:
+        return []
+    candidates_summary = "\n".join(
+        f"{i + 1}. title={item.get('title', '')!r} source={item.get('source', '')!r} "
+        f"size={item.get('width', 0)}x{item.get('height', 0)} url={item.get('url', '')[:80]}"
+        for i, item in enumerate(candidates)
+    )
+    prompt = f"""You are selecting relevant images for a deep research report section.
+
+Section title: {section_title}
+Section preview (first 800 chars):
+{section_text[:800]}
+
+Image candidates (from a Google Images search):
+{candidates_summary}
+
+Select up to {max_images} images that would genuinely enhance this section. Prioritize:
+- Technical diagrams, architecture charts, system flows
+- Data visualizations, graphs, charts, tables-as-images
+- Infographics, process diagrams, comparison visuals
+- Screenshots of relevant technical interfaces or metrics
+
+REJECT:
+- Stock photos, portraits, headshots
+- Generic decorative images, logos, icons unrelated to the topic
+- Low-resolution thumbnails (width < 200 or height < 200)
+- Images with no clear relation to the section topic
+
+Return ONLY a JSON array of the selected candidate numbers (1-based), e.g. [2, 5] or [] if none qualify.
+Return an empty array if no images are clearly relevant."""
+    try:
+        raw = llm_text(prompt).strip()
+        # Extract JSON array from response
+        match = re.search(r"\[[\d,\s]*\]", raw)
+        if not match:
+            return []
+        indices = json.loads(match.group())
+        selected = []
+        for idx in indices:
+            if isinstance(idx, int) and 1 <= idx <= len(candidates):
+                selected.append(candidates[idx - 1])
+        log_task_update(
+            DEEP_RESEARCH_LABEL,
+            f"Image filter for '{section_title[:50]}': {len(selected)}/{len(candidates)} candidates selected.",
+        )
+        return selected[:max_images]
+    except Exception as exc:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Image relevance filter failed: {exc}")
+        return []
+
+
+def _collect_section_images(
+    *,
+    section_title: str,
+    section_objective: str,
+    section_text: str,
+    artifact_dir: str,
+    section_index: int,
+    max_images: int = 3,
+    search_num: int = 12,
+) -> list[dict]:
+    """Search, filter, and download images for a report section.
+
+    Returns a list of dicts with keys:
+        relative_path, abs_path, title, source, source_page, alt_text, section_index, section_title
+    """
+    query = f"{section_title} diagram chart architecture infographic"
+    log_task_update(DEEP_RESEARCH_LABEL, f"Searching for images for section {section_index}: '{section_title[:50]}'")
+    candidates = _collect_image_search_results(query, num=search_num)
+    if not candidates:
+        return []
+
+    selected = _filter_relevant_images(candidates, section_title=section_title, section_text=section_text, max_images=max_images)
+    if not selected:
+        log_task_update(DEEP_RESEARCH_LABEL, f"No relevant images selected for section {section_index}: '{section_title[:50]}'")
+        return []
+
+    images_dir = _artifact_file(artifact_dir, f"section_{section_index:02d}/images")
+    abs_images_dir = resolve_output_path(images_dir)
+    os.makedirs(abs_images_dir, exist_ok=True)
+
+    saved: list[dict] = []
+    for img_index, img in enumerate(selected, start=1):
+        img_url = img.get("url", "")
+        if not img_url:
+            continue
+        # Derive a file extension from the URL or default to .jpg
+        parsed_path = urlparse(img_url).path
+        ext = Path(parsed_path).suffix.lower()
+        if ext not in _IMAGE_EXTENSIONS:
+            ext = ".jpg"
+        filename = f"img_{section_index:02d}_{img_index:02d}{ext}"
+        abs_path = os.path.join(abs_images_dir, filename)
+        relative_path = f"section_{section_index:02d}/images/{filename}"
+
+        if _download_image(img_url, abs_path):
+            alt_text = img.get("title", "") or f"{section_title} — visual {img_index}"
+            saved.append({
+                "relative_path": relative_path,
+                "abs_path": abs_path,
+                "filename": filename,
+                "title": img.get("title", ""),
+                "source": img.get("source", ""),
+                "source_page": img.get("source_page", ""),
+                "url": img_url,
+                "alt_text": alt_text,
+                "section_index": section_index,
+                "section_title": section_title,
+                "width": img.get("width", 0),
+                "height": img.get("height", 0),
+            })
+
+    log_task_update(
+        DEEP_RESEARCH_LABEL,
+        f"Section {section_index} images: {len(saved)}/{len(selected)} downloaded to {abs_images_dir}",
+    )
+    return saved
+
+
+def _image_appendix_markdown(all_image_entries: list[dict]) -> str:
+    """Build Appendix D — Image Gallery markdown from all collected section images."""
+    lines = ["## Appendix D - Image Gallery", ""]
+    if not all_image_entries:
+        lines.append("_No images were collected during research._")
+        return "\n".join(lines)
+
+    lines.append(
+        f"This appendix contains {len(all_image_entries)} image(s) collected from the web during research. "
+        "Images are grouped by the report section they support."
+    )
+    lines.append("")
+
+    # Group by section
+    by_section: dict[int, list[dict]] = {}
+    for entry in all_image_entries:
+        idx = int(entry.get("section_index", 0))
+        by_section.setdefault(idx, []).append(entry)
+
+    for section_idx in sorted(by_section):
+        entries = by_section[section_idx]
+        section_title = entries[0].get("section_title", f"Section {section_idx}")
+        lines.append(f"### Section {section_idx}: {section_title}")
+        lines.append("")
+        for i, entry in enumerate(entries, start=1):
+            rel_path = entry.get("relative_path", "")
+            alt = entry.get("alt_text", "") or entry.get("title", f"Image {i}")
+            source = entry.get("source", "")
+            source_page = entry.get("source_page", "")
+            lines.append(f"![{alt}]({rel_path})")
+            caption_parts = [f"**Figure {section_idx}.{i}** — {alt}"]
+            if source:
+                caption_parts.append(f"Source: {source}")
+            if source_page:
+                caption_parts.append(f"([link]({source_page}))")
+            lines.append(" ".join(caption_parts))
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def _embed_images_in_section(section_text: str, images: list[dict]) -> str:
+    """Append downloaded image references at the end of a section's markdown."""
+    if not images:
+        return section_text
+    lines = [section_text.rstrip(), "", "**Visual References**", ""]
+    for i, entry in enumerate(images, start=1):
+        rel_path = entry.get("relative_path", "")
+        alt = entry.get("alt_text", "") or entry.get("title", f"Figure {i}")
+        source = entry.get("source", "")
+        lines.append(f"![{alt}]({rel_path})")
+        if source:
+            lines.append(f"*Source: {source}*")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _sources_from_search_results(results: list[dict], *, prefix: str = "S") -> list[dict]:
     entries = []
     for index, item in enumerate(results or [], start=1):
@@ -2662,6 +2928,7 @@ Section text:
 
 
 def _markdown_to_plain_text(markdown_text: str) -> str:
+    input_chars = len(markdown_text or "")
     lines: list[str] = []
     in_code = False
     for raw in (markdown_text or "").splitlines():
@@ -2672,23 +2939,40 @@ def _markdown_to_plain_text(markdown_text: str) -> str:
         if in_code:
             lines.append(line)
             continue
-        line = re.sub(r"^#{1,6}\\s+", "", line)
-        line = re.sub(r"^[-*]\\s+", "- ", line)
-        line = re.sub(r"^\\d+\\.\\s+", "", line)
+        line = re.sub(r"^#{1,6}\s+", "", line)
+        line = re.sub(r"^[-*]\s+", "- ", line)
+        line = re.sub(r"^\d+\.\s+", "", line)
         lines.append(line)
     cleaned = "\n".join(lines).strip()
-    # Best-effort ASCII clean-up for PDF rendering
-    cleaned = cleaned.encode("ascii", errors="ignore").decode("ascii")
-    return cleaned
+    # Best-effort ASCII clean-up for PDF rendering (latin-1 PDF stream)
+    cleaned_ascii = cleaned.encode("ascii", errors="ignore").decode("ascii")
+    stripped_chars = len(cleaned) - len(cleaned_ascii)
+    if stripped_chars > 0:
+        log_task_update(
+            DEEP_RESEARCH_LABEL,
+            f"_markdown_to_plain_text: stripped {stripped_chars} non-ASCII characters for PDF rendering "
+            f"(input {input_chars} chars → {len(cleaned_ascii)} chars).",
+        )
+    else:
+        log_task_update(
+            DEEP_RESEARCH_LABEL,
+            f"_markdown_to_plain_text: converted {input_chars} chars → {len(cleaned_ascii)} plain-text chars (no non-ASCII loss).",
+        )
+    return cleaned_ascii
 
 
 def _markdown_to_html(markdown_text: str) -> str:
+    input_chars = len(markdown_text or "")
+    log_task_update(DEEP_RESEARCH_LABEL, f"_markdown_to_html: converting {input_chars} chars of markdown to HTML.")
     lines = (markdown_text or "").splitlines()
     html_lines: list[str] = []
     in_code = False
     in_ul = False
     in_ol = False
     index = 0
+    heading_count = 0
+    list_item_count = 0
+    table_count = 0
 
     def close_lists() -> None:
         nonlocal in_ul, in_ol
@@ -2739,7 +3023,7 @@ def _markdown_to_html(markdown_text: str) -> str:
         # Table detection (header + separator line)
         if "|" in line and index + 1 < len(lines):
             sep = lines[index + 1]
-            if re.match(r"^\\s*\\|?\\s*[:\\-\\s|]+\\|?\\s*$", sep):
+            if re.match(r"^\s*\|?\s*[:\-\s|]+\|?\s*$", sep):
                 table_block = [line, sep]
                 index += 2
                 while index < len(lines) and "|" in lines[index] and lines[index].strip():
@@ -2747,39 +3031,58 @@ def _markdown_to_html(markdown_text: str) -> str:
                     index += 1
                 close_lists()
                 render_table(table_block)
+                table_count += 1
                 continue
 
-        heading = re.match(r"^(#{1,6})\\s+(.*)$", line)
+        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
         if heading:
             close_lists()
             level = min(len(heading.group(1)), 6)
             html_lines.append(f"<h{level}>{html.escape(heading.group(2).strip())}</h{level}>")
+            heading_count += 1
             index += 1
             continue
 
-        ul_item = re.match(r"^[-*]\\s+(.*)$", line)
+        ul_item = re.match(r"^[-*]\s+(.*)$", line)
         if ul_item:
             if not in_ul:
                 close_lists()
                 html_lines.append("<ul>")
                 in_ul = True
             html_lines.append(f"<li>{html.escape(ul_item.group(1).strip())}</li>")
+            list_item_count += 1
             index += 1
             continue
 
-        ol_item = re.match(r"^\\d+\\.\\s+(.*)$", line)
+        ol_item = re.match(r"^\d+\.\s+(.*)$", line)
         if ol_item:
             if not in_ol:
                 close_lists()
                 html_lines.append("<ol>")
                 in_ol = True
             html_lines.append(f"<li>{html.escape(ol_item.group(1).strip())}</li>")
+            list_item_count += 1
             index += 1
             continue
 
         if not line.strip():
             close_lists()
             html_lines.append("<p></p>")
+            index += 1
+            continue
+
+        # Image syntax: ![alt text](path)
+        img_match = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)$", line.strip())
+        if img_match:
+            close_lists()
+            img_alt = html.escape(img_match.group(1).strip())
+            img_src = html.escape(img_match.group(2).strip())
+            html_lines.append(
+                f'<figure style="margin:18px 0;text-align:center;">'
+                f'<img src="{img_src}" alt="{img_alt}" style="max-width:100%;border-radius:6px;border:1px solid var(--line);">'
+                f'<figcaption style="font-size:0.85em;color:var(--muted);margin-top:6px;">{img_alt}</figcaption>'
+                f'</figure>'
+            )
             index += 1
             continue
 
@@ -2809,21 +3112,33 @@ def _markdown_to_html(markdown_text: str) -> str:
         "ul,ol{padding-left:22px;}"
         "</style>"
     )
-    return (
+    html_result = (
         "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Deep Research Report</title>"
         f"{style}</head><body>\n"
         + "\n".join(html_lines)
         + "\n</body></html>"
     )
+    log_task_update(
+        DEEP_RESEARCH_LABEL,
+        f"_markdown_to_html: done — {heading_count} headings, {list_item_count} list items, "
+        f"{table_count} tables → {len(html_result)} chars of HTML.",
+    )
+    return html_result
 
 
 def _markdown_to_docx(markdown_text: str, output_path: str) -> None:
+    input_chars = len(markdown_text or "")
+    log_task_update(DEEP_RESEARCH_LABEL, f"_markdown_to_docx: converting {input_chars} chars → {output_path}")
     if not _ensure_python_package("python-docx", "docx"):
         raise RuntimeError("python-docx not available")
     from docx import Document
 
     doc = Document()
     in_code = False
+    heading_count = 0
+    bullet_count = 0
+    numbered_count = 0
+    para_count = 0
     for raw in (markdown_text or "").splitlines():
         line = raw.rstrip()
         if line.strip().startswith("```"):
@@ -2837,20 +3152,55 @@ def _markdown_to_docx(markdown_text: str, output_path: str) -> None:
         if not line.strip():
             doc.add_paragraph("")
             continue
-        heading_match = re.match(r"^(#{1,6})\\s+(.*)$", line)
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", line)
         if heading_match:
             level = min(len(heading_match.group(1)), 6)
             doc.add_heading(heading_match.group(2).strip(), level=level)
+            heading_count += 1
             continue
-        if re.match(r"^[-*]\\s+", line):
-            doc.add_paragraph(re.sub(r"^[-*]\\s+", "", line), style="List Bullet")
+        if re.match(r"^[-*]\s+", line):
+            doc.add_paragraph(re.sub(r"^[-*]\s+", "", line), style="List Bullet")
+            bullet_count += 1
             continue
-        if re.match(r"^\\d+\\.\\s+", line):
-            doc.add_paragraph(re.sub(r"^\\d+\\.\\s+", "", line), style="List Number")
+        if re.match(r"^\d+\.\s+", line):
+            doc.add_paragraph(re.sub(r"^\d+\.\s+", "", line), style="List Number")
+            numbered_count += 1
             continue
+        # Image syntax: ![alt text](path or url)
+        img_match = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)$", line.strip())
+        if img_match:
+            img_alt = img_match.group(1).strip()
+            img_path = img_match.group(2).strip()
+            # Only embed local file paths (not http URLs which docx can't fetch)
+            if not img_path.startswith("http"):
+                try:
+                    # Resolve relative to compiled markdown's output dir
+                    abs_img = resolve_output_path(img_path) if not os.path.isabs(img_path) else img_path
+                    if os.path.isfile(abs_img):
+                        from docx.shared import Inches  # type: ignore
+                        doc.add_picture(abs_img, width=Inches(5.5))
+                        caption_para = doc.add_paragraph(img_alt or "Figure")
+                        caption_para.style = "Caption" if "Caption" in [s.name for s in doc.styles] else "Normal"
+                        log_task_update(DEEP_RESEARCH_LABEL, f"  Embedded image in DOCX: {abs_img}")
+                    else:
+                        doc.add_paragraph(f"[Image not found: {img_path}]")
+                        log_task_update(DEEP_RESEARCH_LABEL, f"  Image not found for DOCX embed: {abs_img}")
+                except Exception as img_exc:
+                    doc.add_paragraph(f"[Image: {img_alt or img_path}]")
+                    log_task_update(DEEP_RESEARCH_LABEL, f"  DOCX image embed failed ({img_path}): {img_exc}")
+            else:
+                doc.add_paragraph(f"[Image: {img_alt or img_path}]")
+            continue
+
         doc.add_paragraph(line)
+        para_count += 1
 
     doc.save(output_path)
+    log_task_update(
+        DEEP_RESEARCH_LABEL,
+        f"_markdown_to_docx: saved — {heading_count} headings, {bullet_count} bullets, "
+        f"{numbered_count} numbered items, {para_count} paragraphs → {output_path}",
+    )
 
 
 def _ensure_python_package(package: str, import_name: str | None = None) -> bool:
@@ -2904,12 +3254,14 @@ def _escape_pdf_text(value: str) -> str:
 
 
 def _render_pdf_bytes(text: str) -> bytes:
+    log_task_update(DEEP_RESEARCH_LABEL, f"_render_pdf_bytes: building PDF from {len(text)} chars of plain text.")
     lines = _wrap_pdf_lines(text)
     page_height = 792
     margin_top = 742
     leading = 14
     lines_per_page = 48
     pages = [lines[i : i + lines_per_page] for i in range(0, max(len(lines), 1), lines_per_page)] or [[]]
+    log_task_update(DEEP_RESEARCH_LABEL, f"_render_pdf_bytes: {len(lines)} wrapped lines → {len(pages)} pages.")
 
     objects: list[bytes] = []
 
@@ -2973,7 +3325,9 @@ def _render_pdf_bytes(text: str) -> bytes:
     buffer.extend(b"startxref\n")
     buffer.extend(f"{xref_offset}\n".encode("ascii"))
     buffer.extend(b"%%EOF\n")
-    return bytes(buffer)
+    result = bytes(buffer)
+    log_task_update(DEEP_RESEARCH_LABEL, f"_render_pdf_bytes: PDF built — {len(pages)} pages, {len(result)} bytes.")
+    return result
 
 
 def _export_long_document_formats(
@@ -2982,51 +3336,80 @@ def _export_long_document_formats(
     *,
     requested_formats: list[str] | None = None,
 ) -> dict[str, str]:
+    """Returns dict with keys 'html', 'docx', 'pdf' (paths) and 'errors' (dict of format->error msg)."""
     compiled_path = Path(resolve_output_path(compiled_filename))
     base_path = compiled_path.with_suffix("")
     html_path = base_path.with_suffix(".html")
     docx_path = base_path.with_suffix(".docx")
     pdf_path = base_path.with_suffix(".pdf")
     formats = set(_normalize_research_formats(requested_formats or DEFAULT_RESEARCH_FORMATS))
+    export_errors: dict[str, str] = {}
 
     html_text = _markdown_to_html(compiled_markdown)
+    log_task_update(DEEP_RESEARCH_LABEL, f"Document export starting. Requested formats: {', '.join(formats)}.")
     if "html" in formats or "pdf" in formats:
-        html_path.write_text(html_text, encoding="utf-8")
+        log_task_update(DEEP_RESEARCH_LABEL, f"Rendering HTML ({len(html_text)} chars)...")
+        try:
+            html_path.write_text(html_text, encoding="utf-8")
+            log_task_update(DEEP_RESEARCH_LABEL, f"HTML written → {html_path}")
+        except Exception as exc:
+            err_msg = f"HTML export failed: {exc}"
+            log_task_update(DEEP_RESEARCH_LABEL, err_msg)
+            export_errors["html"] = err_msg
+            html_path = Path("")
     else:
+        log_task_update(DEEP_RESEARCH_LABEL, "HTML export skipped (not in requested formats).")
         html_path = Path("")
 
     if "docx" in formats:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Rendering DOCX → {docx_path}...")
         try:
             _markdown_to_docx(compiled_markdown, str(docx_path))
+            log_task_update(DEEP_RESEARCH_LABEL, f"DOCX written → {docx_path}")
         except Exception as exc:
-            log_task_update(DEEP_RESEARCH_LABEL, f"DOCX export skipped: {exc}")
+            err_msg = f"DOCX export failed: {exc}"
+            log_task_update(DEEP_RESEARCH_LABEL, err_msg)
+            export_errors["docx"] = err_msg
             docx_path = Path("")
     else:
+        log_task_update(DEEP_RESEARCH_LABEL, "DOCX export skipped (not in requested formats).")
         docx_path = Path("")
 
     pdf_written = False
     if "pdf" in formats:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Rendering PDF → {pdf_path} (trying weasyprint first)...")
         try:
             if _ensure_python_package("weasyprint"):
                 from weasyprint import HTML  # type: ignore
 
                 HTML(string=html_text).write_pdf(str(pdf_path))
                 pdf_written = True
+                log_task_update(DEEP_RESEARCH_LABEL, f"PDF written via weasyprint → {pdf_path}")
             else:
                 raise RuntimeError("weasyprint not available")
         except Exception as exc:
             log_task_update(DEEP_RESEARCH_LABEL, f"HTML-to-PDF export unavailable, falling back to text PDF: {exc}")
 
         if not pdf_written:
-            plain_text = _markdown_to_plain_text(compiled_markdown)
-            pdf_path.write_bytes(_render_pdf_bytes(plain_text))
+            log_task_update(DEEP_RESEARCH_LABEL, "Falling back to plain-text PDF renderer...")
+            try:
+                plain_text = _markdown_to_plain_text(compiled_markdown)
+                pdf_path.write_bytes(_render_pdf_bytes(plain_text))
+                log_task_update(DEEP_RESEARCH_LABEL, f"PDF written via text renderer → {pdf_path}")
+            except Exception as exc:
+                err_msg = f"PDF export failed: {exc}"
+                log_task_update(DEEP_RESEARCH_LABEL, err_msg)
+                export_errors["pdf"] = err_msg
+                pdf_path = Path("")
     else:
+        log_task_update(DEEP_RESEARCH_LABEL, "PDF export skipped (not in requested formats).")
         pdf_path = Path("")
 
     return {
         "html": str(html_path) if str(html_path) else "",
         "docx": str(docx_path) if str(docx_path) else "",
         "pdf": str(pdf_path) if str(pdf_path) else "",
+        "errors": export_errors,
     }
 
 
@@ -3045,6 +3428,7 @@ def _build_compiled_markdown(
     generated_at: str,
     model_name: str,
     deep_research_tier: int,
+    image_entries: list[dict] | None = None,
 ) -> str:
     escaped_title = title.replace('"', '\\"')
     lines = [
@@ -3097,6 +3481,8 @@ def _build_compiled_markdown(
             lines.append(f"- {line}")
     else:
         lines.append("- No research log lines were captured.")
+    lines.append("")
+    lines.append(_image_appendix_markdown(image_entries or []))
     lines.append("")
     return "\n".join(lines).strip() + "\n"
 
@@ -3633,6 +4019,10 @@ def long_document_agent(state):
     continuity_notes: list[str] = []
     section_outputs: list[dict] = []
     section_packages: list[dict] = []
+    all_section_images: list[dict] = []
+    image_collection_enabled = web_search_enabled and bool(os.getenv("SERP_API_KEY", "").strip())
+    if not image_collection_enabled:
+        log_task_update(DEEP_RESEARCH_LABEL, "Image collection disabled (requires web search + SERP_API_KEY).")
     coherence_context_md = _coherence_base_context(state, objective)
     write_text_file(_artifact_file(artifact_dir, "deep_research_coherence_base.md"), coherence_context_md)
 
@@ -4090,6 +4480,48 @@ def long_document_agent(state):
         flowchart_files.extend(inline_png_files)
 
         section_text = _append_generated_visuals(section_text, visual_assets)
+
+        # --- Image collection (web-sourced diagrams / charts / visuals) ---
+        section_images: list[dict] = []
+        if image_collection_enabled:
+            _trace_research_event(
+                state,
+                title=f"Collecting images for section {write_index}/{len(ordered_packages)}",
+                detail=f"Searching for diagrams and visuals to illustrate '{section_title}'.",
+                status="running",
+                metadata={"phase": "image_collection", "section_index": write_index, "section_title": section_title},
+                subtask=f"Collect images for {section_title}",
+            )
+            try:
+                section_images = _collect_section_images(
+                    section_title=section_title,
+                    section_objective=str(package.get("objective", objective)),
+                    section_text=section_text,
+                    artifact_dir=artifact_dir,
+                    section_index=write_index,
+                    max_images=int(state.get("long_document_max_images_per_section", 3)),
+                    search_num=int(state.get("long_document_image_search_num", 12)),
+                )
+                all_section_images.extend(section_images)
+                _trace_research_event(
+                    state,
+                    title=f"Images collected for section {write_index}",
+                    detail=f"{len(section_images)} image(s) downloaded for '{section_title}'.",
+                    status="completed",
+                    metadata={
+                        "phase": "image_collection",
+                        "section_index": write_index,
+                        "section_title": section_title,
+                        "image_count": len(section_images),
+                        "images": [e.get("filename", "") for e in section_images],
+                    },
+                    subtask=f"Collect images for {section_title}",
+                )
+            except Exception as _img_exc:
+                log_task_update(DEEP_RESEARCH_LABEL, f"Image collection failed for section {write_index}: {_img_exc}")
+        if section_images:
+            section_text = _embed_images_in_section(section_text, section_images)
+
         if include_section_references:
             section_text = _append_verified_references(section_text, package.get("sources", []))
         else:
@@ -4132,9 +4564,13 @@ def long_document_agent(state):
                 "visual_assets_file": f"{OUTPUT_DIR}/{visual_assets_json_filename}",
                 "visual_assets_markdown_file": f"{OUTPUT_DIR}/{visual_assets_md_filename}",
                 "flowchart_files": flowchart_files,
+                "section_images": section_images,
             }
         )
-        research_log_lines.append(f"Drafted section {write_index}: {section_title}")
+        research_log_lines.append(
+            f"Drafted section {write_index}: {section_title}"
+            + (f" ({len(section_images)} images)" if section_images else "")
+        )
         state["draft_response"] = (
             f"Deep research in progress: drafted section {write_index}/{len(ordered_packages)} "
             f"({section_title}). Sources this section: {len(package.get('sources', []))}."
@@ -4188,6 +4624,15 @@ def long_document_agent(state):
             json.dumps({"phase": "writing", "sections": section_outputs}, indent=2, ensure_ascii=False),
         )
 
+    log_task_update(DEEP_RESEARCH_LABEL, f"Phase 3/4 - generating executive summary from {len(section_outputs)} sections.")
+    _trace_research_event(
+        state,
+        title="Generating executive summary",
+        detail=f"Synthesizing executive summary from {len(section_outputs)} drafted sections.",
+        status="running",
+        metadata={"phase": "executive_summary", "section_count": len(section_outputs)},
+        subtask="Generate executive summary",
+    )
     summary_prompt = f"""
 Create a concise executive summary for this deep research report.
 Objective:
@@ -4199,7 +4644,19 @@ Section continuity notes:
     executive_summary = llm_text(summary_prompt).strip()
     if not executive_summary:
         executive_summary = "Executive summary was not generated."
+        log_task_update(DEEP_RESEARCH_LABEL, "WARNING: Executive summary was empty — using placeholder.")
+    else:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Executive summary generated: {len(executive_summary.split())} words.")
+    _trace_research_event(
+        state,
+        title="Generating executive summary",
+        detail=f"Executive summary complete ({len(executive_summary.split())} words)." if executive_summary != "Executive summary was not generated." else "Executive summary generation returned empty — using placeholder.",
+        status="completed" if executive_summary != "Executive summary was not generated." else "failed",
+        metadata={"phase": "executive_summary", "word_count": len(executive_summary.split())},
+        subtask="Generate executive summary",
+    )
 
+    log_task_update(DEEP_RESEARCH_LABEL, "Consolidating references and remapping citations across all sections.")
     consolidated_references = _consolidate_references(section_outputs)
     if not include_section_references:
         for item in section_outputs:
@@ -4208,11 +4665,23 @@ Section continuity notes:
                 item.get("references", []),
                 consolidated_references,
             )
+    log_task_update(DEEP_RESEARCH_LABEL, f"Consolidated {len(consolidated_references)} references across {len(section_outputs)} sections.")
+    _trace_research_event(
+        state,
+        title="References consolidated",
+        detail=f"Merged {len(consolidated_references)} unique references from {len(section_outputs)} sections using {citation_style.upper()} style.",
+        status="completed",
+        metadata={"phase": "references", "reference_count": len(consolidated_references), "citation_style": citation_style},
+        subtask="Consolidate references",
+    )
     references_md_filename = _artifact_file(artifact_dir, "deep_research_references.md")
     references_json_filename = _artifact_file(artifact_dir, "deep_research_references.json")
     write_text_file(references_md_filename, _bibliography_markdown(consolidated_references, style=citation_style))
     write_text_file(references_json_filename, json.dumps(consolidated_references, indent=2, ensure_ascii=False))
     visual_index = _build_visual_index(section_outputs)
+    total_tables_vi = sum(len(item.get("tables", [])) for item in visual_index.get("sections", []))
+    total_flowcharts_vi = sum(len(item.get("flowcharts", [])) for item in visual_index.get("sections", []))
+    log_task_update(DEEP_RESEARCH_LABEL, f"Visual index built: {total_tables_vi} tables, {total_flowcharts_vi} flowcharts.")
     visual_index_json_filename = _artifact_file(artifact_dir, "deep_research_visual_index.json")
     visual_index_md_filename = _artifact_file(artifact_dir, "deep_research_visual_index.md")
     write_text_file(visual_index_json_filename, json.dumps(visual_index, indent=2, ensure_ascii=False))
@@ -4234,6 +4703,18 @@ Section continuity notes:
     ]
     methodology_text = "\n".join(methodology_lines)
 
+    if plagiarism_enabled:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Phase 3/4 - running plagiarism check across {len(section_outputs)} sections.")
+        _trace_research_event(
+            state,
+            title="Running plagiarism check",
+            detail=f"Checking {len(section_outputs)} sections for similarity and AI-generated content.",
+            status="running",
+            metadata={"phase": "plagiarism", "section_count": len(section_outputs)},
+            subtask="Run plagiarism check",
+        )
+    else:
+        log_task_update(DEEP_RESEARCH_LABEL, "Plagiarism check disabled — skipping.")
     plagiarism_sources = [{"label": "Evidence bank", "url": "", "text": evidence_bank_md}]
     for package in section_packages:
         plagiarism_sources.append(
@@ -4248,11 +4729,38 @@ Section continuity notes:
         if plagiarism_enabled
         else {"overall_score": 0.0, "ai_content_score": 0.0, "status": "PASS", "sections": []}
     )
+    if plagiarism_enabled:
+        plag_score = plagiarism_report.get("overall_score", 0)
+        plag_status = plagiarism_report.get("status", "PASS")
+        plag_ai = plagiarism_report.get("ai_content_score", 0)
+        log_task_update(
+            DEEP_RESEARCH_LABEL,
+            f"Plagiarism check complete: overall={plag_score}% ({plag_status}), AI content={plag_ai}%.",
+        )
+        _trace_research_event(
+            state,
+            title="Plagiarism check complete",
+            detail=f"Overall similarity: {plag_score}% ({plag_status}). AI content score: {plag_ai}%.",
+            status="completed",
+            metadata={"phase": "plagiarism", "overall_score": plag_score, "status": plag_status, "ai_content_score": plag_ai},
+            subtask="Run plagiarism check",
+        )
     plagiarism_json_filename = _artifact_file(artifact_dir, "plagiarism_report.json")
     plagiarism_md_filename = _artifact_file(artifact_dir, "plagiarism_report.md")
     write_text_file(plagiarism_json_filename, json.dumps(plagiarism_report, indent=2, ensure_ascii=False))
     write_text_file(plagiarism_md_filename, _plagiarism_report_markdown(plagiarism_report))
 
+    log_task_update(DEEP_RESEARCH_LABEL, f"Phase 4/4 - assembling compiled markdown from {len(section_outputs)} sections.")
+    compile_started_at = _trace_now()
+    _trace_research_event(
+        state,
+        title="Compiling final report",
+        detail=f"Merging {len(section_outputs)} sections with executive summary, references, plagiarism appendix, and methodology.",
+        status="running",
+        started_at=compile_started_at,
+        metadata={"phase": "compile", "section_count": len(section_outputs), "formats": output_formats},
+        subtask="Compile and export final report",
+    )
     compiled_markdown = _build_compiled_markdown(
         title,
         objective,
@@ -4267,24 +4775,68 @@ Section continuity notes:
         generated_at=dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
         model_name=research_model,
         deep_research_tier=int(analysis.get("tier", 0) or 0),
+        image_entries=all_section_images,
     )
     compiled_filename = _artifact_file(artifact_dir, "deep_research_report.md")
     write_text_file(compiled_filename, compiled_markdown)
-    export_paths: dict[str, str] = {}
-    compile_started_at = _trace_now()
+    compiled_chars = len(compiled_markdown)
+    compiled_words = len(compiled_markdown.split())
+    log_task_update(
+        DEEP_RESEARCH_LABEL,
+        f"Compiled markdown written: {compiled_words} words, {compiled_chars} chars → {OUTPUT_DIR}/{compiled_filename}",
+    )
     _trace_research_event(
         state,
-        title="Compiling final report",
-        detail="Merging sections, references, plagiarism appendix, and export artifacts.",
+        title="Compiled markdown ready",
+        detail=f"Full report assembled: {compiled_words} words across {len(section_outputs)} sections. Writing export formats: {', '.join(output_formats)}.",
         status="running",
         started_at=compile_started_at,
-        metadata={"phase": "compile"},
+        metadata={"phase": "compile_markdown", "word_count": compiled_words, "char_count": compiled_chars},
         subtask="Compile and export final report",
     )
+    export_paths: dict[str, str] = {}
+    export_errors: dict[str, str] = {}
     try:
+        log_task_update(DEEP_RESEARCH_LABEL, f"Exporting document formats: {', '.join(output_formats)}.")
         export_paths = _export_long_document_formats(compiled_markdown, compiled_filename, requested_formats=output_formats)
+        export_errors = dict(export_paths.pop("errors", {}) or {})
+        succeeded_formats = [fmt for fmt in ("html", "docx", "pdf", "md") if export_paths.get(fmt)]
+        failed_formats = list(export_errors.keys())
+        if succeeded_formats:
+            log_task_update(DEEP_RESEARCH_LABEL, f"Document export succeeded for: {', '.join(succeeded_formats).upper()}.")
+            for fmt in succeeded_formats:
+                log_task_update(DEEP_RESEARCH_LABEL, f"  {fmt.upper()} → {export_paths[fmt]}")
+        if export_errors:
+            err_summary = "; ".join(f"{fmt.upper()}: {msg}" for fmt, msg in export_errors.items())
+            log_task_update(DEEP_RESEARCH_LABEL, f"Some format exports failed: {err_summary}")
+            _trace_research_event(
+                state,
+                title="Document export — partial failure",
+                detail=f"Succeeded: {', '.join(succeeded_formats) or 'none'}. Failed: {err_summary}",
+                status="failed",
+                metadata={"phase": "export", "succeeded": succeeded_formats, "failed": failed_formats, "errors": export_errors},
+                subtask="Compile and export final report",
+            )
+        else:
+            _trace_research_event(
+                state,
+                title="Document export complete",
+                detail=f"All requested formats exported successfully: {', '.join(succeeded_formats).upper() if succeeded_formats else 'none'}.",
+                status="completed",
+                metadata={"phase": "export", "succeeded": succeeded_formats, "paths": {fmt: export_paths.get(fmt, "") for fmt in succeeded_formats}},
+                subtask="Compile and export final report",
+            )
     except Exception as exc:
-        log_task_update(DEEP_RESEARCH_LABEL, f"Format export failed: {exc}")
+        log_task_update(DEEP_RESEARCH_LABEL, f"Format export failed with unexpected exception: {exc}")
+        _trace_research_event(
+            state,
+            title="Document export failed",
+            detail=f"Unexpected error during format export: {exc}",
+            status="failed",
+            metadata={"phase": "export", "error": str(exc)},
+            subtask="Compile and export final report",
+        )
+        export_errors = {"all": str(exc)}
     manifest_filename = _artifact_file(artifact_dir, "deep_research_manifest.json")
     write_text_file(
         manifest_filename,
@@ -4313,6 +4865,21 @@ Section continuity notes:
                 "compiled_pdf_file": export_paths.get("pdf", ""),
                 "evidence_bank_file": state.get("long_document_evidence_bank_path", ""),
                 "evidence_bank_json_file": state.get("long_document_evidence_bank_json_path", ""),
+                "image_gallery_count": total_images,
+                "image_gallery": [
+                    {
+                        "section_index": e.get("section_index"),
+                        "section_title": e.get("section_title", ""),
+                        "filename": e.get("filename", ""),
+                        "abs_path": e.get("abs_path", ""),
+                        "relative_path": e.get("relative_path", ""),
+                        "source": e.get("source", ""),
+                        "source_page": e.get("source_page", ""),
+                        "title": e.get("title", ""),
+                        "alt_text": e.get("alt_text", ""),
+                    }
+                    for e in all_section_images
+                ],
             },
             indent=2,
             ensure_ascii=False,
@@ -4323,6 +4890,27 @@ Section continuity notes:
     total_flowcharts = sum(len((item.get("visual_assets") or {}).get("flowcharts", [])) for item in section_outputs)
     total_words = sum(len(str(item.get("section_text", "")).split()) for item in section_outputs) + len(str(executive_summary).split())
     total_sources = len(consolidated_references)
+    total_images = len(all_section_images)
+    if total_images:
+        log_task_update(
+            DEEP_RESEARCH_LABEL,
+            f"Image collection complete: {total_images} images across {len(section_outputs)} sections.",
+        )
+        _trace_research_event(
+            state,
+            title="Image gallery ready",
+            detail=f"Collected {total_images} web-sourced image(s) across {len(section_outputs)} sections for Appendix D.",
+            status="completed",
+            metadata={
+                "phase": "image_gallery",
+                "total_images": total_images,
+                "images_by_section": {
+                    str(e.get("section_index", "?")): e.get("filename", "")
+                    for e in all_section_images
+                },
+            },
+            subtask="Build image gallery appendix",
+        )
 
     final_summary = (
         f"Deep research pipeline completed.\n"
@@ -4346,6 +4934,7 @@ Section continuity notes:
         f"- Plagiarism report: {OUTPUT_DIR}/{plagiarism_json_filename}\n"
         f"- Evidence bank: {state.get('long_document_evidence_bank_path', 'n/a')}\n"
         f"- Visual assets generated: {total_tables} tables, {total_flowcharts} flowcharts\n"
+        f"- Web images collected: {total_images} (Appendix D)\n"
         f"- Manifest: {OUTPUT_DIR}/{manifest_filename}\n"
         "\nExecutive summary:\n"
         f"{_trim_text(executive_summary, 1800)}\n"
@@ -4414,6 +5003,12 @@ Section continuity notes:
         "knowledge_graph_path": f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'knowledge_graph.json')}",
         "plagiarism_report_path": f"{OUTPUT_DIR}/{plagiarism_json_filename}",
         "raw_json_path": f"{OUTPUT_DIR}/{manifest_filename}",
+        "export_errors": export_errors,
+        "image_count": total_images,
+        "images": [
+            {"section": e.get("section_title", ""), "file": e.get("filename", ""), "path": e.get("abs_path", "")}
+            for e in all_section_images
+        ],
     }
     state["draft_response"] = final_summary
     _trace_research_event(

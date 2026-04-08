@@ -10,6 +10,16 @@ from unittest.mock import patch
 
 
 class TestProjectServices(unittest.TestCase):
+    def test_normalize_path_maps_windows_drive_path_on_posix(self):
+        from kendr import project_manager as pm
+
+        raw = "D:/repo"
+        normalized = pm._normalize_path(raw)
+        if os.name == "nt":
+            self.assertTrue(normalized.lower().endswith("\\repo"))
+        else:
+            self.assertEqual(normalized, str(Path("/mnt/d/repo").resolve()))
+
     def test_start_stop_and_read_project_service_log(self):
         from kendr import project_manager as pm
 

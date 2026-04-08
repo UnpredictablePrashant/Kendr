@@ -21,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from kendr.path_utils import normalize_host_path
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -138,7 +140,7 @@ def generate_kendr_md(
     Does NOT require an LLM — it's a fast structural scan that gives the
     agent enough context to start working immediately.
     """
-    root = Path(project_root).expanduser().resolve()
+    root = normalize_host_path(project_root)
     if not root.exists():
         return f"# Project: {project_name or root.name}\n\n> ⚠️ Directory not found: `{root}`\n"
 
@@ -229,7 +231,7 @@ def generate_kendr_md(
 # ---------------------------------------------------------------------------
 
 def kendr_md_path(project_root: str) -> Path:
-    return Path(project_root).expanduser().resolve() / KENDR_MD_FILENAME
+    return normalize_host_path(project_root) / KENDR_MD_FILENAME
 
 
 def read_kendr_md(project_root: str) -> str:
@@ -245,8 +247,10 @@ def read_kendr_md(project_root: str) -> str:
 
 def write_kendr_md(project_root: str, content: str) -> Path:
     """Write content to kendr.md and return the path."""
-    path = kendr_md_path(project_root)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    root = normalize_host_path(project_root)
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"Project root does not exist: {root}")
+    path = root / KENDR_MD_FILENAME
     path.write_text(content, encoding="utf-8")
     return path
 
@@ -260,7 +264,9 @@ def ensure_kendr_md(project_root: str, project_name: str = "") -> str:
     if existing.strip():
         return existing
     content = generate_kendr_md(project_root, project_name)
-    write_kendr_md(project_root, content)
+    root = normalize_host_path(project_root)
+    if root.exists() and root.is_dir():
+        write_kendr_md(str(root), content)
     return content
 
 
@@ -329,9 +335,10 @@ def get_project_context_blob(project_root: str, project_name: str = "") -> str:
     md = ensure_kendr_md(project_root, project_name)
     if not md.strip():
         return ""
+    resolved_root = normalize_host_path(project_root)
     return (
         "=== PROJECT CONTEXT (kendr.md) ===\n"
-        f"Project root: {project_root}\n\n"
+        f"Project root: {resolved_root}\n\n"
         f"{md}\n"
         "=== END PROJECT CONTEXT ===\n"
     )

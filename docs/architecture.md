@@ -42,7 +42,7 @@ At a high level, a run goes through these stages:
 - [`tasks/a2a_protocol.py`](../tasks/a2a_protocol.py)
   Internal task/message/artifact protocol.
 - [`kendr/persistence/`](../kendr/persistence/)
-  Durable SQLite persistence split by runtime, setup, and superRAG responsibilities.
+  Durable SQLite persistence for runtime, setup, and superRAG responsibilities in one shared DB.
 - [`tasks/sqlite_store.py`](../tasks/sqlite_store.py)
   Backward-compatible import shim for the legacy persistence path.
 - [`tasks/research_infra.py`](../tasks/research_infra.py)

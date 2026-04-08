@@ -567,6 +567,37 @@ class TestLiveRunOverlay(unittest.TestCase):
         self.assertEqual(merged[0]["attempt_id"], "attempt-2")
         self.assertEqual(merged[0]["status"], "awaiting_user_input")
 
+    def test_live_recent_runs_does_not_include_pending_only_rows(self):
+        import kendr.ui_server as ui_server
+
+        runs = [
+            {
+                "run_id": "attempt-1",
+                "workflow_id": "workflow-1",
+                "attempt_id": "attempt-1",
+                "user_query": "Research bananas",
+                "status": "completed",
+                "started_at": "2026-04-03T10:00:00+00:00",
+                "updated_at": "2026-04-03T10:05:00+00:00",
+                "completed_at": "2026-04-03T10:05:00+00:00",
+            }
+        ]
+        pending_only = {
+            "run_id": "stale-ui-run",
+            "workflow_id": "stale-ui-run",
+            "attempt_id": "stale-ui-run",
+            "status": "running",
+            "started_at": "2026-04-03T10:01:00+00:00",
+            "updated_at": "2026-04-03T10:02:00+00:00",
+            "payload": {"text": "stale test run"},
+        }
+
+        with patch.dict("kendr.ui_server._pending_runs", {"stale-ui-run": pending_only}, clear=True):
+            merged = ui_server._live_recent_runs(runs)
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["run_id"], "attempt-1")
+
     def test_live_recent_chat_threads_collapse_session_and_keep_main_prompt(self):
         import kendr.ui_server as ui_server
 
@@ -605,6 +636,35 @@ class TestLiveRunOverlay(unittest.TestCase):
             threads[0]["user_query"],
             "Research what data Facebook, Instagram, WhatsApp, and TikTok capture.",
         )
+
+    def test_live_recent_chat_threads_include_session_backfill_without_runs(self):
+        import kendr.ui_server as ui_server
+
+        sessions = [
+            {
+                "session_key": "webchat:default:chat-42:main",
+                "channel": "webchat",
+                "chat_id": "chat-42",
+                "updated_at": "2026-04-03T10:06:00+00:00",
+                "state": {
+                    "last_run_id": "run-42",
+                    "last_workflow_id": "workflow-42",
+                    "last_attempt_id": "run-42",
+                    "last_status": "running",
+                    "last_objective": "Long-running deep research thread",
+                    "run_output_dir": "/tmp/runs/run-42",
+                },
+            }
+        ]
+
+        threads = ui_server._live_recent_chat_threads([], sessions)
+
+        self.assertEqual(len(threads), 1)
+        self.assertEqual(threads[0]["chat_session_id"], "chat-42")
+        self.assertEqual(threads[0]["latest_run_id"], "run-42")
+        self.assertEqual(threads[0]["status"], "running")
+        self.assertEqual(threads[0]["run_output_dir"], "/tmp/runs/run-42")
+        self.assertEqual(threads[0]["user_query"], "Long-running deep research thread")
 
     def test_extract_chat_session_id_from_webchat_session_key(self):
         import kendr.ui_server as ui_server
@@ -918,6 +978,35 @@ class TestUIChatPayloads(unittest.TestCase):
         self.assertTrue(body.get("streaming"))
         self.assertEqual(captured["payload"]["provider"], "openai")
         self.assertEqual(captured["payload"]["model"], "gpt-5.1")
+
+    def test_webchat_does_not_auto_inject_active_project_context(self):
+        from kendr.ui_server import KendrUIHandler
+
+        handler = object.__new__(KendrUIHandler)
+        handler._json = MagicMock()
+
+        body = {
+            "text": "Give me a generic answer",
+            "channel": "webchat",
+            "chat_id": "chat-123",
+            "run_id": "ui-webchat-run",
+            "working_directory": "/tmp/work",
+        }
+
+        with (
+            patch("kendr.ui_server._gateway_ready", return_value=True),
+            patch("kendr.ui_server._pm_get_active", return_value={"id": "proj-1", "path": "/tmp/demo", "name": "Demo"}),
+            patch("kendr.ui_server._start_run_background") as start_run,
+            patch.dict("kendr.ui_server._pending_runs", {}, clear=True),
+            patch.dict("kendr.ui_server._run_event_queues", {}, clear=True),
+        ):
+            handler._handle_chat(body)
+
+        forwarded = start_run.call_args.args[1]
+        self.assertEqual(forwarded["channel"], "webchat")
+        self.assertEqual(forwarded["working_directory"], "/tmp/work")
+        self.assertNotIn("project_root", forwarded)
+        self.assertNotIn("project_name", forwarded)
 
 
 class TestUIModelSelectionPersistence(unittest.TestCase):

@@ -27,13 +27,14 @@ from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
 from kendr.execution_trace import duration_label
+from kendr.path_utils import normalize_host_path
 
 _log = logging.getLogger("kendr.project_manager")
 
 
 def _normalize_path(path: str) -> str:
     """Expand ~ and resolve to an absolute real path."""
-    return str(Path(path).expanduser().resolve())
+    return str(normalize_host_path(path))
 
 
 _store_lock = threading.Lock()

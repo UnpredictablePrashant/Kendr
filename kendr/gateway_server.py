@@ -4,6 +4,7 @@ import html
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from kendr import AgentRuntime, build_registry
@@ -28,12 +29,73 @@ from kendr.persistence import (
     list_scheduled_jobs,
     list_task_sessions,
 )
+from kendr.persistence.run_store import scan_manifest_runs
 from kendr.recovery import discover_resume_candidates, load_resume_candidate
 
 
 REGISTRY = build_registry()
 RUNTIME = AgentRuntime(REGISTRY)
 SKILL_REGISTRY = RUNTIME.skill_registry
+
+
+def _task_session_summary(task_session: dict | None) -> dict:
+    if not isinstance(task_session, dict):
+        return {}
+    summary = task_session.get("summary")
+    if isinstance(summary, dict):
+        return summary
+    raw = task_session.get("summary_json")
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except Exception:
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _run_log_paths(run_output_dir: str) -> dict[str, str]:
+    base = str(run_output_dir or "").strip()
+    if not base:
+        return {}
+    resolved = str(Path(base).expanduser().resolve())
+    return {
+        "run_output_dir": resolved,
+        "execution_log": str(Path(resolved) / "execution.log"),
+        "agent_work_notes": str(Path(resolved) / "agent_work_notes.txt"),
+        "final_output": str(Path(resolved) / "final_output.txt"),
+        "privileged_audit": str(Path(resolved) / "privileged_audit.log"),
+        "run_manifest": str(Path(resolved) / "run_manifest.json"),
+        "checkpoint": str(Path(resolved) / "checkpoint.json"),
+        "resume_summary": str(Path(resolved) / "resume_summary.json"),
+        "heartbeat": str(Path(resolved) / "heartbeat.json"),
+    }
+
+
+def _decorate_run_record(run_row: dict, task_session: dict | None = None) -> dict:
+    row = dict(run_row or {})
+    run_output_dir = str(row.get("run_output_dir", "")).strip()
+    if run_output_dir:
+        row["output_dir"] = run_output_dir
+        row["log_paths"] = _run_log_paths(run_output_dir)
+    if isinstance(task_session, dict):
+        row["task_session"] = task_session
+        summary = _task_session_summary(task_session)
+        if summary:
+            row["active_task"] = str(summary.get("active_task") or summary.get("objective") or row.get("active_task", "")).strip()
+            row["pending_user_input_kind"] = str(summary.get("pending_user_input_kind") or row.get("pending_user_input_kind") or "").strip()
+            row["approval_pending_scope"] = str(summary.get("approval_pending_scope") or row.get("approval_pending_scope") or "").strip()
+            row["pending_user_question"] = str(summary.get("pending_user_question") or row.get("pending_user_question") or "").strip()
+            if bool(summary.get("awaiting_user_input")) or row.get("pending_user_input_kind") or row.get("approval_pending_scope"):
+                row["status"] = "awaiting_user_input"
+                row["awaiting_user_input"] = True
+            summary_run_dir = str(summary.get("run_output_dir", "")).strip()
+            if summary_run_dir and not run_output_dir:
+                row["run_output_dir"] = summary_run_dir
+                row["output_dir"] = summary_run_dir
+                row["log_paths"] = _run_log_paths(summary_run_dir)
+    return row
 
 
 def _is_cancelled_error(exc: Exception) -> bool:
@@ -153,7 +215,27 @@ class GatewayHandler(BaseHTTPRequestHandler):
             )
             return
         if parsed.path == "/runs":
-            self._send_json(200, list_recent_runs())
+            api_limit = max(100, int(str(os.getenv("KENDR_RUNS_API_LIMIT", "500") or "500")))
+            db_runs = list_recent_runs(api_limit)
+            known_ids = {r["run_id"] for r in db_runs}
+            manifest_runs = scan_manifest_runs(known_run_ids=known_ids)
+            all_runs = db_runs + manifest_runs
+            task_sessions = list_task_sessions(max(api_limit, 500))
+            task_by_run: dict[str, dict] = {}
+            for session in task_sessions:
+                run_id = str(session.get("run_id", "")).strip()
+                if run_id and run_id not in task_by_run:
+                    task_by_run[run_id] = session
+            all_runs = [
+                _decorate_run_record(run, task_by_run.get(str(run.get("run_id", "")).strip()))
+                for run in all_runs
+                if isinstance(run, dict)
+            ]
+            all_runs.sort(
+                key=lambda r: str(r.get("updated_at") or r.get("started_at") or ""),
+                reverse=True,
+            )
+            self._send_json(200, all_runs[:api_limit])
             return
         if parsed.path.startswith("/runs/"):
             run_id = parsed.path.split("/runs/", 1)[1].strip()
@@ -162,13 +244,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
             match = get_run(run_id)
             if not match:
+                manifest_list = scan_manifest_runs(known_run_ids=set())
+                match = next((r for r in manifest_list if r.get("run_id") == run_id), None)
+            if not match:
                 self._send_json(404, {"error": "run_not_found", "run_id": run_id})
                 return
             task_session = get_task_session_by_run(run_id)
-            if task_session:
-                match = dict(match)
-                match["task_session"] = task_session
-            self._send_json(200, match)
+            self._send_json(200, _decorate_run_record(match, task_session if isinstance(task_session, dict) else None))
             return
         if parsed.path == "/resume-candidates":
             params = parse_qs(parsed.query or "")
@@ -180,13 +262,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(200, discover_resume_candidates(search_path, limit=limit))
             return
         if parsed.path == "/sessions":
-            self._send_json(200, list_channel_sessions())
+            self._send_json(200, list_channel_sessions(500))
             return
         if parsed.path == "/jobs":
             self._send_json(200, list_scheduled_jobs())
             return
         if parsed.path == "/task-sessions":
-            self._send_json(200, list_task_sessions())
+            self._send_json(200, list_task_sessions(500))
             return
         if parsed.path.startswith("/task-sessions/by-run/"):
             run_id = parsed.path.split("/task-sessions/by-run/", 1)[1].strip()
@@ -358,6 +440,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
             explicit_workflow_type = str(payload.get("workflow_type", "")).strip()
             if explicit_workflow_type:
                 state_overrides["workflow_type"] = explicit_workflow_type
+            if not str(state_overrides.get("session_id", "")).strip():
+                state_overrides["session_id"] = session_id_for_payload(
+                    payload,
+                    force_new=bool(state_overrides.get("memory_force_new_session", False)),
+                )
+            if not str(state_overrides.get("channel_session_key", "")).strip():
+                state_overrides["channel_session_key"] = session_id_for_payload(payload, force_new=False)
         normalized_channel = normalize_incoming_message(
             payload,
             channel=str(state_overrides.get("incoming_channel") or payload.get("channel") or "webchat"),

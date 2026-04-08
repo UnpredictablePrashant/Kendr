@@ -1,7 +1,7 @@
 """MCP Server Manager — kendr as an MCP client.
 
-Persists a registry of external MCP servers in the local SQLite DB
-(``output/agent_workflow.sqlite3``, table ``mcp_servers``) and connects to
+Persists a registry of external MCP servers in Kendr's centralized SQLite DB
+(``mcp_servers`` table, path resolved via ``KENDR_DB_PATH``) and connects to
 them to auto-discover their tools, just like Cursor does.
 
 Supported connection types

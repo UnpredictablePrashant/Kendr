@@ -11,14 +11,20 @@ import json
 import logging
 import os
 import time
+from hashlib import sha1
 from typing import Any
 
-from .core import DB_PATH, _connect, initialize_db
+from .core import DB_PATH, _connect, initialize_db, resolve_db_path
 
 _log = logging.getLogger("kendr.persistence.mcp_store")
 
 _LEGACY_JSON = os.path.join(os.path.expanduser("~"), ".kendr", "mcp_registry.json")
-_MIGRATED_FLAG = os.path.join(os.path.expanduser("~"), ".kendr", "mcp_migrated.flag")
+
+
+def _migrated_flag_path(db_path: str) -> str:
+    resolved = resolve_db_path(db_path)
+    digest = sha1(resolved.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    return os.path.join(os.path.expanduser("~"), ".kendr", f"mcp_migrated_{digest}.flag")
 
 
 def _row_to_dict(row) -> dict:
@@ -35,12 +41,13 @@ def _row_to_dict(row) -> dict:
 
 
 def _maybe_migrate(db_path: str = DB_PATH) -> None:
-    if os.path.exists(_MIGRATED_FLAG):
+    migrated_flag = _migrated_flag_path(db_path)
+    if os.path.exists(migrated_flag):
         return
     if not os.path.isfile(_LEGACY_JSON):
         try:
-            os.makedirs(os.path.dirname(_MIGRATED_FLAG), exist_ok=True)
-            open(_MIGRATED_FLAG, "w").close()
+            os.makedirs(os.path.dirname(migrated_flag), exist_ok=True)
+            open(migrated_flag, "w").close()
         except Exception:
             pass
         return
@@ -85,8 +92,8 @@ def _maybe_migrate(db_path: str = DB_PATH) -> None:
                     )
         _log.info("MCP registry migrated from JSON (%d servers)", len(servers))
         try:
-            os.makedirs(os.path.dirname(_MIGRATED_FLAG), exist_ok=True)
-            open(_MIGRATED_FLAG, "w").close()
+            os.makedirs(os.path.dirname(migrated_flag), exist_ok=True)
+            open(migrated_flag, "w").close()
         except Exception:
             pass
     except Exception as exc:

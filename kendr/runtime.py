@@ -23,6 +23,7 @@ from kendr.persistence import (
     upsert_channel_session,
     upsert_task_session,
 )
+from kendr.path_utils import normalize_host_path_str
 from kendr.setup import build_setup_snapshot
 from kendr.skill_registry import build_skill_registry, SkillRegistry
 from kendr.workflow_contract import (
@@ -96,7 +97,7 @@ class AgentRuntime:
                 "Working folder is not configured. Set KENDR_WORKING_DIR in Setup UI (Core Runtime), "
                 "or pass state_overrides['working_directory'] before running tasks."
             )
-        resolved = Path(working_dir).expanduser().resolve()
+        resolved = Path(normalize_host_path_str(working_dir))
         resolved.mkdir(parents=True, exist_ok=True)
         return str(resolved)
 
@@ -104,6 +105,13 @@ class AgentRuntime:
         return self.registry.agent_descriptions()
 
     def apply_runtime_setup(self, state: dict) -> dict:
+        working_dir = str(state.get("working_directory", "") or "").strip()
+        if working_dir:
+            state["working_directory"] = normalize_host_path_str(working_dir)
+        project_root = str(state.get("project_root", "") or "").strip()
+        if project_root:
+            state["project_root"] = normalize_host_path_str(project_root, base_dir=state.get("working_directory", ""))
+
         snapshot = build_setup_snapshot(self._agent_cards())
         available_agents = snapshot.get("available_agents", [])
         filtered_cards = [card for card in self._agent_cards() if card["agent_name"] in available_agents]
@@ -710,8 +718,12 @@ class AgentRuntime:
     def _session_payload(self, state: RuntimeState, *, status: str, active_agent: str = "", completed_at: str = "") -> dict:
         channel_session = state.get("channel_session", {}) if isinstance(state.get("channel_session"), dict) else {}
         plan_summary = self._plan_step_summary(state)
+        run_output_dir = str(state.get("run_output_dir", "") or "").strip()
+        log_paths = self._run_log_paths(run_output_dir)
         return {
-            "session_id": state.get("session_id", ""),
+            # Persist task sessions by run_id so long-running chat threads keep per-run
+            # execution history instead of overwriting one row per channel session.
+            "session_id": str(state.get("run_id", "") or state.get("session_id", "")),
             "run_id": state.get("run_id", ""),
             "workflow_id": state.get("workflow_id", state.get("run_id", "")),
             "attempt_id": state.get("attempt_id", state.get("run_id", "")),
@@ -744,6 +756,10 @@ class AgentRuntime:
                 "plan_step_total": plan_summary.get("plan_step_total", 0),
                 "recent_events": self._recent_event_summary(state),
                 "execution_trace": self._recent_execution_trace(state),
+                "thread_session_id": state.get("session_id", ""),
+                "working_directory": str(state.get("working_directory", "") or ""),
+                "run_output_dir": run_output_dir,
+                "log_paths": log_paths,
             },
         }
 
@@ -792,6 +808,8 @@ class AgentRuntime:
         session_key = self._base_channel_session_key(state)
         if not session_key:
             return
+        run_output_dir = str(state.get("run_output_dir", "") or "").strip()
+        log_paths = self._run_log_paths(run_output_dir)
         previous = get_channel_session(session_key) or {}
         previous_state = previous.get("state", {}) if isinstance(previous, dict) else {}
         if not isinstance(previous_state, dict):
@@ -825,6 +843,8 @@ class AgentRuntime:
                 "last_attempt_id": state.get("attempt_id", state.get("run_id", "")),
                 "workflow_type": state.get("workflow_type", ""),
                 "last_objective": state.get("current_objective", state.get("user_query", "")),
+                "run_output_dir": run_output_dir,
+                "log_paths": log_paths,
                 "last_plan": state.get("plan", ""),
                 "last_plan_data": state.get("plan_data", {}),
                 "last_plan_steps": state.get("plan_steps", []),
@@ -876,6 +896,23 @@ class AgentRuntime:
         }
         upsert_channel_session(session_key, session_payload)
         state["channel_session"] = session_payload
+
+    def _run_log_paths(self, run_output_dir: str) -> dict[str, str]:
+        base = str(run_output_dir or "").strip()
+        if not base:
+            return {}
+        resolved = str(Path(base).expanduser().resolve())
+        return {
+            "run_output_dir": resolved,
+            "execution_log": str(Path(resolved) / "execution.log"),
+            "agent_work_notes": str(Path(resolved) / "agent_work_notes.txt"),
+            "final_output": str(Path(resolved) / "final_output.txt"),
+            "privileged_audit": str(Path(resolved) / "privileged_audit.log"),
+            "run_manifest": str(Path(resolved) / "run_manifest.json"),
+            "checkpoint": str(Path(resolved) / "checkpoint.json"),
+            "resume_summary": str(Path(resolved) / "resume_summary.json"),
+            "heartbeat": str(Path(resolved) / "heartbeat.json"),
+        }
 
     def _persist_recovery_state(self, state: RuntimeState, *, status: str, active_agent: str = "", completed_at: str = "") -> None:
         run_id = str(state.get("run_id", "")).strip()
@@ -1993,9 +2030,21 @@ class AgentRuntime:
         # during the analysis-card phase. This guard re-dispatches deterministically without
         # calling the LLM, preventing the orchestrator from treating the analysis card text
         # as a "good final answer" and finishing prematurely.
+        deep_research_workflow = (
+            bool(state.get("deep_research_mode", False))
+            or str(state.get("workflow_type", "")).strip().lower() == "deep_research"
+        )
+        result_card = state.get("deep_research_result_card", {})
+        result_kind = str((result_card or {}).get("kind", "")).strip().lower() if isinstance(result_card, dict) else ""
+        deep_research_pipeline_completed = (
+            result_kind == "result"
+            or bool(str(state.get("long_document_compiled_path", "")).strip())
+            or bool(str(state.get("long_document_manifest_path", "")).strip())
+        )
         if (
-            bool(state.get("deep_research_confirmed", False))
-            and not bool(state.get("long_document_mode", False))
+            deep_research_workflow
+            and bool(state.get("deep_research_confirmed", False))
+            and not deep_research_pipeline_completed
             and self._is_agent_available(state, "long_document_agent")
         ):
             reason = "Deep research confirmed by user — resuming long_document_agent to run the full research pipeline."
@@ -3312,6 +3361,9 @@ Return ONLY valid JSON in this exact schema:
                 initial_state["approval_request"] = {}
                 initial_state["deep_research_confirmed"] = True
                 initial_state["deep_research_mode"] = True
+                # Reset stale dispatch guards from the pre-approval analysis run.
+                initial_state["long_document_mode"] = False
+                initial_state["long_document_job_started"] = False
                 initial_state["workflow_type"] = "deep_research"
                 return
             if response["action"] == "quick_summary":
