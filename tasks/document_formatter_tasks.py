@@ -381,17 +381,10 @@ def _export_to_docx(content: str, title: str, out_path: str) -> bool:
         return False
 
 
-def _export_to_pdf(html_text: str, pdf_path: str) -> bool:
+def _export_to_pdf(md_path: str, pdf_path: str) -> bool:
     try:
-        import weasyprint
-        weasyprint.HTML(string=html_text).write_pdf(pdf_path)
-        return True
-    except Exception:
-        pass
-    try:
-        from tasks.long_document_tasks import _markdown_to_plain_text, _render_pdf_bytes
-        plain = _markdown_to_plain_text(html_text)
-        Path(pdf_path).write_bytes(_render_pdf_bytes(plain))
+        from tasks.md_to_pdf import md_to_pdf
+        md_to_pdf(md_path, pdf_path)
         return True
     except Exception as exc:
         log_task_update("DocFormatter", f"PDF export failed: {exc}")
@@ -409,6 +402,15 @@ def document_formatter_agent(state: dict) -> dict:
         or task_content
         or ""
     ).strip()
+
+    # If content is just a user query (no markdown body), check if it references an .md file on disk
+    if not content or (len(content) < 500 and content == (task_content or "").strip()):
+        md_ref = re.search(r'["\']?([^\s"\']+\.md)["\']?', content or task_content or "", re.IGNORECASE)
+        if md_ref:
+            candidate = Path(md_ref.group(1))
+            if candidate.exists():
+                content = candidate.read_text(encoding="utf-8")
+                log_task_update("DocFormatter", f"Reading MD file from path: {candidate}")
 
     if not content:
         log_task_update("DocFormatter", "No content to format.")
@@ -438,7 +440,7 @@ def document_formatter_agent(state: dict) -> dict:
     docx_ok = _export_to_docx(clean_md, title, docx_path)
 
     pdf_path = str(artifact_path / f"{slug}.pdf")
-    pdf_ok = _export_to_pdf(html_text, pdf_path)
+    pdf_ok = _export_to_pdf(str(md_path), pdf_path)
 
     state["document_formatter_md_path"] = str(md_path)
     state["document_formatter_pdf_path"] = pdf_path if pdf_ok else ""

@@ -15,10 +15,8 @@ fastmcp
 telethon
 boto3
 playwright
-# Document export: styled PDF generation
-weasyprint
-# Flowchart PNG rendering (Python wrapper — also requires Graphviz binary)
-# Windows: choco install graphviz  (run as Administrator)
-# macOS:   brew install graphviz
-# Linux:   apt-get install graphviz
-graphviz
+# Document export: MD → PDF via xhtml2pdf, Mermaid diagrams via networkx/matplotlib
+xhtml2pdf
+markdown
+networkx
+matplotlib

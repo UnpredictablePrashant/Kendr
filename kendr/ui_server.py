@@ -1691,6 +1691,20 @@ a:hover { text-decoration: underline; }
 .deep-research-panel.visible { display:block; max-height:min(46vh, 560px); overflow-y:auto; }
 .deep-research-panel.collapsed { max-height:none; overflow:visible; }
 .deep-research-panel.collapsed .dr-body { display:none; }
+.security-panel { display:none; margin-bottom:12px; padding:14px; border:1px solid rgba(251,113,133,0.3); border-radius:12px; background:linear-gradient(180deg, rgba(251,113,133,0.06), rgba(239,68,68,0.04)); }
+.security-panel.visible { display:block; }
+.sec-head { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; margin-bottom:12px; }
+.sec-title { font-size:13px; font-weight:700; color:#f87171; margin-bottom:2px; }
+.sec-subtitle { font-size:11px; color:var(--muted); line-height:1.4; }
+.sec-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.sec-field { display:flex; flex-direction:column; gap:4px; }
+.sec-field label { font-size:11px; font-weight:600; color:var(--muted); text-transform:uppercase; letter-spacing:.04em; }
+.sec-input { background:var(--bg); border:1px solid var(--border); border-radius:7px; padding:7px 10px; font-size:12px; color:var(--text); width:100%; box-sizing:border-box; }
+.sec-input:focus { outline:none; border-color:rgba(251,113,133,0.6); }
+.sec-auth-row { display:flex; align-items:center; gap:8px; margin-top:10px; padding:10px 12px; background:rgba(251,113,133,0.08); border:1px solid rgba(251,113,133,0.2); border-radius:8px; }
+.sec-auth-row input[type=checkbox] { width:16px; height:16px; accent-color:#f87171; cursor:pointer; flex-shrink:0; }
+.sec-auth-label { font-size:12px; color:#f87171; font-weight:600; line-height:1.4; }
+.sec-warn { font-size:11px; color:var(--muted); margin-top:8px; line-height:1.4; padding:8px 10px; background:rgba(251,113,133,0.05); border-radius:6px; border-left:3px solid rgba(251,113,133,0.4); }
 .dr-head { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; margin-bottom:10px; flex-wrap:wrap; }
 .dr-head > div:first-child { flex:1 1 320px; min-width:0; }
 .dr-title { font-size:12px; font-weight:700; color:var(--teal); letter-spacing:.08em; text-transform:uppercase; }
@@ -1874,6 +1888,7 @@ a:hover { text-decoration: underline; }
       <div class="chat-command-chip active" id="chatModeChip">Chat</div>
       <div class="chat-command-chip" id="chatResearchChip">Auto</div>
       <div class="chat-command-chip" id="chatShellChip">Shell Off</div>
+      <div class="chat-command-chip" id="chatSecurityChip" style="display:none">Security Off</div>
     </div>
   </div>
   <div class="messages" id="messages">
@@ -1895,6 +1910,30 @@ a:hover { text-decoration: underline; }
     <div class="mode-row">
       <button class="mode-pill active" id="modeAutoBtn" onclick="setResearchMode('auto')">Auto</button>
       <button class="mode-pill" id="modeDeepResearchBtn" onclick="setResearchMode('deep_research')">Deep Research</button>
+      <button class="mode-pill" id="modeSecurityBtn" onclick="setSecurityMode(!securityMode)" title="Security Assessment — requires explicit authorization before any scan runs">&#x1F6E1; Security</button>
+    </div>
+    <div class="security-panel" id="securityPanel">
+      <div class="sec-head">
+        <div>
+          <div class="sec-title">Security Assessment Authorization</div>
+          <div class="sec-subtitle">All three fields are required. Scanning is blocked until authorization is confirmed.</div>
+        </div>
+      </div>
+      <div class="sec-grid">
+        <div class="sec-field">
+          <label for="secTargetUrl">Target URL</label>
+          <input id="secTargetUrl" class="sec-input" type="url" placeholder="https://example.com" oninput="_renderChatInspector()">
+        </div>
+        <div class="sec-field">
+          <label for="secAuthNote">Authorization Reference</label>
+          <input id="secAuthNote" class="sec-input" type="text" placeholder="e.g. Ticket SEC-123, signed contract, owner approval" oninput="_renderChatInspector()">
+        </div>
+      </div>
+      <div class="sec-auth-row">
+        <input type="checkbox" id="secAuthorized" onchange="_renderChatInspector()">
+        <label class="sec-auth-label" for="secAuthorized">I confirm I own this target or have explicit written permission from the owner to perform a security assessment.</label>
+      </div>
+      <div class="sec-warn">Only authorized defensive security assessments are permitted. Unauthorized scanning is blocked. Ensure scope and testing window are agreed with the asset owner before proceeding.</div>
     </div>
     <div class="deep-research-panel" id="deepResearchPanel">
       <div class="dr-head">
@@ -2010,7 +2049,10 @@ a:hover { text-decoration: underline; }
       </div>
       </div>
     </div>
+    <div id="mainChatAttachChips" class="chat-attach-chips"></div>
     <div class="input-row">
+      <input type="file" id="mainChatFileInput" multiple style="display:none" onchange="handleMainChatFileSelect(this)">
+      <button class="attach-btn" onclick="document.getElementById('mainChatFileInput').click()" title="Attach files">&#x1F4CE;</button>
       <textarea class="input-box" id="userInput" placeholder="Ask kendr anything &#x2014; research, code, deploy, analyze..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
       <button class="send-btn" id="sendBtn" onclick="handleSendButton()" title="Send (Enter)">&#x27A4;</button>
     </div>
@@ -2088,6 +2130,7 @@ let workingDir = '';
 let activeEvtSource = null;
 let _loadRunToken = 0;
 let shellModeActive = false;
+let securityMode = false;
 let researchMode = 'auto';
 let deepResearchUploadedRoots = [];
 let deepResearchLocalPaths = [];
@@ -2100,6 +2143,8 @@ let _chatAwaitingContext = null;
 let _lastDeepResearchCard = null;
 let _lastDocExports = null;
 let _lastCompletedRunId = '';
+let _mainChatAttachments = [];
+let _projChatAttachments = [];
 
 function _defaultChatPlaceholder() {
   return researchMode === 'deep_research'
@@ -2318,6 +2363,16 @@ function _renderChatInspector() {
     modeChip.textContent = researchMode === 'deep_research' ? 'Deep Research' : 'Auto';
     modeChip.classList.toggle('active', researchMode === 'deep_research');
   }
+  const secChip = document.getElementById('chatSecurityChip');
+  if (secChip) {
+    secChip.style.display = securityMode ? '' : 'none';
+    const secAuthorized = !!((document.getElementById('secAuthorized') || {}).checked);
+    const secTarget = ((document.getElementById('secTargetUrl') || {}).value || '').trim();
+    const secNote = ((document.getElementById('secAuthNote') || {}).value || '').trim();
+    const secReady = securityMode && secAuthorized && secTarget && secNote;
+    secChip.textContent = !securityMode ? 'Security Off' : secReady ? 'Security: Authorized' : 'Security: Needs Auth';
+    secChip.classList.toggle('active', secReady);
+  }
   if (chatChip) chatChip.classList.add('active');
   if (_chatRunState.runId) {
     const heroTitle = document.getElementById('run-hero-title-' + _chatRunState.runId);
@@ -2522,6 +2577,21 @@ function toggleShellMode() {
     btn.classList.remove('active');
     btn.title = 'Enable shell automation \u2014 lets agents install tools, run commands, and execute multi-step workflows';
     if (banner) banner.classList.remove('visible');
+  }
+  _renderChatInspector();
+}
+
+function setSecurityMode(on) {
+  securityMode = !!on;
+  const btn = document.getElementById('modeSecurityBtn');
+  const panel = document.getElementById('securityPanel');
+  const chip = document.getElementById('chatSecurityChip');
+  if (btn) btn.classList.toggle('active', securityMode);
+  if (panel) panel.classList.toggle('visible', securityMode);
+  if (chip) {
+    chip.style.display = securityMode ? '' : 'none';
+    chip.textContent = securityMode ? 'Security On' : 'Security Off';
+    chip.classList.toggle('active', securityMode);
   }
   _renderChatInspector();
 }
@@ -4348,13 +4418,74 @@ function _tryHandleFileRequest(text) {
   return html || null;
 }
 
+// ── Chat file attachment helpers ──────────────────────────────────────────────
+function _readFileAsText(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = e => resolve(e.target.result);
+    reader.onerror = () => reject(new Error('Could not read ' + file.name));
+    reader.readAsText(file);
+  });
+}
+
+function _renderAttachChips(attachments, containerId, removeFn) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = attachments.map((a, i) =>
+    `<span class="chat-attach-chip">&#x1F4CE; ${escapeHtml(a.name)}<button onclick="${removeFn}(${i})" title="Remove">&#x2715;</button></span>`
+  ).join('');
+}
+
+async function handleMainChatFileSelect(input) {
+  for (const file of Array.from(input.files)) {
+    try { _mainChatAttachments.push({ name: file.name, content: await _readFileAsText(file) }); }
+    catch(e) { console.warn('Attach error:', e); }
+  }
+  input.value = '';
+  _renderAttachChips(_mainChatAttachments, 'mainChatAttachChips', 'removeMainChatAttachment');
+}
+
+function removeMainChatAttachment(idx) {
+  _mainChatAttachments.splice(idx, 1);
+  _renderAttachChips(_mainChatAttachments, 'mainChatAttachChips', 'removeMainChatAttachment');
+}
+
+async function handleProjChatFileSelect(input) {
+  for (const file of Array.from(input.files)) {
+    try { _projChatAttachments.push({ name: file.name, content: await _readFileAsText(file) }); }
+    catch(e) { console.warn('Attach error:', e); }
+  }
+  input.value = '';
+  _renderAttachChips(_projChatAttachments, 'projChatAttachChips', 'removeProjChatAttachment');
+}
+
+function removeProjChatAttachment(idx) {
+  _projChatAttachments.splice(idx, 1);
+  _renderAttachChips(_projChatAttachments, 'projChatAttachChips', 'removeProjChatAttachment');
+}
+
+function _buildTextWithAttachments(text, attachments) {
+  if (!attachments.length) return text;
+  const parts = attachments.map(a => {
+    const ext = (a.name.split('.').pop() || '').toLowerCase();
+    return ext === 'md'
+      ? `[Attached: ${a.name}]\n\n${a.content}`
+      : `[Attached: ${a.name}]\n\`\`\`${ext}\n${a.content}\n\`\`\``;
+  });
+  const joined = parts.join('\n\n---\n\n');
+  return text ? joined + '\n\n---\n\n' + text : joined;
+}
+
 async function sendMessage() {
   const input = document.getElementById('userInput');
-  const text = input.value.trim();
+  const rawText = input.value.trim();
+  const text = _buildTextWithAttachments(rawText, _mainChatAttachments);
   if (!text || isRunning) return;
 
   input.value = '';
   autoResize(input);
+  _mainChatAttachments = [];
+  _renderAttachChips(_mainChatAttachments, 'mainChatAttachChips', 'removeMainChatAttachment');
   isRunning = true;
   isStopping = false;
   _setChatComposerState();
@@ -4370,8 +4501,10 @@ async function sendMessage() {
   _removeAwaitingBanner();
 
   appendUserMsg(text);
-  const runId = continuationRunId || ('ui-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
-  const workflowId = continuationWorkflowId || runId;
+  // Every message turn (including approval/resume replies) gets a fresh run id.
+  // Keeping workflow_id stable preserves thread identity without overwriting prior runs.
+  const runId = 'ui-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  const workflowId = continuationWorkflowId || continuationRunId || runId;
   currentRunId = runId;
   currentWorkflowId = workflowId;
   sessionStorage.setItem('kendr_active_run_id', runId);
@@ -4468,9 +4601,42 @@ async function sendMessage() {
       payload.shell_auto_approve = true;
       payload.privileged_approval_note = 'Approved via Shell Automation mode in chat UI';
     }
+    if (securityMode) {
+      const secAuthorized = !!((document.getElementById('secAuthorized') || {}).checked);
+      const secTarget = ((document.getElementById('secTargetUrl') || {}).value || '').trim();
+      const secNote = ((document.getElementById('secAuthNote') || {}).value || '').trim();
+      if (!secTarget) {
+        finalizeStreamRow(runId, '', 'Security mode requires a Target URL before scanning can start.');
+        isRunning = false;
+        isStopping = false;
+        _setChatComposerState();
+        return;
+      }
+      if (!secAuthorized) {
+        finalizeStreamRow(runId, '', 'Security mode requires you to check the authorization confirmation before scanning can start.');
+        isRunning = false;
+        isStopping = false;
+        _setChatComposerState();
+        return;
+      }
+      if (!secNote) {
+        finalizeStreamRow(runId, '', 'Security mode requires an Authorization Reference (ticket ID, contract, or signed approval) before scanning can start.');
+        isRunning = false;
+        isStopping = false;
+        _setChatComposerState();
+        return;
+      }
+      payload.security_authorized = true;
+      payload.security_target_url = secTarget;
+      payload.security_authorization_note = secNote;
+    }
     if (resumeDir) {
       endpoint = API + '/api/chat/resume';
       payload.resume_dir = resumeDir;
+      if (isContinuation) {
+        // Approval replies should take over stale/running candidates after reconnects.
+        payload.force = true;
+      }
     }
     const resp = await fetch(endpoint, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const d = await resp.json();
@@ -4976,6 +5142,12 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
 .ctx-badge { font-size: 10px; color: var(--muted); display: flex; align-items: center; gap: 5px; }
 .ctx-bar-wrap { width: 60px; height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
 .ctx-bar-fill { height: 100%; background: var(--teal); border-radius: 2px; transition: width 0.4s; }
+.attach-btn { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 15px; cursor: pointer; color: var(--muted); transition: color 0.15s, border-color 0.15s; flex-shrink: 0; line-height: 1; }
+.attach-btn:hover { color: var(--text); border-color: var(--teal); }
+.chat-attach-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 0 4px 0; min-height: 0; }
+.chat-attach-chip { display: inline-flex; align-items: center; gap: 5px; background: rgba(0,201,167,0.1); border: 1px solid rgba(0,201,167,0.25); border-radius: 6px; padding: 3px 8px; font-size: 11px; color: var(--teal); }
+.chat-attach-chip button { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 12px; line-height: 1; padding: 0 0 0 3px; }
+.chat-attach-chip button:hover { color: var(--crimson); }
 .ctx-bar-fill.warn { background: var(--amber); }
 .ctx-bar-fill.full { background: var(--crimson); }
 .msg-ctx { font-size: 10px; color: var(--muted); margin-top: 4px; display: flex; align-items: center; gap: 6px; }
@@ -5291,7 +5463,10 @@ body.mode-code .inspector-panel { opacity: 0; pointer-events: none; transform: t
         <div class="msg-row system"><div class="msg-bubble">Open a project, then ask me anything about it — review code, explain files, find bugs, add features.</div></div>
       </div>
       <div class="chat-input-bar" style="flex-shrink:0">
+        <div id="projChatAttachChips" class="chat-attach-chips"></div>
         <div class="chat-input-row">
+          <input type="file" id="projChatFileInput" multiple style="display:none" onchange="handleProjChatFileSelect(this)">
+          <button class="attach-btn" onclick="document.getElementById('projChatFileInput').click()" title="Attach files">&#x1F4CE;</button>
           <textarea class="chat-input" id="chatInput" rows="1" placeholder="Ask about your project..." onkeydown="chatKeydown(event)"></textarea>
           <button class="send-btn" id="sendBtn" onclick="sendChat()">&#x27A4;</button>
         </div>
@@ -6937,8 +7112,9 @@ async function _sendProjectResume(replyText, approvalContext, existingBubble, ap
     return created;
   })();
   bubble.innerHTML = '<span class="spinner"></span>';
-  const runId = (context && context.runId) ? context.runId : ('project-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8));
-  const workflowId = (context && context.workflowId) ? context.workflowId : runId;
+  // Every continuation turn should create a new run record.
+  const runId = 'project-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+  const workflowId = (context && context.workflowId) ? context.workflowId : ((context && context.runId) ? context.runId : runId);
   const payload = {
     text: replyText,
     channel: 'project_ui',
@@ -6953,6 +7129,7 @@ async function _sendProjectResume(replyText, approvalContext, existingBubble, ap
     project_id: _activeProjectId || '',
     project_root: _activeProjectPath || '',
     project_name: _activeProjectName || '',
+    force: true,
   };
   if (_projSelectedModel) payload.model = _projSelectedModel;
   if (_projSelectedProvider) payload.provider = _projSelectedProvider;
@@ -7103,18 +7280,21 @@ async function _sendProjectRuntime(text, bubble) {
 async function sendChat() {
   const inp = document.getElementById('chatInput');
   const btn = document.getElementById('sendBtn');
-  const text = inp.value.trim();
+  const rawText = inp.value.trim();
+  const text = _buildTextWithAttachments(rawText, _projChatAttachments);
   if (!text) return;
   if (!_activeProjectPath) { appendSysMsg('Please open a project first.'); return; }
   const pendingApprovalContext = _projectAwaitingContext;
   const resumingApproval = !!pendingApprovalContext;
-  const route = _projectChatRoute(text);
+  const route = _projectChatRoute(rawText || text);
   if (route === 'execute' && _projectChatLooksDestructive(text) && !_projectChatAllowDestructive) {
     appendSysMsg('This request looks destructive. Enable Destructive in the project chat controls before asking Kendr to delete, remove, reset, or wipe project files.');
     return;
   }
   inp.value = '';
   inp.style.height = 'auto';
+  _projChatAttachments = [];
+  _renderAttachChips(_projChatAttachments, 'projChatAttachChips', 'removeProjChatAttachment');
   btn.disabled = true;
   _closeProjectApprovalModal();
   appendMsg('user', text, isLikelyMarkdown(text) ? 'markdown' : 'text');
@@ -10844,7 +11024,8 @@ strong { color: var(--text); }
                     "research_enable_plagiarism_check", "research_web_search_enabled", "research_date_range",
                     "research_sources", "research_max_sources", "research_checkpoint_enabled",
                     "deep_research_source_urls", "local_drive_paths", "local_drive_recursive",
-                    "local_drive_force_long_document"):
+                    "local_drive_force_long_document",
+                    "security_authorized", "security_target_url", "security_authorization_note"):
             if body.get(key) is not None:
                 payload[key] = body[key]
         channel_name = str(payload.get("channel") or "").strip().lower()
@@ -10936,17 +11117,26 @@ strong { color: var(--text); }
         if not text:
             self._json(400, {"error": "missing_text"})
             return
-        run_id = str(body.get("run_id") or "").strip() or f"ui-{uuid.uuid4().hex[:8]}"
+        requested_run_id = str(body.get("run_id") or "").strip()
+        run_id = requested_run_id or f"ui-{uuid.uuid4().hex[:8]}"
         workflow_id = str(body.get("workflow_id") or "").strip() or run_id
         attempt_id = str(body.get("attempt_id") or "").strip() or run_id
         resume_dir = str(body.get("resume_dir") or body.get("working_directory") or os.getenv("KENDR_WORKING_DIR", "")).strip()
         resume_output_dir = str(body.get("output_folder") or body.get("resume_output_dir") or "").strip()
-        if run_id:
+        run_row = None
+        if requested_run_id:
             try:
-                run_row = _db_get_run(run_id)
+                run_row = _db_get_run(requested_run_id)
             except Exception:
                 run_row = None
             if isinstance(run_row, dict):
+                # Preserve history: if client resumes using an existing run_id,
+                # fork the continuation into a new run row.
+                run_id = f"ui-{uuid.uuid4().hex[:8]}"
+                if not str(body.get("workflow_id") or "").strip():
+                    workflow_id = str(run_row.get("workflow_id") or requested_run_id).strip() or run_id
+                if not str(body.get("attempt_id") or "").strip():
+                    attempt_id = run_id
                 resume_output_dir = (
                     resume_output_dir
                     or str(run_row.get("run_output_dir") or "").strip()
@@ -10954,7 +11144,7 @@ strong { color: var(--text); }
                 )
                 resume_dir = resume_dir or str(run_row.get("working_directory") or "").strip()
             if not resume_output_dir:
-                resume_output_dir = _get_run_output_dir_from_manifest(run_id)
+                resume_output_dir = _get_run_output_dir_from_manifest(requested_run_id)
         if not resume_dir and not resume_output_dir:
             self._json(400, {"error": "missing_resume_dir", "detail": "Provide resume_dir, output_folder, or working_directory."})
             return
@@ -10998,6 +11188,9 @@ strong { color: var(--text); }
                     "attempt_id": attempt_id,
                     "kill_switch_file": kill_switch_file,
                 }
+                for key in ("force", "branch"):
+                    if key in body:
+                        resume_payload[key] = bool(body.get(key))
                 for key in ("provider", "model", "project_id", "project_root", "project_name", "workflow_type"):
                     value = body.get(key)
                     if value is not None and str(value).strip():

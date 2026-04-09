@@ -498,6 +498,266 @@ def _resolve_existing_output_path(path_value: str) -> str:
     return resolved
 
 
+def _read_json_file(path_value: str, fallback: Any) -> Any:
+    path = str(path_value or "").strip()
+    if not path:
+        return fallback
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return fallback
+
+
+def _normalize_objective_key(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip()).lower()
+
+
+def _discover_deep_research_run_dirs() -> list[str]:
+    base_dir = Path(resolve_output_path("deep_research_runs"))
+    if not base_dir.exists() or not base_dir.is_dir():
+        return []
+    discovered: list[tuple[int, str]] = []
+    for entry in base_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        match = re.fullmatch(r"deep_research_run_(\d+)", entry.name)
+        if not match:
+            continue
+        discovered.append((int(match.group(1)), f"deep_research_runs/{entry.name}"))
+    discovered.sort(key=lambda item: item[0], reverse=True)
+    return [item[1] for item in discovered]
+
+
+def _artifact_dir_has_resume_data(artifact_dir: str) -> bool:
+    rel = str(artifact_dir or "").strip().rstrip("/")
+    if not rel:
+        return False
+    base = Path(resolve_output_path(rel))
+    if not base.exists() or not base.is_dir():
+        return False
+    probe_files = (
+        "deep_research_progress.json",
+        "checkpoint_after_research.json",
+        "checkpoint_after_writing.json",
+        "evidence_bank.json",
+        "evidence_bank.md",
+        "deep_research_analysis.md",
+        "deep_research_subplan.md",
+    )
+    if any((base / name).exists() for name in probe_files):
+        return True
+    for section_dir in base.glob("section_*"):
+        if not section_dir.is_dir():
+            continue
+        if (section_dir / "research.json").exists() or (section_dir / "section.md").exists():
+            return True
+    return False
+
+
+def _artifact_dir_objective_key(artifact_dir: str) -> str:
+    for rel_path in ("evidence_bank.json", "deep_research_manifest.json"):
+        payload = _read_json_file(resolve_output_path(_artifact_file(artifact_dir, rel_path)), {})
+        if isinstance(payload, dict):
+            value = _normalize_objective_key(payload.get("objective", ""))
+            if value:
+                return value
+    return ""
+
+
+def _resolve_resume_artifact_dir(
+    state: dict,
+    *,
+    call_number: int,
+    default_artifact_dir: str,
+    objective: str,
+) -> str:
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    def _add(path_value: str) -> None:
+        value = _normalize_output_relative_path(str(path_value or "").strip()).rstrip("/")
+        if not value or value in seen:
+            return
+        seen.add(value)
+        candidates.append(value)
+
+    _add(state.get("long_document_artifact_dir", ""))
+    if call_number > 1:
+        _add(f"deep_research_runs/deep_research_run_{call_number - 1}")
+    _add(default_artifact_dir)
+    for discovered in _discover_deep_research_run_dirs():
+        _add(discovered)
+
+    objective_key = _normalize_objective_key(objective)
+    for candidate in candidates:
+        if not _artifact_dir_has_resume_data(candidate):
+            continue
+        candidate_objective_key = _artifact_dir_objective_key(candidate)
+        if candidate_objective_key and objective_key and candidate_objective_key != objective_key:
+            continue
+        return candidate
+    return default_artifact_dir
+
+
+def _load_cached_evidence_bank(
+    *,
+    artifact_dir: str,
+    objective: str,
+    max_sources: int,
+) -> dict[str, Any]:
+    evidence_json_abs = resolve_output_path(_artifact_file(artifact_dir, "evidence_bank.json"))
+    evidence_md_abs = resolve_output_path(_artifact_file(artifact_dir, "evidence_bank.md"))
+    if not Path(evidence_json_abs).exists() and not Path(evidence_md_abs).exists():
+        return {}
+    payload = _read_json_file(evidence_json_abs, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    cached_objective = _normalize_objective_key(payload.get("objective", ""))
+    if cached_objective and cached_objective != _normalize_objective_key(objective):
+        return {}
+    evidence_md = _read_text_file(evidence_md_abs, "")
+    source_ledger = payload.get("source_ledger", [])
+    if not isinstance(source_ledger, list):
+        source_ledger = []
+    evidence_sources = [item for item in source_ledger if isinstance(item, dict)]
+    if max_sources > 0:
+        evidence_sources = evidence_sources[:max_sources]
+    if not evidence_md and not evidence_sources:
+        return {}
+    return {
+        "artifact_dir": artifact_dir,
+        "evidence_markdown": evidence_md,
+        "evidence_sources": evidence_sources,
+        "evidence_path": f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'evidence_bank.md')}",
+        "evidence_json_path": f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'evidence_bank.json')}",
+    }
+
+
+def _load_cached_section_research_package(
+    *,
+    artifact_dir: str,
+    objective: str,
+    section: dict[str, Any],
+    section_index: int,
+    section_pages: int,
+    collect_sources_first: bool,
+    evidence_excerpt: str,
+    evidence_sources: list[dict],
+    explicit_source_entries: list[dict],
+    max_sources: int,
+) -> dict[str, Any]:
+    section_title = str(section.get("title", f"Section {section_index}")).strip() or f"Section {section_index}"
+    section_objective = str(section.get("objective", objective)).strip() or objective
+    section_questions = section.get("key_questions", [])
+    if not isinstance(section_questions, list):
+        section_questions = []
+    target_section_pages = _safe_int(section.get("target_pages"), section_pages, 1, 30)
+
+    research_abs = resolve_output_path(_artifact_file(artifact_dir, f"section_{section_index:02d}/research.json"))
+    sources_abs = resolve_output_path(_artifact_file(artifact_dir, f"section_{section_index:02d}/sources.json"))
+    if not Path(research_abs).exists() and not Path(sources_abs).exists():
+        return {}
+
+    research_pass = _read_json_file(research_abs, {})
+    if not isinstance(research_pass, dict):
+        research_pass = {}
+    status = str(research_pass.get("status", "")).strip() or "completed"
+    if status not in {"completed", "local_only", "evidence_bank"}:
+        return {}
+
+    section_sources_raw = _read_json_file(sources_abs, [])
+    section_sources = [item for item in section_sources_raw if isinstance(item, dict)] if isinstance(section_sources_raw, list) else []
+    if not section_sources and collect_sources_first and evidence_sources:
+        section_sources = list(evidence_sources)
+    if not section_sources:
+        section_sources = _merge_sources(explicit_source_entries, _extract_source_entries(research_pass))
+    if max_sources > 0:
+        section_sources = section_sources[:max_sources]
+
+    research_output = str(research_pass.get("output_text", "")).strip()
+    if not research_output and collect_sources_first and evidence_excerpt:
+        research_output = evidence_excerpt
+    if not research_output:
+        research_output = "Reused cached research package did not include output text."
+
+    return {
+        "index": section_index,
+        "title": section_title,
+        "objective": section_objective,
+        "key_questions": section_questions,
+        "target_pages": target_section_pages,
+        "research_pass": research_pass,
+        "research_text": research_output,
+        "sources": section_sources,
+        "source_ledger_md": _source_ledger_markdown(section_sources),
+        "search_query": "",
+        "section_search_results": {},
+        "from_cache": True,
+        "cache_artifact_dir": artifact_dir,
+    }
+
+
+def _fallback_continuity_note(section_text: str) -> str:
+    lines: list[str] = []
+    for raw in str(section_text or "").splitlines():
+        cleaned = re.sub(r"^#{1,6}\s*", "", raw).strip()
+        if not cleaned or cleaned.startswith("!["):
+            continue
+        lines.append(cleaned)
+        if len(lines) >= 6:
+            break
+    if not lines:
+        return "- Continuity note unavailable in cached draft."
+    return "\n".join(f"- {item}" for item in lines)
+
+
+def _load_cached_section_draft(
+    *,
+    artifact_dir: str,
+    section_index: int,
+    section_title: str,
+) -> dict[str, Any]:
+    section_md_abs = resolve_output_path(_artifact_file(artifact_dir, f"section_{section_index:02d}/section.md"))
+    if not Path(section_md_abs).exists():
+        return {}
+    section_text = _read_text_file(section_md_abs, "").strip()
+    if not section_text:
+        return {}
+
+    visual_assets_abs = resolve_output_path(_artifact_file(artifact_dir, f"section_{section_index:02d}/visual_assets.json"))
+    continuity_abs = resolve_output_path(_artifact_file(artifact_dir, f"section_{section_index:02d}/continuity.txt"))
+    metadata_abs = resolve_output_path(_artifact_file(artifact_dir, f"section_{section_index:02d}/section_metadata.json"))
+
+    visual_assets = _read_json_file(visual_assets_abs, {})
+    if not isinstance(visual_assets, dict):
+        visual_assets = {"tables": [], "flowcharts": [], "notes": ""}
+    continuity_note = _read_text_file(continuity_abs, "").strip() or _fallback_continuity_note(section_text)
+
+    metadata = _read_json_file(metadata_abs, {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    cached_title = str(metadata.get("section_title", "")).strip()
+    if cached_title and cached_title != section_title:
+        return {}
+
+    flowchart_files = metadata.get("flowchart_files", [])
+    if not isinstance(flowchart_files, list):
+        flowchart_files = []
+    section_images = metadata.get("section_images", [])
+    if not isinstance(section_images, list):
+        section_images = []
+
+    return {
+        "section_text": section_text,
+        "continuity_note": continuity_note,
+        "visual_assets": visual_assets,
+        "flowchart_files": flowchart_files,
+        "section_images": section_images,
+        "from_cache": True,
+        "cache_artifact_dir": artifact_dir,
+    }
+
+
 def _source_label(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme == "file":
@@ -2771,6 +3031,7 @@ def _record_section_research_package(
 ) -> dict[str, Any]:
     index = int(package.get("index", 0) or 0)
     section_title = str(package.get("title", f"Section {index}")).strip() or f"Section {index}"
+    from_cache = bool(package.get("from_cache", False))
     research_pass = package.get("research_pass", {}) if isinstance(package.get("research_pass"), dict) else {}
     section_sources = package.get("sources", []) if isinstance(package.get("sources"), list) else []
     search_query = str(package.get("search_query", "")).strip()
@@ -2807,7 +3068,11 @@ def _record_section_research_package(
         state,
         title=f"Researching section {index}/{total_sections}",
         detail=(
-            f"{section_title} completed with {len(section_sources)} sources."
+            (
+                f"{section_title} reused from resume artifacts with {len(section_sources)} sources."
+                if from_cache
+                else f"{section_title} completed with {len(section_sources)} sources."
+            )
             if section_research_status in {"completed", "local_only", "evidence_bank"}
             else f"{section_title} finished with status '{section_research_status}'. Using partial research output."
         ),
@@ -2824,6 +3089,7 @@ def _record_section_research_package(
             "elapsed_seconds": int(research_pass.get("elapsed_seconds", 0) or 0),
             "search_query": search_query,
             "urls": _trace_url_list([str(item.get("url", "")).strip() for item in section_sources]),
+            "resumed_from_cache": from_cache,
         },
         subtask=f"Gather evidence for {section_title}",
     )
@@ -2840,7 +3106,13 @@ def _record_section_research_package(
         _artifact_file(artifact_dir, f"section_{index:02d}/sources.md"),
         _references_markdown(section_sources),
     )
-    research_log_lines.append(f"Researched section {index}: {section_title} ({len(section_sources)} sources)")
+    research_log_lines.append(
+        (
+            f"Reused section {index} research: {section_title} ({len(section_sources)} sources)"
+            if from_cache
+            else f"Researched section {index}: {section_title} ({len(section_sources)} sources)"
+        )
+    )
 
     package = dict(package)
     package.pop("section_search_results", None)
@@ -3375,32 +3647,18 @@ def _export_long_document_formats(
         log_task_update(DEEP_RESEARCH_LABEL, "DOCX export skipped (not in requested formats).")
         docx_path = Path("")
 
-    pdf_written = False
     if "pdf" in formats:
-        log_task_update(DEEP_RESEARCH_LABEL, f"Rendering PDF → {pdf_path} (trying weasyprint first)...")
+        log_task_update(DEEP_RESEARCH_LABEL, f"Rendering PDF → {pdf_path}...")
         try:
-            if _ensure_python_package("weasyprint"):
-                from weasyprint import HTML  # type: ignore
-
-                HTML(string=html_text).write_pdf(str(pdf_path))
-                pdf_written = True
-                log_task_update(DEEP_RESEARCH_LABEL, f"PDF written via weasyprint → {pdf_path}")
-            else:
-                raise RuntimeError("weasyprint not available")
+            from tasks.md_to_pdf import md_to_pdf
+            compiled_path.write_text(compiled_markdown, encoding="utf-8")
+            md_to_pdf(str(compiled_path), str(pdf_path))
+            log_task_update(DEEP_RESEARCH_LABEL, f"PDF written → {pdf_path}")
         except Exception as exc:
-            log_task_update(DEEP_RESEARCH_LABEL, f"HTML-to-PDF export unavailable, falling back to text PDF: {exc}")
-
-        if not pdf_written:
-            log_task_update(DEEP_RESEARCH_LABEL, "Falling back to plain-text PDF renderer...")
-            try:
-                plain_text = _markdown_to_plain_text(compiled_markdown)
-                pdf_path.write_bytes(_render_pdf_bytes(plain_text))
-                log_task_update(DEEP_RESEARCH_LABEL, f"PDF written via text renderer → {pdf_path}")
-            except Exception as exc:
-                err_msg = f"PDF export failed: {exc}"
-                log_task_update(DEEP_RESEARCH_LABEL, err_msg)
-                export_errors["pdf"] = err_msg
-                pdf_path = Path("")
+            err_msg = f"PDF export failed: {exc}"
+            log_task_update(DEEP_RESEARCH_LABEL, err_msg)
+            export_errors["pdf"] = err_msg
+            pdf_path = Path("")
     else:
         log_task_update(DEEP_RESEARCH_LABEL, "PDF export skipped (not in requested formats).")
         pdf_path = Path("")
@@ -3596,6 +3854,25 @@ def long_document_agent(state):
 
     collect_sources_first = bool(state.get("long_document_collect_sources_first", False))
     artifact_dir = f"deep_research_runs/deep_research_run_{call_number}"
+    resume_reuse_enabled = bool(
+        state.get("resume_source_run_id")
+        or state.get("resume_requested", False)
+        or state.get("resume_output_dir")
+        or state.get("resume_checkpoint_payload")
+    )
+    if resume_reuse_enabled:
+        resumed_artifact_dir = _resolve_resume_artifact_dir(
+            state,
+            call_number=call_number,
+            default_artifact_dir=artifact_dir,
+            objective=objective,
+        )
+        if resumed_artifact_dir != artifact_dir:
+            log_task_update(
+                DEEP_RESEARCH_LABEL,
+                f"Resume detected: reusing artifact directory {resumed_artifact_dir} instead of {artifact_dir}.",
+            )
+            artifact_dir = resumed_artifact_dir
 
     if bool(state.get("long_document_addendum_requested", False)):
         return _run_long_document_addendum(
@@ -3846,6 +4123,38 @@ def long_document_agent(state):
         max_sources=max_sources or 120,
     )
     if collect_sources_first:
+        cached_evidence = _load_cached_evidence_bank(
+            artifact_dir=artifact_dir,
+            objective=objective,
+            max_sources=max_sources,
+        )
+        if cached_evidence:
+            evidence_bank_md = str(cached_evidence.get("evidence_markdown", "") or "")
+            evidence_sources = list(cached_evidence.get("evidence_sources", []) or [])
+            evidence_excerpt = _trim_text(evidence_bank_md, 18000) if evidence_bank_md else ""
+            state["long_document_sources_collected"] = True
+            state["long_document_evidence_bank_path"] = str(cached_evidence.get("evidence_path", "") or "")
+            state["long_document_evidence_bank_json_path"] = str(cached_evidence.get("evidence_json_path", "") or "")
+            state["long_document_evidence_bank_excerpt"] = evidence_excerpt
+            state["long_document_evidence_sources"] = evidence_sources
+            _trace_research_event(
+                state,
+                title="Collecting evidence bank",
+                detail=f"Reused existing evidence bank from {artifact_dir}.",
+                command=objective,
+                status="completed",
+                metadata={
+                    "phase": "evidence_bank",
+                    "sources": len(evidence_sources),
+                    "resumed_from_cache": True,
+                },
+                subtask="Build cross-report evidence bank",
+            )
+            log_task_update(
+                DEEP_RESEARCH_LABEL,
+                f"Reused cached evidence bank with {len(evidence_sources)} source(s).",
+            )
+    if collect_sources_first:
         if not state.get("long_document_sources_collected", False):
             evidence_started_at = _trace_now()
             _trace_research_event(
@@ -3990,7 +4299,8 @@ def long_document_agent(state):
                 subtask="Build cross-report evidence bank",
             )
         else:
-            evidence_bank_md = _read_text_file(state.get("long_document_evidence_bank_path", ""), "")
+            evidence_path = _resolve_existing_output_path(state.get("long_document_evidence_bank_path", ""))
+            evidence_bank_md = _read_text_file(evidence_path, "")
             evidence_excerpt = state.get("long_document_evidence_bank_excerpt", "") or _trim_text(evidence_bank_md, 18000)
             evidence_sources = state.get("long_document_evidence_sources", []) or []
 
@@ -4057,8 +4367,41 @@ def long_document_agent(state):
             )
             completed_section_packages[int(recorded.get("index", 0) or 0)] = recorded
 
+        reused_research_sections = 0
+        if resume_reuse_enabled:
+            for index, section in enumerate(parallel_sections, start=1):
+                cached_package = _load_cached_section_research_package(
+                    artifact_dir=artifact_dir,
+                    objective=objective,
+                    section=section,
+                    section_index=index,
+                    section_pages=section_pages,
+                    collect_sources_first=collect_sources_first,
+                    evidence_excerpt=evidence_excerpt,
+                    evidence_sources=evidence_sources,
+                    explicit_source_entries=explicit_source_entries,
+                    max_sources=max_sources,
+                )
+                if not cached_package:
+                    continue
+                section_title = str(section.get("title", f"Section {index}")).strip() or f"Section {index}"
+                section_started_at_by_index[index] = _trace_now()
+                log_task_update(
+                    DEEP_RESEARCH_LABEL,
+                    f"Phase 1/4 - reusing cached research for section {index}/{total_parallel_sections}: {section_title}",
+                )
+                _finalize_section_package(cached_package)
+                reused_research_sections += 1
+        if reused_research_sections:
+            log_task_update(
+                DEEP_RESEARCH_LABEL,
+                f"Resume reuse: skipped fresh research for {reused_research_sections}/{total_parallel_sections} section(s).",
+            )
+
         if section_parallelism <= 1:
             for index, section in enumerate(parallel_sections, start=1):
+                if index in completed_section_packages:
+                    continue
                 section_title = str(section.get("title", f"Section {index}")).strip() or f"Section {index}"
                 section_objective = str(section.get("objective", objective)).strip() or objective
                 log_task_update(
@@ -4110,6 +4453,8 @@ def long_document_agent(state):
             with ThreadPoolExecutor(max_workers=section_parallelism, thread_name_prefix="kendr-section") as executor:
                 future_map = {}
                 for index, section in enumerate(parallel_sections, start=1):
+                    if index in completed_section_packages:
+                        continue
                     section_title = str(section.get("title", f"Section {index}")).strip() or f"Section {index}"
                     section_objective = str(section.get("objective", objective)).strip() or objective
                     log_task_update(
@@ -4417,6 +4762,112 @@ def long_document_agent(state):
         _raise_if_cancelled(state, phase=f"section_{write_index}_draft")
         section_title = str(package.get("title", f"Section {write_index}")).strip() or f"Section {write_index}"
         words_target = max(500, int(package.get("target_pages", section_pages) or section_pages) * words_per_page)
+        cached_draft = {}
+        if resume_reuse_enabled:
+            cached_draft = _load_cached_section_draft(
+                artifact_dir=artifact_dir,
+                section_index=write_index,
+                section_title=section_title,
+            )
+        if cached_draft:
+            log_task_update(
+                DEEP_RESEARCH_LABEL,
+                f"Phase 3/4 - reusing cached draft for section {write_index}/{len(ordered_packages)}: {section_title}",
+            )
+            section_text = str(cached_draft.get("section_text", "")).strip()
+            note = str(cached_draft.get("continuity_note", "")).strip() or _fallback_continuity_note(section_text)
+            visual_assets = cached_draft.get("visual_assets", {})
+            if not isinstance(visual_assets, dict):
+                visual_assets = {"tables": [], "flowcharts": [], "notes": ""}
+            flowchart_files = cached_draft.get("flowchart_files", [])
+            if not isinstance(flowchart_files, list):
+                flowchart_files = []
+            section_images = cached_draft.get("section_images", [])
+            if not isinstance(section_images, list):
+                section_images = []
+            all_section_images.extend([item for item in section_images if isinstance(item, dict)])
+
+            section_md_filename = _artifact_file(artifact_dir, f"section_{write_index:02d}/section.md")
+            visual_assets_json_filename = _artifact_file(artifact_dir, f"section_{write_index:02d}/visual_assets.json")
+            visual_assets_md_filename = _artifact_file(artifact_dir, f"section_{write_index:02d}/visual_assets.md")
+            write_text_file(section_md_filename, section_text)
+            write_text_file(visual_assets_json_filename, json.dumps(visual_assets, indent=2, ensure_ascii=False))
+            write_text_file(visual_assets_md_filename, _render_visual_assets_md(visual_assets) + "\n")
+
+            continuity_notes.append(f"{section_title}:\n{note}")
+            write_text_file(_artifact_file(artifact_dir, f"section_{write_index:02d}/continuity.txt"), note)
+            bridge_md = (
+                f"# Section {write_index} Coherence Bridge\n\n"
+                f"## Section\n{section_title}\n\n"
+                "## Carry-Forward Notes\n"
+                f"{note.strip()}\n"
+            )
+            write_text_file(_artifact_file(artifact_dir, f"section_{write_index:02d}/bridge.md"), bridge_md)
+            coherence_context_md = coherence_context_md + "\n\n" + f"[Section {write_index} Bridge]\n" + _trim_text(bridge_md, 2000)
+            write_text_file(_artifact_file(artifact_dir, "deep_research_coherence_live.md"), coherence_context_md)
+
+            section_outputs.append(
+                {
+                    "index": write_index,
+                    "title": section_title,
+                    "objective": package.get("objective", objective),
+                    "research_status": str((package.get("research_pass") or {}).get("status", "")),
+                    "research_response_id": str((package.get("research_pass") or {}).get("response_id", "")),
+                    "research_elapsed_seconds": int((package.get("research_pass") or {}).get("elapsed_seconds", 0) or 0),
+                    "research_text_preview": str(package.get("research_text", ""))[:2000],
+                    "section_text": section_text,
+                    "continuity_note": note,
+                    "references": package.get("sources", []),
+                    "visual_assets": visual_assets,
+                    "visual_assets_file": f"{OUTPUT_DIR}/{visual_assets_json_filename}",
+                    "visual_assets_markdown_file": f"{OUTPUT_DIR}/{visual_assets_md_filename}",
+                    "flowchart_files": flowchart_files,
+                    "section_images": section_images,
+                }
+            )
+            research_log_lines.append(f"Reused drafted section {write_index}: {section_title}")
+            state["draft_response"] = (
+                f"Deep research in progress: reused drafted section {write_index}/{len(ordered_packages)} "
+                f"({section_title}). Sources this section: {len(package.get('sources', []))}."
+            )
+            progress_payload = {
+                "title": title,
+                "objective": objective,
+                "target_pages": target_pages,
+                "completed_sections": write_index,
+                "total_sections": len(ordered_packages),
+                "tier": analysis.get("tier", 0),
+                "phase": "writing",
+                "sections": [
+                    {
+                        "index": item["index"],
+                        "title": item["title"],
+                        "research_status": item["research_status"],
+                        "references_count": len(item.get("references", [])),
+                        "table_count": len((item.get("visual_assets") or {}).get("tables", [])),
+                        "flowchart_count": len((item.get("visual_assets") or {}).get("flowcharts", [])),
+                    }
+                    for item in section_outputs
+                ],
+            }
+            write_text_file(_artifact_file(artifact_dir, "deep_research_progress.json"), json.dumps(progress_payload, indent=2, ensure_ascii=False))
+            _trace_research_event(
+                state,
+                title=f"Drafting section {write_index}/{len(ordered_packages)}",
+                detail=f"{section_title} reused from resume artifacts.",
+                status="completed",
+                metadata={
+                    "phase": "section_drafting",
+                    "section_index": write_index,
+                    "section_title": section_title,
+                    "resumed_from_cache": True,
+                    "source_count": len(package.get("sources", [])),
+                    "table_count": len((visual_assets or {}).get("tables", [])),
+                    "flowchart_count": len((visual_assets or {}).get("flowcharts", [])),
+                },
+                subtask=f"Draft {section_title}",
+            )
+            continue
         log_task_update(
             DEEP_RESEARCH_LABEL,
             f"Phase 3/4 - drafting section {write_index}/{len(ordered_packages)}: {section_title}",
@@ -4531,9 +4982,24 @@ def long_document_agent(state):
         section_md_filename = _artifact_file(artifact_dir, f"section_{write_index:02d}/section.md")
         visual_assets_json_filename = _artifact_file(artifact_dir, f"section_{write_index:02d}/visual_assets.json")
         visual_assets_md_filename = _artifact_file(artifact_dir, f"section_{write_index:02d}/visual_assets.md")
+        section_metadata_filename = _artifact_file(artifact_dir, f"section_{write_index:02d}/section_metadata.json")
         write_text_file(section_md_filename, section_text)
         write_text_file(visual_assets_json_filename, json.dumps(visual_assets, indent=2, ensure_ascii=False))
         write_text_file(visual_assets_md_filename, _render_visual_assets_md(visual_assets) + "\n")
+        write_text_file(
+            section_metadata_filename,
+            json.dumps(
+                {
+                    "section_index": write_index,
+                    "section_title": section_title,
+                    "section_objective": package.get("objective", objective),
+                    "flowchart_files": flowchart_files,
+                    "section_images": section_images,
+                },
+                indent=2,
+                ensure_ascii=False,
+            ),
+        )
 
         note = _section_continuity_note(section_title, section_text)
         continuity_notes.append(f"{section_title}:\n{note}")
@@ -4837,6 +5303,7 @@ Section continuity notes:
             subtask="Compile and export final report",
         )
         export_errors = {"all": str(exc)}
+    total_images = len(all_section_images)
     manifest_filename = _artifact_file(artifact_dir, "deep_research_manifest.json")
     write_text_file(
         manifest_filename,
@@ -4890,7 +5357,6 @@ Section continuity notes:
     total_flowcharts = sum(len((item.get("visual_assets") or {}).get("flowcharts", [])) for item in section_outputs)
     total_words = sum(len(str(item.get("section_text", "")).split()) for item in section_outputs) + len(str(executive_summary).split())
     total_sources = len(consolidated_references)
-    total_images = len(all_section_images)
     if total_images:
         log_task_update(
             DEEP_RESEARCH_LABEL,

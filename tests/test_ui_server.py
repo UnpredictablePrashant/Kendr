@@ -429,6 +429,122 @@ class TestRunCancellationHelpers(unittest.TestCase):
         self.assertEqual(captured["output_folder"], "D:\\superagentTasks\\runs\\run-resume-1")
         self.assertEqual(captured["working_directory"], "D:\\superagentTasks")
 
+    def test_handle_chat_resume_forks_run_id_when_existing_run_is_reused(self):
+        import kendr.ui_server as ui_server
+
+        handler = object.__new__(ui_server.KendrUIHandler)
+        responses: list[tuple[int, dict]] = []
+
+        def _json(code, payload):
+            responses.append((code, payload))
+
+        handler._json = _json
+        done = threading.Event()
+        captured: dict[str, str] = {}
+
+        def _resume(payload):
+            captured["run_id"] = str(payload.get("run_id") or "")
+            captured["workflow_id"] = str(payload.get("workflow_id") or "")
+            captured["attempt_id"] = str(payload.get("attempt_id") or "")
+            done.set()
+            return {
+                "run_id": captured["run_id"],
+                "workflow_id": captured["workflow_id"],
+                "attempt_id": captured["attempt_id"],
+                "status": "running",
+            }
+
+        body = {
+            "text": "approve",
+            "run_id": "run-resume-1",
+            "working_directory": "D:\\superagentTasks",
+            "channel": "webchat",
+            "sender_id": "ui_user",
+            "chat_id": "chat-test",
+        }
+
+        with (
+            patch("kendr.ui_server._gateway_ready", return_value=True),
+            patch(
+                "kendr.ui_server._db_get_run",
+                return_value={
+                    "run_id": "run-resume-1",
+                    "workflow_id": "workflow-resume-1",
+                    "run_output_dir": "D:\\superagentTasks\\runs\\run-resume-1",
+                    "working_directory": "D:\\superagentTasks",
+                },
+            ),
+            patch("kendr.ui_server._gateway_resume", side_effect=_resume),
+            patch("kendr.ui_server.uuid.uuid4") as mock_uuid,
+        ):
+            mock_uuid.return_value.hex = "abc123def456"
+            handler._handle_chat_resume(body)
+            self.assertTrue(done.wait(1.0))
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertEqual(captured["run_id"], "ui-abc123de")
+        self.assertEqual(captured["workflow_id"], "workflow-resume-1")
+        self.assertEqual(captured["attempt_id"], "ui-abc123de")
+
+    def test_handle_chat_resume_forwards_force_to_gateway_resume(self):
+        import kendr.ui_server as ui_server
+
+        handler = object.__new__(ui_server.KendrUIHandler)
+        responses: list[tuple[int, dict]] = []
+
+        def _json(code, payload):
+            responses.append((code, payload))
+
+        handler._json = _json
+        done = threading.Event()
+        captured: dict[str, object] = {}
+
+        def _resume(payload):
+            captured["force"] = payload.get("force")
+            captured["branch"] = payload.get("branch")
+            done.set()
+            return {
+                "run_id": str(payload.get("run_id") or ""),
+                "workflow_id": str(payload.get("workflow_id") or ""),
+                "attempt_id": str(payload.get("attempt_id") or ""),
+                "status": "running",
+            }
+
+        body = {
+            "text": "approve",
+            "run_id": "run-resume-1",
+            "workflow_id": "workflow-resume-1",
+            "attempt_id": "run-resume-1",
+            "working_directory": "D:\\superagentTasks",
+            "channel": "webchat",
+            "sender_id": "ui_user",
+            "chat_id": "chat-test",
+            "force": True,
+            "branch": False,
+        }
+
+        with (
+            patch("kendr.ui_server._gateway_ready", return_value=True),
+            patch(
+                "kendr.ui_server._db_get_run",
+                return_value={
+                    "run_id": "run-resume-1",
+                    "workflow_id": "workflow-resume-1",
+                    "run_output_dir": "D:\\superagentTasks\\runs\\run-resume-1",
+                    "working_directory": "D:\\superagentTasks",
+                },
+            ),
+            patch("kendr.ui_server._gateway_resume", side_effect=_resume),
+            patch("kendr.ui_server.uuid.uuid4") as mock_uuid,
+        ):
+            mock_uuid.return_value.hex = "abc123def456"
+            handler._handle_chat_resume(body)
+            self.assertTrue(done.wait(1.0))
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertIs(captured["force"], True)
+        self.assertIs(captured["branch"], False)
+
 
 class TestSseReplayBehavior(unittest.TestCase):
     def test_chat_html_done_handler_uses_done_awaiting_payload(self):

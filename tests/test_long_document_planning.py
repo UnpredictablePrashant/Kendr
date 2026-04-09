@@ -1,6 +1,9 @@
 import os
+import json
 import time
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
@@ -13,6 +16,7 @@ from tasks.long_document_tasks import (
     _default_subtopics,
     long_document_agent,
 )
+from tasks.utils import set_active_output_dir
 
 
 class LongDocumentPlanningTests(unittest.TestCase):
@@ -388,6 +392,130 @@ class LongDocumentPlanningTests(unittest.TestCase):
         self.assertIn("https://example.com/market-report", evidence_search.get("metadata", {}).get("urls", []))
         self.assertEqual(section_search.get("command"), "Market Structure Explain market structure and major players.")
         self.assertIn("https://example.com/market-report", section_search.get("metadata", {}).get("urls", []))
+
+    def test_long_document_agent_resume_reuses_completed_evidence_and_sections(self):
+        objective = "Create a resumed deep research report."
+        state = {
+            "current_objective": objective,
+            "user_query": objective,
+            "memory_soul_file": __file__,
+            "deep_research_mode": True,
+            "deep_research_confirmed": True,
+            "long_document_mode": True,
+            "long_document_pages": 10,
+            "long_document_plan_status": "approved",
+            "long_document_collect_sources_first": True,
+            "research_web_search_enabled": True,
+            "resume_source_run_id": "ui-old-run",
+            "long_document_calls": 1,
+            "deep_research_analysis": {
+                "tier": 3,
+                "requires_deep_research": True,
+                "estimated_pages": 10,
+                "estimated_sources": 8,
+                "estimated_duration_minutes": 20,
+                "subtopics": ["Market Structure"],
+                "request_signature": {
+                    "objective": objective,
+                    "target_pages": 10,
+                    "requested_sources": [],
+                    "date_range": "all_time",
+                    "max_sources": 0,
+                },
+            },
+            "long_document_outline": {
+                "title": "Resume Report",
+                "sections": [
+                    {
+                        "id": 1,
+                        "title": "Market Structure",
+                        "objective": "Explain market structure and major players.",
+                        "key_questions": ["Who leads the market?"],
+                        "target_pages": 3,
+                    }
+                ],
+            },
+        }
+
+        correlation = {
+            "briefing": "Correlation briefing",
+            "knowledge_graph": {"nodes": [], "edges": []},
+            "cross_cutting_themes": [],
+            "contradictions": [],
+            "section_order": ["Market Structure"],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_output:
+            set_active_output_dir(tmp_output)
+            try:
+                artifact_root = Path(tmp_output) / "deep_research_runs" / "deep_research_run_1"
+                section_dir = artifact_root / "section_01"
+                section_dir.mkdir(parents=True, exist_ok=True)
+                (artifact_root / "evidence_bank.md").write_text("# Evidence Bank\n\nCached evidence.", encoding="utf-8")
+                (artifact_root / "evidence_bank.json").write_text(
+                    json.dumps(
+                        {
+                            "objective": objective,
+                            "source_ledger": [{"id": "S1", "url": "https://example.com/source", "label": "Example Source"}],
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                (section_dir / "research.json").write_text(
+                    json.dumps(
+                        {
+                            "response_id": "resp-cached-1",
+                            "status": "completed",
+                            "elapsed_seconds": 2,
+                            "output_text": "Cached section research output.",
+                            "raw": {},
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                (section_dir / "sources.json").write_text(
+                    json.dumps([{"id": "S1", "url": "https://example.com/source", "label": "Example Source"}], indent=2),
+                    encoding="utf-8",
+                )
+                (section_dir / "section.md").write_text("## Market Structure\n\nCached section draft. [S1]\n", encoding="utf-8")
+                (section_dir / "continuity.txt").write_text("- Cached continuity note.", encoding="utf-8")
+                (section_dir / "visual_assets.json").write_text(json.dumps({"tables": [], "flowcharts": [], "notes": ""}, indent=2), encoding="utf-8")
+                (section_dir / "section_metadata.json").write_text(
+                    json.dumps({"section_index": 1, "section_title": "Market Structure", "flowchart_files": [], "section_images": []}, indent=2),
+                    encoding="utf-8",
+                )
+
+                def _fake_llm_text(prompt: str) -> str:
+                    if "Create a concise executive summary" in str(prompt):
+                        return "Resume-aware executive summary."
+                    raise AssertionError("Section drafting LLM call should be skipped on resume.")
+
+                with (
+                    patch("tasks.long_document_tasks.OpenAI", return_value=Mock()),
+                    patch("tasks.long_document_tasks.llm_text", side_effect=_fake_llm_text),
+                    patch("tasks.long_document_tasks._collect_section_research_package") as mock_collect_section_research,
+                    patch("tasks.long_document_tasks._run_research_pass") as mock_research_pass,
+                    patch("tasks.long_document_tasks._collect_google_search_evidence") as mock_google_search,
+                    patch("tasks.long_document_tasks._build_correlation_package", return_value=correlation),
+                    patch("tasks.long_document_tasks._build_plagiarism_report", return_value={"overall_score": 0.0, "ai_content_score": 0.0, "status": "PASS", "sections": []}),
+                    patch("tasks.long_document_tasks._generate_visual_assets", return_value={"tables": [], "flowcharts": [], "notes": ""}) as mock_visuals,
+                    patch("tasks.long_document_tasks._export_long_document_formats", return_value={}),
+                    patch("tasks.long_document_tasks.update_planning_file"),
+                    patch("tasks.long_document_tasks.log_task_update"),
+                    patch("tasks.long_document_tasks.publish_agent_output", side_effect=lambda current_state, *args, **kwargs: current_state),
+                ):
+                    result = long_document_agent(state)
+            finally:
+                set_active_output_dir("output")
+
+        mock_collect_section_research.assert_not_called()
+        mock_research_pass.assert_not_called()
+        mock_google_search.assert_not_called()
+        mock_visuals.assert_not_called()
+        self.assertTrue(str(result.get("long_document_artifact_dir", "")).endswith("deep_research_runs/deep_research_run_1"))
+        self.assertEqual(result.get("long_document_sections_data", [{}])[0].get("title"), "Market Structure")
 
     def test_long_document_agent_parallel_section_research_preserves_section_order(self):
         state = {
