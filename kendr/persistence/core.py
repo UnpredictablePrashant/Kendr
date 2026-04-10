@@ -70,6 +70,13 @@ _CORE_TABLES = (
     "superrag_ingestions",
     "superrag_chat_messages",
     "mcp_servers",
+    "capabilities",
+    "capability_relations",
+    "auth_profiles",
+    "policy_profiles",
+    "capability_health_runs",
+    "capability_audit_events",
+    "user_skills",
 )
 
 
@@ -630,6 +637,118 @@ def initialize_db(db_path: str = DB_PATH):
                 FOREIGN KEY(session_id) REFERENCES superrag_sessions(session_id),
                 FOREIGN KEY(run_id) REFERENCES runs(run_id)
             );
+
+            CREATE TABLE IF NOT EXISTS capabilities (
+                capability_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                capability_key TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                visibility TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                schema_in_json TEXT NOT NULL DEFAULT '{}',
+                schema_out_json TEXT NOT NULL DEFAULT '{}',
+                auth_profile_id TEXT,
+                policy_profile_id TEXT,
+                health_status TEXT NOT NULL DEFAULT 'unknown',
+                health_last_checked_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_capabilities_workspace_key_version
+                ON capabilities (workspace_id, capability_key, version);
+            CREATE INDEX IF NOT EXISTS idx_capabilities_workspace_type_status
+                ON capabilities (workspace_id, type, status);
+
+            CREATE TABLE IF NOT EXISTS capability_relations (
+                relation_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                parent_capability_id TEXT NOT NULL,
+                child_capability_id TEXT NOT NULL,
+                relation_type TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_capability_relations_parent
+                ON capability_relations (workspace_id, parent_capability_id);
+            CREATE INDEX IF NOT EXISTS idx_capability_relations_child
+                ON capability_relations (workspace_id, child_capability_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_capability_relations_unique
+                ON capability_relations (workspace_id, parent_capability_id, child_capability_id, relation_type);
+
+            CREATE TABLE IF NOT EXISTS auth_profiles (
+                auth_profile_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                auth_type TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                secret_ref TEXT NOT NULL,
+                scopes_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_auth_profiles_workspace_provider
+                ON auth_profiles (workspace_id, provider);
+
+            CREATE TABLE IF NOT EXISTS policy_profiles (
+                policy_profile_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                rules_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_policy_profiles_workspace_name
+                ON policy_profiles (workspace_id, name);
+
+            CREATE TABLE IF NOT EXISTS capability_health_runs (
+                health_run_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                capability_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                latency_ms INTEGER,
+                error TEXT,
+                checked_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_capability_health_runs_capability
+                ON capability_health_runs (workspace_id, capability_id, checked_at);
+
+            CREATE TABLE IF NOT EXISTS capability_audit_events (
+                audit_event_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                capability_id TEXT,
+                actor_user_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_capability_audit_events_workspace_created
+                ON capability_audit_events (workspace_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS user_skills (
+                skill_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                slug TEXT UNIQUE NOT NULL,
+                description TEXT DEFAULT '',
+                category TEXT DEFAULT 'Custom',
+                icon TEXT DEFAULT '',
+                skill_type TEXT NOT NULL DEFAULT 'catalog',
+                catalog_id TEXT DEFAULT '',
+                code TEXT DEFAULT '',
+                input_schema TEXT DEFAULT '{}',
+                output_schema TEXT DEFAULT '{}',
+                is_installed INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                tags TEXT DEFAULT '[]',
+                metadata TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_skills_slug ON user_skills (slug);
+            CREATE INDEX IF NOT EXISTS idx_user_skills_type_installed ON user_skills (skill_type, is_installed);
             """
         )
         _ensure_column(conn, "runs", "workflow_id", "TEXT")

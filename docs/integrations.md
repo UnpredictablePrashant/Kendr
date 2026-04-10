@@ -264,7 +264,6 @@ WHATSAPP_PHONE_NUMBER_ID="109876543210"      # phone number ID (NOT the number i
 
 ```bash
 kendr run \
-  --communication-authorized \
   --whatsapp-to "+15551234567" \
   --whatsapp-message "Hello from Kendr." \
   "Send a WhatsApp message."
@@ -274,7 +273,6 @@ kendr run \
 
 ```bash
 kendr run \
-  --communication-authorized \
   --whatsapp-to "+15551234567" \
   --whatsapp-template "hello_world" \
   "Send a WhatsApp template message."
@@ -494,6 +492,30 @@ Example templates:
 - [`plugin_templates/provider_plugin.py`](../plugin_templates/provider_plugin.py)
 
 See [Plugin SDK](plugin_sdk.md) for manifest expectations, compatibility notes, and testing guidance.
+
+### One-Stop Extensibility (Custom Skills + MCP)
+
+Use this flow when you want any user to add their own skills and MCP servers:
+
+1. Create/register custom skill agents as plugins (`register(registry)` + `AgentDefinition` metadata).
+2. Add one or more MCP servers:
+
+```bash
+kendr mcp add "Server A" http://localhost:8000/mcp
+kendr mcp add "Server B" "python mcp_servers/example_fastmcp_server.py" --type stdio
+kendr mcp discover "Server A"
+kendr mcp discover "Server B"
+```
+
+3. Verify discoverability surfaces used by runtime/chat routing:
+
+```bash
+kendr agents list
+kendr mcp list
+curl http://127.0.0.1:8790/registry/skills
+```
+
+The gateway re-registers discovered MCP tools as synthetic `mcp_*_agent` entries, and the skill registry includes them in routing once enabled/configured.
 
 ---
 

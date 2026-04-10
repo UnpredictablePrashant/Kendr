@@ -168,7 +168,8 @@ Activates the end-to-end dev pipeline: blueprint → scaffold → build → test
 
 | Flag | Default | Description |
 |---|---|---|
-| `--communication-authorized` | _(off)_ | Confirm authorization to access communication channels for this run. |
+| `--communication-authorized` | `on` | Enable communication-channel access for this run. |
+| `--no-communication-authorized` | _(off)_ | Disable communication-channel access for this run. |
 | `--communication-lookback-hours N` | `24` | Lookback window in hours for the communication digest. |
 | `--whatsapp-to PHONE` | _(none)_ | Recipient phone in E.164 format for `whatsapp_send_message_agent`. |
 | `--whatsapp-message TEXT` | _(none)_ | Plain text message body. |
@@ -211,8 +212,7 @@ kendr run --current-folder --os-command "ls -la" --os-shell bash \
   --privileged-approved --privileged-approval-note "OPS-42 approved" "List project root."
 
 # Communication digest (last 8 hours)
-kendr run --communication-authorized \
-  "Summarize my Slack and Gmail messages from the last 8 hours."
+kendr run "Summarize my Slack and Gmail messages from the last 8 hours."
 ```
 
 ---

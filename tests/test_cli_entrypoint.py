@@ -26,6 +26,24 @@ class CliEntrypointSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stderr)
         self.assertIn("usage: kendr", result.stdout.lower())
 
+    def test_run_help_lists_communication_disable_flag(self):
+        env = os.environ.copy()
+        env.setdefault("OPENAI_API_KEY", "test-openai-key")
+        env["PYTHONPATH"] = str(ROOT) if not env.get("PYTHONPATH") else f"{ROOT}{os.pathsep}{env['PYTHONPATH']}"
+
+        result = subprocess.run(
+            [sys.executable, "-m", "kendr.cli", "run", "--help"],
+            cwd=ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertIn("--communication-authorized", result.stdout)
+        self.assertIn("--no-communication-authorized", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

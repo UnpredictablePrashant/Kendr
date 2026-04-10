@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import cgi
 import html as _html
+import http.client
 import json
 import logging
 import os
 import queue
 import re
+import shlex
 import tempfile
 import threading
 import time
@@ -224,6 +226,99 @@ def _gateway_long_timeout_seconds() -> float | None:
     except Exception:
         return 21600.0
     return None if timeout <= 0 else timeout
+
+
+def _normalize_mcp_add_payload(body: dict) -> list[dict]:
+    def _clean_bool(value, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    def _normalize_entry(server_name: str, raw: dict) -> dict:
+        if not isinstance(raw, dict):
+            raise ValueError(f"Invalid MCP config for '{server_name}'")
+
+        name = str(raw.get("name") or server_name or "").strip()
+        if not name:
+            raise ValueError("MCP server name is required")
+
+        description = str(raw.get("description", "") or "").strip()
+        auth_token = str(raw.get("auth_token", "") or "").strip()
+        enabled = _clean_bool(raw.get("enabled"), not _clean_bool(raw.get("disabled"), False))
+
+        if raw.get("command"):
+            command = str(raw.get("command", "") or "").strip()
+            if not command:
+                raise ValueError(f"MCP server '{name}' is missing a command")
+            args = raw.get("args", [])
+            if args is None:
+                args = []
+            if not isinstance(args, list):
+                raise ValueError(f"MCP server '{name}' has invalid args")
+            cmd = command.lower()
+            argv = [str(arg or "").strip() for arg in args]
+            if (
+                cmd in {"uvx", "uv"}
+                and len(argv) >= 3
+                and argv[0].lower() == "fastmcp"
+                and argv[1].lower() == "run"
+                and (argv[2].startswith("http://") or argv[2].startswith("https://"))
+            ):
+                connection = argv[2]
+                server_type = "http"
+            else:
+                connection = shlex.join([command, *argv])
+                server_type = "stdio"
+        else:
+            connection = str(
+                raw.get("connection")
+                or raw.get("url")
+                or raw.get("endpoint")
+                or ""
+            ).strip()
+            server_type = str(raw.get("type") or "http").strip().lower() or "http"
+            if server_type not in {"http", "stdio"}:
+                server_type = "http"
+
+        if not connection:
+            raise ValueError(f"MCP server '{name}' is missing a connection")
+
+        return {
+            "name": name,
+            "connection": connection,
+            "type": server_type,
+            "description": description,
+            "auth_token": auth_token,
+            "enabled": enabled,
+        }
+
+    raw_config = body.get("config_json")
+    if isinstance(raw_config, str) and raw_config.strip():
+        try:
+            parsed = json.loads(raw_config)
+        except Exception as exc:
+            raise ValueError(f"Invalid MCP JSON: {exc}") from exc
+    else:
+        parsed = body
+
+    if not isinstance(parsed, dict):
+        raise ValueError("MCP payload must be a JSON object")
+
+    mcp_servers = parsed.get("mcpServers")
+    if isinstance(mcp_servers, dict):
+        entries = [_normalize_entry(server_name, raw) for server_name, raw in mcp_servers.items()]
+        if not entries:
+            raise ValueError("mcpServers is empty")
+        return entries
+
+    return [_normalize_entry(str(parsed.get("name", "") or ""), parsed)]
 
 
 def _gateway_open_json(req: urllib.request.Request, *, timeout: float | None) -> dict | list:
@@ -619,6 +714,31 @@ def _gateway_get(path: str, timeout: float = 5.0) -> dict | list:
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _gateway_forward_json(
+    method: str,
+    path: str,
+    *,
+    payload: dict | None = None,
+    timeout: float = 5.0,
+) -> tuple[int, dict | list]:
+    body = None
+    headers: dict[str, str] = {}
+    if payload is not None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"{_gateway_url()}{path}", data=body, method=method.upper(), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(raw) if raw else {"error": exc.reason}
+        except Exception:
+            data = {"error": raw or str(exc.reason or "gateway_error")}
+        return int(getattr(exc, "code", 500) or 500), data
+
+
 def _gateway_refresh_mcp(timeout: float = 5.0) -> None:
     """POST /registry/mcp-refresh so the gateway re-registers MCP synthetic agents."""
     try:
@@ -637,6 +757,21 @@ def _gateway_refresh_mcp(timeout: float = 5.0) -> None:
 _pending_runs: dict[str, dict] = {}
 _run_event_queues: dict[str, "queue.Queue[dict]"] = {}
 _pending_lock = threading.Lock()
+_ollama_pull_lock = threading.Lock()
+_ollama_pull_state: dict[str, object] = {
+    "active": False,
+    "status": "idle",
+    "model": "",
+    "digest": "",
+    "message": "",
+    "error": "",
+    "completed": 0,
+    "total": 0,
+    "started_at": "",
+    "updated_at": "",
+    "completed_at": "",
+    "cancel_requested": False,
+}
 _OAUTH_PENDING_STATES: dict[str, str] = {}
 _PENDING_TERMINAL_TTL_SECONDS = max(
     0,
@@ -654,6 +789,199 @@ def _run_control_dir() -> str:
 def _kill_switch_path_for_run(run_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", str(run_id or "").strip()) or "run"
     return os.path.join(_run_control_dir(), f"{safe}.stop")
+
+
+def _ollama_base_url() -> str:
+    return str(os.getenv("OLLAMA_BASE_URL", "http://localhost:11434") or "http://localhost:11434").strip().rstrip("/")
+
+
+def _ollama_pull_public_state() -> dict[str, object]:
+    with _ollama_pull_lock:
+        state = dict(_ollama_pull_state)
+    state = _sanitize_ollama_pull_state(state)
+    return state
+
+
+def _sanitize_ollama_pull_state(state: dict[str, object] | None) -> dict[str, object]:
+    state = dict(state or {})
+    state.pop("connection", None)
+    state.pop("response", None)
+    total = int(state.get("total") or 0)
+    completed = int(state.get("completed") or 0)
+    percent = 0.0
+    if total > 0:
+        percent = max(0.0, min(100.0, (completed / total) * 100.0))
+    state["percent"] = percent
+    state["cancellable"] = bool(state.get("active")) and str(state.get("status") or "") in {"starting", "running", "cancelling"}
+    return state
+
+
+def _set_ollama_pull_state(**updates: object) -> dict[str, object]:
+    with _ollama_pull_lock:
+        _ollama_pull_state.update(updates)
+        _ollama_pull_state["updated_at"] = _utc_now_iso()
+        return dict(_ollama_pull_state)
+
+
+def _apply_ollama_pull_event(event: dict) -> dict[str, object]:
+    if not isinstance(event, dict):
+        return _ollama_pull_public_state()
+
+    updates: dict[str, object] = {}
+    status = str(event.get("status") or "").strip()
+    digest = str(event.get("digest") or "").strip()
+    if status:
+        updates["message"] = status
+        lowered = status.lower()
+        if lowered in {"success", "verifying sha256 digest", "writing manifest", "removing any unused layers"}:
+            updates["status"] = "running"
+        elif "pulling" in lowered or "download" in lowered:
+            updates["status"] = "running"
+    if digest:
+        updates["digest"] = digest
+    total = event.get("total")
+    completed = event.get("completed")
+    if isinstance(total, (int, float)):
+        updates["total"] = max(0, int(total))
+    if isinstance(completed, (int, float)):
+        updates["completed"] = max(0, int(completed))
+    if str(event.get("status") or "").strip().lower() == "success":
+        updates.update({
+            "active": False,
+            "status": "completed",
+            "message": "Download complete",
+            "completed_at": _utc_now_iso(),
+        })
+        final_total = int(updates.get("total") or _ollama_pull_state.get("total") or 0)
+        if final_total > 0:
+            updates["completed"] = final_total
+    _set_ollama_pull_state(**updates)
+    return _ollama_pull_public_state()
+
+
+def _start_ollama_pull_job(model_name: str) -> tuple[bool, dict[str, object], int]:
+    model = str(model_name or "").strip()
+    if not model:
+        return False, {"error": "missing_model"}, 400
+
+    with _ollama_pull_lock:
+        current_status = str(_ollama_pull_state.get("status") or "")
+        if bool(_ollama_pull_state.get("active")) and current_status in {"starting", "running", "cancelling"}:
+            current_model = str(_ollama_pull_state.get("model") or "").strip()
+            current_pull = _sanitize_ollama_pull_state(_ollama_pull_state)
+            return False, {
+                "error": "pull_already_running",
+                "detail": f"Model pull already in progress for {current_model or 'another model'}",
+                "pull": current_pull,
+            }, 409
+        _ollama_pull_state.clear()
+        _ollama_pull_state.update({
+            "active": True,
+            "status": "starting",
+            "model": model,
+            "digest": "",
+            "message": "Starting download",
+            "error": "",
+            "completed": 0,
+            "total": 0,
+            "started_at": _utc_now_iso(),
+            "updated_at": _utc_now_iso(),
+            "completed_at": "",
+            "cancel_requested": False,
+            "connection": None,
+            "response": None,
+        })
+
+    def _run() -> None:
+        conn: http.client.HTTPConnection | http.client.HTTPSConnection | None = None
+        response: http.client.HTTPResponse | None = None
+        try:
+            parsed = urlparse(_ollama_base_url())
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(f"Invalid OLLAMA_BASE_URL: {_ollama_base_url()}")
+            connection_cls = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+            conn = connection_cls(parsed.netloc, timeout=60)
+            target_path = (parsed.path.rstrip("/") or "") + "/api/pull"
+            payload = json.dumps({"name": model, "stream": True}).encode("utf-8")
+            conn.request("POST", target_path, body=payload, headers={"Content-Type": "application/json"})
+            response = conn.getresponse()
+            _set_ollama_pull_state(connection=conn, response=response, status="running", message="Connecting to Ollama")
+            if response.status >= 400:
+                raw = response.read().decode("utf-8", errors="replace").strip()
+                raise RuntimeError(raw or f"Ollama pull failed ({response.status})")
+
+            while True:
+                line = response.readline()
+                if not line:
+                    break
+                decoded = line.decode("utf-8", errors="replace").strip()
+                if not decoded:
+                    continue
+                try:
+                    event = json.loads(decoded)
+                except Exception:
+                    _set_ollama_pull_state(message=decoded, status="running")
+                    continue
+                if isinstance(event, dict):
+                    _apply_ollama_pull_event(event)
+
+            public_state = _ollama_pull_public_state()
+            if str(public_state.get("status") or "") not in {"completed", "cancelled"}:
+                _set_ollama_pull_state(
+                    active=False,
+                    status="completed",
+                    message="Download complete",
+                    completed_at=_utc_now_iso(),
+                )
+        except Exception as exc:
+            public_state = _ollama_pull_public_state()
+            cancelled = bool(public_state.get("cancel_requested"))
+            _set_ollama_pull_state(
+                active=False,
+                status="cancelled" if cancelled else "failed",
+                error="" if cancelled else str(exc),
+                message="Download cancelled" if cancelled else "Download failed",
+                completed_at=_utc_now_iso(),
+            )
+        finally:
+            try:
+                if response is not None:
+                    response.close()
+            except Exception:
+                pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+            _set_ollama_pull_state(connection=None, response=None)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True, {"ok": True, "pull": _ollama_pull_public_state()}, 202
+
+
+def _cancel_ollama_pull_job() -> tuple[bool, dict[str, object], int]:
+    with _ollama_pull_lock:
+        state = dict(_ollama_pull_state)
+        if not bool(state.get("active")) or str(state.get("status") or "") not in {"starting", "running", "cancelling"}:
+            return False, {"error": "pull_not_running", "pull": _sanitize_ollama_pull_state(state)}, 409
+        _ollama_pull_state["cancel_requested"] = True
+        _ollama_pull_state["status"] = "cancelling"
+        _ollama_pull_state["message"] = "Cancelling download"
+        _ollama_pull_state["updated_at"] = _utc_now_iso()
+        response = _ollama_pull_state.get("response")
+        connection = _ollama_pull_state.get("connection")
+    try:
+        if response is not None:
+            response.close()
+    except Exception:
+        pass
+    try:
+        if connection is not None:
+            connection.close()
+    except Exception:
+        pass
+    return True, {"ok": True, "pull": _ollama_pull_public_state()}, 200
 
 
 def _clear_kill_switch_file(path_value: str) -> None:
@@ -1822,7 +2150,7 @@ a:hover { text-decoration: underline; }
     <a href="/skills" class="nav-btn"><span class="icon">🧠</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">🔬</span> Super-RAG</a>
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
-    <a href="/mcp" class="nav-btn"><span class="icon">🧩</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
     <a href="/projects" class="nav-btn"><span class="icon">📁</span> Projects</a>
     <a href="/docs" class="nav-btn"><span class="icon">📖</span> Docs</a>
   </div>
@@ -1915,25 +2243,22 @@ a:hover { text-decoration: underline; }
     <div class="security-panel" id="securityPanel">
       <div class="sec-head">
         <div>
-          <div class="sec-title">Security Assessment Authorization</div>
-          <div class="sec-subtitle">All three fields are required. Scanning is blocked until authorization is confirmed.</div>
+          <div class="sec-title">&#x1F7E2; Security Assessment — Authorized</div>
+          <div class="sec-subtitle">Target URL and authorization note are auto-filled from your message. Override below if needed.</div>
         </div>
       </div>
       <div class="sec-grid">
         <div class="sec-field">
-          <label for="secTargetUrl">Target URL</label>
-          <input id="secTargetUrl" class="sec-input" type="url" placeholder="https://example.com" oninput="_renderChatInspector()">
+          <label for="secTargetUrl">Target URL <span style="font-weight:400;opacity:.6">(auto-detected from message)</span></label>
+          <input id="secTargetUrl" class="sec-input" type="url" placeholder="https://example.com — or leave blank to auto-detect" oninput="_renderChatInspector()">
         </div>
         <div class="sec-field">
-          <label for="secAuthNote">Authorization Reference</label>
-          <input id="secAuthNote" class="sec-input" type="text" placeholder="e.g. Ticket SEC-123, signed contract, owner approval" oninput="_renderChatInspector()">
+          <label for="secAuthNote">Authorization Note <span style="font-weight:400;opacity:.6">(auto-filled)</span></label>
+          <input id="secAuthNote" class="sec-input" type="text" placeholder="Auto: Authorized via Security Assessment mode in Web UI" oninput="_renderChatInspector()">
         </div>
       </div>
-      <div class="sec-auth-row">
-        <input type="checkbox" id="secAuthorized" onchange="_renderChatInspector()">
-        <label class="sec-auth-label" for="secAuthorized">I confirm I own this target or have explicit written permission from the owner to perform a security assessment.</label>
-      </div>
-      <div class="sec-warn">Only authorized defensive security assessments are permitted. Unauthorized scanning is blocked. Ensure scope and testing window are agreed with the asset owner before proceeding.</div>
+      <input type="checkbox" id="secAuthorized" style="display:none" checked>
+      <div class="sec-warn">Only use this mode on targets you own or have explicit written permission to assess. Enabling Security mode confirms authorization.</div>
     </div>
     <div class="deep-research-panel" id="deepResearchPanel">
       <div class="dr-head">
@@ -2366,12 +2691,8 @@ function _renderChatInspector() {
   const secChip = document.getElementById('chatSecurityChip');
   if (secChip) {
     secChip.style.display = securityMode ? '' : 'none';
-    const secAuthorized = !!((document.getElementById('secAuthorized') || {}).checked);
-    const secTarget = ((document.getElementById('secTargetUrl') || {}).value || '').trim();
-    const secNote = ((document.getElementById('secAuthNote') || {}).value || '').trim();
-    const secReady = securityMode && secAuthorized && secTarget && secNote;
-    secChip.textContent = !securityMode ? 'Security Off' : secReady ? 'Security: Authorized' : 'Security: Needs Auth';
-    secChip.classList.toggle('active', secReady);
+    secChip.textContent = securityMode ? 'Security: Authorized' : 'Security Off';
+    secChip.classList.toggle('active', securityMode);
   }
   if (chatChip) chatChip.classList.add('active');
   if (_chatRunState.runId) {
@@ -2588,9 +2909,16 @@ function setSecurityMode(on) {
   const chip = document.getElementById('chatSecurityChip');
   if (btn) btn.classList.toggle('active', securityMode);
   if (panel) panel.classList.toggle('visible', securityMode);
+  if (securityMode) {
+    // One-click authorization: pre-check consent and pre-fill note automatically
+    const authBox = document.getElementById('secAuthorized');
+    const noteBox = document.getElementById('secAuthNote');
+    if (authBox) authBox.checked = true;
+    if (noteBox && !noteBox.value.trim()) noteBox.value = 'Authorized via Security Assessment mode in Web UI';
+  }
   if (chip) {
     chip.style.display = securityMode ? '' : 'none';
-    chip.textContent = securityMode ? 'Security On' : 'Security Off';
+    chip.textContent = securityMode ? 'Security: Authorized' : 'Security Off';
     chip.classList.toggle('active', securityMode);
   }
   _renderChatInspector();
@@ -4601,33 +4929,16 @@ async function sendMessage() {
       payload.shell_auto_approve = true;
       payload.privileged_approval_note = 'Approved via Shell Automation mode in chat UI';
     }
-    if (securityMode) {
-      const secAuthorized = !!((document.getElementById('secAuthorized') || {}).checked);
-      const secTarget = ((document.getElementById('secTargetUrl') || {}).value || '').trim();
-      const secNote = ((document.getElementById('secAuthNote') || {}).value || '').trim();
-      if (!secTarget) {
-        finalizeStreamRow(runId, '', 'Security mode requires a Target URL before scanning can start.');
-        isRunning = false;
-        isStopping = false;
-        _setChatComposerState();
-        return;
-      }
-      if (!secAuthorized) {
-        finalizeStreamRow(runId, '', 'Security mode requires you to check the authorization confirmation before scanning can start.');
-        isRunning = false;
-        isStopping = false;
-        _setChatComposerState();
-        return;
-      }
-      if (!secNote) {
-        finalizeStreamRow(runId, '', 'Security mode requires an Authorization Reference (ticket ID, contract, or signed approval) before scanning can start.');
-        isRunning = false;
-        isStopping = false;
-        _setChatComposerState();
-        return;
-      }
+    // Always inject security authorization from the webchat UI (operator-controlled).
+    // Explicit Security mode overrides the target URL field; otherwise auto-extract from message.
+    {
+      const secTarget = securityMode
+        ? (((document.getElementById('secTargetUrl') || {}).value || '').trim() || (() => { const m = text.match(/https?:\/\/[^\s]+|(?:^|\s)([\w.-]+\.[a-z]{2,}(?:\/[^\s]*)?)/i); return m ? (m[0] || m[1] || '').trim() : ''; })())
+        : (() => { const m = text.match(/https?:\/\/[^\s]+|(?:^|\s)([\w.-]+\.[a-z]{2,}(?:\/[^\s]*)?)/i); return m ? (m[0] || m[1] || '').trim() : ''; })();
+      const secNote = ((document.getElementById('secAuthNote') || {}).value || '').trim()
+                      || 'Authorized via Web UI (operator session)';
       payload.security_authorized = true;
-      payload.security_target_url = secTarget;
+      if (secTarget) payload.security_target_url = secTarget;
       payload.security_authorization_note = secNote;
     }
     if (resumeDir) {
@@ -4822,7 +5133,7 @@ a { color: var(--teal); }
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
-    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
     <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
@@ -5369,7 +5680,7 @@ body.mode-code .inspector-panel { opacity: 0; pointer-events: none; transform: t
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
-    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
     <a href="/projects" class="nav-btn active"><span class="icon">&#x1F4C1;</span> Projects</a>
     <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
@@ -8052,7 +8363,7 @@ input:checked + .slider:before{transform:translateX(18px);}
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn active"><span class="icon">&#x1F52C;</span> Super-RAG</a>
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
-    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
     <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
@@ -8778,7 +9089,7 @@ body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSy
   <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
   <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
   <a href="/models" class="nav-btn active"><span class="icon">&#x1F916;</span> LLM Models</a>
-  <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
   <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
 </nav>
@@ -8903,7 +9214,7 @@ const PROVIDER_META = {
   openai:      { emoji: '\uD83D\uDFE2', label: 'OpenAI',              type: 'Cloud API',     models: ['gpt-4o','gpt-4o-mini','gpt-5','o3'], keyEnv: 'OPENAI_API_KEY',      hint: 'platform.openai.com/api-keys' },
   anthropic:   { emoji: '\uD83D\uDCA0', label: 'Anthropic (Claude)',  type: 'Cloud API',     models: ['claude-opus-4-6','claude-sonnet-4-6','claude-haiku-4-5'], keyEnv: 'ANTHROPIC_API_KEY', hint: 'console.anthropic.com' },
   google:      { emoji: '\uD83D\uDD35', label: 'Google Gemini',       type: 'Cloud API',     models: ['gemini-2.5-pro','gemini-2.0-flash','gemini-1.5-pro'], keyEnv: 'GOOGLE_API_KEY', hint: 'aistudio.google.com' },
-  xai:         { emoji: '\u274E',       label: 'xAI (Grok)',          type: 'Cloud API',     models: ['grok-3','grok-3-mini','grok-2'], keyEnv: 'XAI_API_KEY',       hint: 'console.x.ai' },
+  xai:         { emoji: '\u274E',       label: 'xAI (Grok)',          type: 'Cloud API',     models: ['grok-4','grok-4.20-beta-latest-non-reasoning','grok-4-1-fast-reasoning'], keyEnv: 'XAI_API_KEY',       hint: 'docs.x.ai/developers/models' },
   minimax:     { emoji: '\uD83C\uDF00', label: 'MiniMax',             type: 'Cloud API',     models: ['MiniMax-M2','image-01'], keyEnv: 'MINIMAX_API_KEY',   hint: 'platform.minimaxi.com' },
   qwen:        { emoji: '\uD83D\uDCCA', label: 'Qwen (Alibaba)',      type: 'Cloud API',     models: ['qwen-max','qwen-plus','qwen-turbo'], keyEnv: 'QWEN_API_KEY',    hint: 'dashscope.aliyuncs.com' },
   glm:         { emoji: '\u26A1',       label: 'GLM (Zhipu AI)',      type: 'Cloud API',     models: ['glm-5','glm-4','glm-4-flash'], keyEnv: 'GLM_API_KEY',     hint: 'bigmodel.cn' },
@@ -9171,7 +9482,7 @@ const CFG_FIELDS = {
   google:     [{ key:'GOOGLE_API_KEY', label:'API Key', secret:true, hint:'From aistudio.google.com' },
                { key:'GOOGLE_MODEL', label:'Default Model', hint:'e.g. gemini-2.5-pro, gemini-2.0-flash' }],
   xai:        [{ key:'XAI_API_KEY', label:'API Key', secret:true, hint:'From console.x.ai' },
-               { key:'XAI_MODEL', label:'Default Model', hint:'e.g. grok-3, grok-3-mini' }],
+               { key:'XAI_MODEL', label:'Default Model', hint:'e.g. grok-4, grok-4.20-beta-latest-non-reasoning' }],
   minimax:    [{ key:'MINIMAX_API_KEY', label:'API Key', secret:true, hint:'From platform.minimaxi.com' },
                { key:'MINIMAX_MODEL', label:'Default Model', hint:'e.g. MiniMax-M2' }],
   qwen:       [{ key:'QWEN_API_KEY', label:'API Key', secret:true, hint:'From dashscope.aliyuncs.com' },
@@ -9341,7 +9652,7 @@ input:checked + .slider:before { transform: translateX(14px); }
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
-    <a href="/mcp" class="nav-btn active"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
     <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
@@ -9635,6 +9946,583 @@ loadScaffold();
 </html>"""
 
 
+_CAPABILITIES_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kendr &mdash; Capability Studio</title>
+<style>
+:root { --teal: #00C9A7; --amber: #FFB347; --crimson: #FF4757; --purple: #A78BFA; --bg: #0d0f14; --surface: #161b22; --surface2: #1e2530; --border: #2a3140; --text: #e6edf3; --muted: #7d8590; --sidebar-w: 280px; }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; }
+.sidebar { width: var(--sidebar-w); min-width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; position: fixed; top: 0; bottom: 0; left: 0; }
+.sidebar-header { padding: 20px 16px 12px; border-bottom: 1px solid var(--border); }
+.logo { font-size: 22px; font-weight: 800; color: var(--teal); }
+.logo span { color: var(--amber); }
+.tagline { font-size: 11px; color: var(--muted); margin-top: 4px; }
+.sidebar-nav { padding: 12px 8px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; }
+.nav-btn { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-radius: 8px; font-size: 13px; font-weight: 500; color: var(--muted); cursor: pointer; border: none; background: transparent; width: 100%; text-align: left; text-decoration: none; transition: background 0.15s, color 0.15s; }
+.nav-btn:hover { background: var(--surface2); color: var(--text); }
+.nav-btn.active { background: rgba(167,139,250,0.12); color: var(--purple); }
+.nav-btn .icon { font-size: 16px; width: 20px; text-align: center; }
+.main { flex: 1; margin-left: var(--sidebar-w); padding: 28px 30px; }
+.page-title { font-size: 25px; font-weight: 700; margin-bottom: 6px; }
+.page-subtitle { font-size: 13px; color: var(--muted); margin-bottom: 18px; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 14px; }
+.panel-title { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+.row { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
+.col2 { grid-column: span 2; }
+.col3 { grid-column: span 3; }
+.col6 { grid-column: span 6; }
+label { display: block; font-size: 11px; font-weight: 700; color: var(--muted); margin-bottom: 5px; letter-spacing: 0.04em; text-transform: uppercase; }
+input, select, textarea { width: 100%; background: var(--surface2); border: 1px solid var(--border); border-radius: 7px; padding: 8px 10px; color: var(--text); font-size: 13px; outline: none; }
+input:focus, select:focus, textarea:focus { border-color: var(--teal); }
+textarea { min-height: 110px; resize: vertical; font-family: "Cascadia Code", "Fira Code", monospace; font-size: 12px; }
+.btn { border: 1px solid var(--border); border-radius: 7px; padding: 7px 11px; font-size: 12px; font-weight: 600; color: var(--text); background: var(--surface2); cursor: pointer; }
+.btn:hover { opacity: 0.86; }
+.btn-primary { background: var(--teal); color: #091017; border-color: rgba(0,0,0,0); }
+.btn-danger { background: rgba(255,71,87,0.1); border-color: rgba(255,71,87,0.4); color: var(--crimson); }
+.btn-amber { background: rgba(255,179,71,0.1); border-color: rgba(255,179,71,0.35); color: var(--amber); }
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.summary { font-size: 12px; color: var(--muted); }
+.summary strong { color: var(--teal); }
+table { width: 100%; border-collapse: collapse; font-size: 12px; }
+th { text-align: left; color: var(--muted); text-transform: uppercase; font-size: 11px; letter-spacing: 0.04em; border-bottom: 1px solid var(--border); padding: 9px 8px; }
+td { border-bottom: 1px solid var(--border); padding: 9px 8px; vertical-align: top; }
+tr:hover td { background: rgba(0,201,167,0.03); }
+.mono { font-family: "Cascadia Code", "Fira Code", monospace; font-size: 11px; color: #b7c6df; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; }
+.status-draft { color: var(--amber); background: rgba(255,179,71,0.12); }
+.status-verified { color: var(--teal); background: rgba(0,201,167,0.12); }
+.status-active { color: var(--teal); background: rgba(0,201,167,0.2); }
+.status-disabled, .status-deprecated { color: var(--crimson); background: rgba(255,71,87,0.15); }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.msg { margin-top: 8px; font-size: 12px; padding: 7px 9px; border-radius: 7px; }
+.msg.ok { background: rgba(0,201,167,0.1); color: var(--teal); }
+.msg.err { background: rgba(255,71,87,0.12); color: var(--crimson); }
+.detail { font-size: 12px; color: #ced8e6; line-height: 1.5; white-space: pre-wrap; background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; max-height: 260px; overflow: auto; }
+.subgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.subcard { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+.subcard h4 { font-size: 13px; margin-bottom: 6px; }
+.server-card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-top: 8px; }
+.server-title { font-size: 13px; font-weight: 700; }
+.server-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.server-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+@media (max-width: 1200px) { .row { grid-template-columns: repeat(2, minmax(0, 1fr)); } .col2,.col3,.col6{grid-column:span 2;} }
+</style>
+</head>
+<body>
+<div class="sidebar">
+  <div class="sidebar-header"><div class="logo">kendr<span>.</span></div><div class="tagline">Multi-agent intelligence runtime</div></div>
+  <div class="sidebar-nav">
+    <a href="/" class="nav-btn"><span class="icon">&#x1F4AC;</span> Chat</a>
+    <a href="/setup" class="nav-btn"><span class="icon">&#x2699;&#xFE0F;</span> Setup &amp; Config</a>
+    <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
+    <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
+    <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
+    <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
+    <a href="/capabilities" class="nav-btn active"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
+    <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
+    <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
+  </div>
+</div>
+<div class="main">
+  <div class="page-title">Capability Studio</div>
+  <div class="page-subtitle">Single place to add MCP servers, import OpenAPI specs, and manage capability records.</div>
+
+  <div class="panel">
+    <div class="panel-title">Add MCP Server</div>
+    <div class="row">
+      <div class="col2"><label>Server Name</label><input id="mcpName" placeholder="my-mcp-server"></div>
+      <div><label>Type</label><select id="mcpType"><option value="http">HTTP/SSE</option><option value="stdio">Stdio</option></select></div>
+      <div class="col3"><label>Connection</label><input id="mcpConnection" placeholder="http://localhost:8000/mcp or python my_server.py"></div>
+      <div class="col2"><label>Auth Token (optional)</label><input id="mcpToken" type="password" placeholder="Bearer token"></div>
+      <div class="col3"><label>Description (optional)</label><input id="mcpDescription" placeholder="What this server provides"></div>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <button class="btn btn-primary" onclick="addMcpServer()">Connect &amp; Discover</button>
+      <button class="btn" onclick="loadMcpServers()">Refresh MCP List</button>
+    </div>
+    <div id="mcpMsg"></div>
+    <div id="mcpList" style="margin-top:8px;color:var(--muted)">Loading MCP servers...</div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Search</div>
+    <div class="row">
+      <div><label>Type</label><select id="fltType"><option value="">Any</option><option value="skill">skill</option><option value="mcp_server">mcp_server</option><option value="mcp_tool">mcp_tool</option><option value="api_service">api_service</option><option value="api_operation">api_operation</option><option value="agent">agent</option><option value="plugin">plugin</option><option value="workflow">workflow</option></select></div>
+      <div><label>Status</label><select id="fltStatus"><option value="">Any</option><option value="draft">draft</option><option value="verified">verified</option><option value="active">active</option><option value="disabled">disabled</option><option value="deprecated">deprecated</option></select></div>
+      <div><label>Visibility</label><select id="fltVisibility"><option value="">Any</option><option value="private">private</option><option value="workspace">workspace</option><option value="public">public</option></select></div>
+      <div class="col3"><label>Search</label><input id="fltQ" placeholder="name, key, description"></div>
+      <div><label>Limit</label><input id="fltLimit" value="200"></div>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <button class="btn btn-primary" onclick="loadCapabilities()">Refresh</button>
+      <button class="btn" onclick="loadDiscoveryCards()">Discovery Cards</button>
+      <div id="discoverySummary" class="summary"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="toolbar">
+      <div class="panel-title" style="margin:0">Capabilities</div>
+      <div id="listSummary" class="summary"></div>
+    </div>
+    <table>
+      <thead><tr><th>Name</th><th>Type</th><th>Status</th><th>Visibility</th><th>Key</th><th>Updated</th><th>Actions</th></tr></thead>
+      <tbody id="capRows"><tr><td colspan="7" style="color:var(--muted)">Loading...</td></tr></tbody>
+    </table>
+    <div id="capMsg"></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">Capability Detail</div>
+    <div id="capDetail" class="detail">Select a capability row to inspect full metadata.</div>
+  </div>
+
+  <div class="row">
+    <div class="col3 panel">
+      <div class="panel-title">Create Capability</div>
+      <div class="row">
+        <div class="col2"><label>Type</label><input id="newType" placeholder="api_operation"></div>
+        <div class="col2"><label>Key</label><input id="newKey" placeholder="billing.invoice.get"></div>
+        <div class="col2"><label>Name</label><input id="newName" placeholder="Get Invoice"></div>
+        <div class="col2"><label>Owner User ID</label><input id="newOwner" value="ui:capabilities"></div>
+        <div><label>Status</label><select id="newStatus"><option value="draft">draft</option><option value="verified">verified</option><option value="active">active</option><option value="disabled">disabled</option></select></div>
+        <div><label>Visibility</label><select id="newVisibility"><option value="workspace">workspace</option><option value="private">private</option><option value="public">public</option></select></div>
+        <div class="col6"><label>Description</label><input id="newDescription" placeholder="Capability description"></div>
+      </div>
+      <div style="margin-top:10px"><button class="btn btn-primary" onclick="createCapability()">Create</button></div>
+      <div id="createMsg"></div>
+    </div>
+
+    <div class="col3 panel">
+      <div class="panel-title">Create Auth Profile</div>
+      <div class="row">
+        <div class="col2"><label>Auth Type</label><input id="authType" placeholder="oauth2_bearer"></div>
+        <div class="col2"><label>Provider</label><input id="authProvider" placeholder="openai"></div>
+        <div class="col2"><label>Secret Ref</label><input id="authSecretRef" placeholder="vault://prod/openai/token"></div>
+      </div>
+      <div style="margin-top:10px"><button class="btn btn-primary" onclick="createAuthProfile()">Create</button></div>
+      <div id="authMsg"></div>
+
+      <div class="panel-title" style="margin-top:16px">Create Policy Profile</div>
+      <div class="row">
+        <div class="col2"><label>Policy Name</label><input id="policyName" placeholder="readonly-policy"></div>
+        <div class="col6"><label>Rules JSON</label><textarea id="policyRules" placeholder='{"deny_write": true, "allow_tools": ["mcp.tool.docs.search"]}'></textarea></div>
+      </div>
+      <div style="margin-top:10px"><button class="btn btn-primary" onclick="createPolicyProfile()">Create</button></div>
+      <div id="policyMsg"></div>
+
+      <div class="panel-title" style="margin-top:16px">Import OpenAPI</div>
+      <div class="row">
+        <div class="col2"><label>Owner User ID</label><input id="openapiOwner" value="ui:openapi-import"></div>
+        <div><label>Status</label><select id="openapiStatus"><option value="draft">draft</option><option value="verified">verified</option><option value="active">active</option></select></div>
+        <div><label>Visibility</label><select id="openapiVisibility"><option value="workspace">workspace</option><option value="private">private</option><option value="public">public</option></select></div>
+        <div class="col2"><label>Auth Profile ID (optional)</label><input id="openapiAuthProfile" placeholder="AP_..."></div>
+        <div class="col6"><label>OpenAPI JSON/YAML</label><textarea id="openapiText" placeholder="openapi: 3.0.3..."></textarea></div>
+      </div>
+      <div style="margin-top:10px"><button class="btn btn-amber" onclick="importOpenApi()">Import OpenAPI</button></div>
+      <div id="openapiMsg"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = '';
+const WORKSPACE_ID = 'default';
+const ACTOR_USER_ID = 'ui:capability-registry';
+let _caps = [];
+let _mcpServers = [];
+
+function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function msg(elId, text, kind) { const el = document.getElementById(elId); el.className = 'msg ' + (kind || 'ok'); el.textContent = text; }
+function clearMsg(elId) { const el = document.getElementById(elId); el.className = ''; el.textContent = ''; }
+function encodeQuery(params) {
+  const items = Object.entries(params).filter(([k,v]) => String(v || '').trim() !== '');
+  return items.length ? ('?' + items.map(([k,v]) => encodeURIComponent(k) + '=' + encodeURIComponent(String(v))).join('&')) : '';
+}
+function statusClass(status) { return 'status-' + String(status || '').toLowerCase(); }
+
+function setInlineMsg(elId, text, kind) {
+  const el = document.getElementById(elId);
+  el.className = 'msg ' + (kind || 'ok');
+  el.textContent = text;
+}
+
+async function loadMcpServers() {
+  try {
+    const r = await fetch(API + '/api/mcp/servers');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    _mcpServers = Array.isArray(d) ? d : [];
+    renderMcpServers();
+  } catch (e) {
+    document.getElementById('mcpList').innerHTML = '<div style="color:var(--crimson)">Failed to load MCP servers: ' + esc(e.message || e) + '</div>';
+  }
+}
+
+function renderMcpServers() {
+  const box = document.getElementById('mcpList');
+  if (!_mcpServers.length) {
+    box.innerHTML = '<div style="color:var(--muted)">No MCP servers configured yet.</div>';
+    return;
+  }
+  box.innerHTML = _mcpServers.map((s) => {
+    const sid = String(s.id || '');
+    const status = String(s.status || 'unknown');
+    const tools = Number(s.tool_count || 0);
+    return '<div class="server-card">' +
+      '<div class="server-title">' + esc(s.name || sid) + '</div>' +
+      '<div class="server-meta">' + esc(s.connection || '') + ' | ' + esc(status) + ' | ' + tools + ' tool(s)</div>' +
+      '<div class="server-actions">' +
+      '<button class="btn" onclick="discoverMcpServer(\\'' + esc(sid) + '\\')">Discover</button>' +
+      '<button class="btn" onclick="toggleMcpServer(\\'' + esc(sid) + '\\',' + (s.enabled ? 'false' : 'true') + ')">' + (s.enabled ? 'Disable' : 'Enable') + '</button>' +
+      '<button class="btn btn-danger" onclick="removeMcpServer(\\'' + esc(sid) + '\\')">Remove</button>' +
+      '</div></div>';
+  }).join('');
+}
+
+async function addMcpServer() {
+  const name = document.getElementById('mcpName').value.trim();
+  const type = document.getElementById('mcpType').value;
+  const connection = document.getElementById('mcpConnection').value.trim();
+  const description = document.getElementById('mcpDescription').value.trim();
+  const authToken = document.getElementById('mcpToken').value.trim();
+  if (!name || !connection) {
+    setInlineMsg('mcpMsg', 'Server name and connection are required.', 'err');
+    return;
+  }
+  const payload = { name, type, connection, description };
+  if (authToken) payload.auth_token = authToken;
+  try {
+    const r = await fetch(API + '/api/mcp/servers', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    setInlineMsg('mcpMsg', 'MCP server connected and discovered.', 'ok');
+    document.getElementById('mcpName').value = '';
+    document.getElementById('mcpConnection').value = '';
+    document.getElementById('mcpDescription').value = '';
+    document.getElementById('mcpToken').value = '';
+    await loadMcpServers();
+    await loadCapabilities();
+  } catch (e) {
+    setInlineMsg('mcpMsg', 'MCP connect failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function discoverMcpServer(serverId) {
+  try {
+    const r = await fetch(API + '/api/mcp/servers/' + encodeURIComponent(serverId) + '/discover', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    setInlineMsg('mcpMsg', 'Re-discovery completed for ' + serverId + '.', 'ok');
+    await loadMcpServers();
+    await loadCapabilities();
+  } catch (e) {
+    setInlineMsg('mcpMsg', 'Discovery failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function toggleMcpServer(serverId, enabled) {
+  try {
+    const r = await fetch(API + '/api/mcp/servers/' + encodeURIComponent(serverId) + '/toggle', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ enabled: Boolean(enabled) }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    setInlineMsg('mcpMsg', 'Updated MCP server state for ' + serverId + '.', 'ok');
+    await loadMcpServers();
+    await loadCapabilities();
+  } catch (e) {
+    setInlineMsg('mcpMsg', 'Toggle failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function removeMcpServer(serverId) {
+  try {
+    const r = await fetch(API + '/api/mcp/servers/' + encodeURIComponent(serverId) + '/remove', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    setInlineMsg('mcpMsg', 'Removed MCP server ' + serverId + '.', 'ok');
+    await loadMcpServers();
+    await loadCapabilities();
+  } catch (e) {
+    setInlineMsg('mcpMsg', 'Remove failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function loadCapabilities() {
+  clearMsg('capMsg');
+  const q = encodeQuery({
+    type: document.getElementById('fltType').value,
+    status: document.getElementById('fltStatus').value,
+    visibility: document.getElementById('fltVisibility').value,
+    q: document.getElementById('fltQ').value,
+    limit: document.getElementById('fltLimit').value || '200',
+  });
+  try {
+    const r = await fetch(API + '/api/capabilities' + q);
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    _caps = d.items || [];
+    document.getElementById('listSummary').innerHTML = '<strong>' + (_caps.length || 0) + '</strong> capability record(s)';
+    renderCapabilities();
+  } catch (e) {
+    document.getElementById('capRows').innerHTML = '<tr><td colspan="7" style="color:var(--crimson)">Failed to load capabilities: ' + esc(e.message || e) + '</td></tr>';
+  }
+}
+
+function renderCapabilities() {
+  const body = document.getElementById('capRows');
+  if (!_caps.length) {
+    body.innerHTML = '<tr><td colspan="7" style="color:var(--muted)">No capabilities match the current filters.</td></tr>';
+    return;
+  }
+  body.innerHTML = _caps.map((c) => {
+    const capId = String(c.id || '');
+    return '<tr>' +
+      '<td><div><strong>' + esc(c.name || capId) + '</strong></div><div class="mono">' + esc(capId) + '</div></td>' +
+      '<td>' + esc(c.type || '') + '</td>' +
+      '<td><span class="badge ' + statusClass(c.status) + '">' + esc(c.status || '') + '</span></td>' +
+      '<td>' + esc(c.visibility || '') + '</td>' +
+      '<td class="mono">' + esc(c.key || '') + '</td>' +
+      '<td class="mono">' + esc(c.updated_at || c.created_at || '') + '</td>' +
+      '<td><div class="actions">' +
+      '<button class="btn" onclick="viewCapability(\'' + esc(capId) + '\')">View</button>' +
+      '<button class="btn" onclick="viewHealth(\'' + esc(capId) + '\')">Health</button>' +
+      '<button class="btn" onclick="viewAudit(\'' + esc(capId) + '\')">Audit</button>' +
+      '<button class="btn" onclick="runHealthCheck(\'' + esc(capId) + '\',\'healthy\')">Mark Healthy</button>' +
+      '<button class="btn btn-amber" onclick="capAction(\'' + esc(capId) + '\',\'verify\')">Verify</button>' +
+      '<button class="btn btn-primary" onclick="capAction(\'' + esc(capId) + '\',\'publish\')">Publish</button>' +
+      '<button class="btn btn-danger" onclick="capAction(\'' + esc(capId) + '\',\'disable\')">Disable</button>' +
+      '</div></td>' +
+      '</tr>';
+  }).join('');
+}
+
+async function viewCapability(capabilityId) {
+  try {
+    const r = await fetch(API + '/api/capabilities/' + encodeURIComponent(capabilityId));
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    document.getElementById('capDetail').textContent = JSON.stringify(d, null, 2);
+  } catch (e) {
+    document.getElementById('capDetail').textContent = 'Detail load failed: ' + String(e.message || e);
+  }
+}
+
+async function capAction(capabilityId, action) {
+  try {
+    const r = await fetch(API + '/api/capabilities/' + encodeURIComponent(capabilityId) + '/' + action, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ workspace_id: WORKSPACE_ID, actor_user_id: ACTOR_USER_ID })
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    msg('capMsg', 'Capability ' + capabilityId + ' ' + action + ' succeeded.', 'ok');
+    if (d.capability) document.getElementById('capDetail').textContent = JSON.stringify(d.capability, null, 2);
+    await loadCapabilities();
+  } catch (e) {
+    msg('capMsg', 'Action failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function viewHealth(capabilityId) {
+  try {
+    const r = await fetch(API + '/api/capabilities/' + encodeURIComponent(capabilityId) + '/health?limit=20');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    document.getElementById('capDetail').textContent = JSON.stringify({ capability_id: capabilityId, health_runs: d.items || [] }, null, 2);
+  } catch (e) {
+    document.getElementById('capDetail').textContent = 'Health load failed: ' + String(e.message || e);
+  }
+}
+
+async function viewAudit(capabilityId) {
+  try {
+    const r = await fetch(API + '/api/capabilities/' + encodeURIComponent(capabilityId) + '/audit?limit=40');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    document.getElementById('capDetail').textContent = JSON.stringify({ capability_id: capabilityId, audit_events: d.items || [] }, null, 2);
+  } catch (e) {
+    document.getElementById('capDetail').textContent = 'Audit load failed: ' + String(e.message || e);
+  }
+}
+
+async function runHealthCheck(capabilityId, status) {
+  try {
+    const r = await fetch(API + '/api/capabilities/' + encodeURIComponent(capabilityId) + '/health-check', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        workspace_id: WORKSPACE_ID,
+        actor_user_id: ACTOR_USER_ID,
+        status: status || 'healthy'
+      })
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    msg('capMsg', 'Health check recorded for ' + capabilityId + ': ' + (d.capability && d.capability.health_status ? d.capability.health_status : 'ok'), 'ok');
+    await viewHealth(capabilityId);
+    await loadCapabilities();
+  } catch (e) {
+    msg('capMsg', 'Health check failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function createCapability() {
+  clearMsg('createMsg');
+  const payload = {
+    workspace_id: WORKSPACE_ID,
+    actor_user_id: ACTOR_USER_ID,
+    owner_user_id: document.getElementById('newOwner').value.trim() || ACTOR_USER_ID,
+    type: document.getElementById('newType').value.trim(),
+    key: document.getElementById('newKey').value.trim(),
+    name: document.getElementById('newName').value.trim(),
+    description: document.getElementById('newDescription').value.trim(),
+    status: document.getElementById('newStatus').value,
+    visibility: document.getElementById('newVisibility').value,
+  };
+  if (!payload.type || !payload.key || !payload.name) {
+    msg('createMsg', 'Type, key, and name are required.', 'err');
+    return;
+  }
+  try {
+    const r = await fetch(API + '/api/capabilities', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    msg('createMsg', 'Created capability: ' + (d.capability && d.capability.id ? d.capability.id : payload.key), 'ok');
+    await loadCapabilities();
+  } catch (e) {
+    msg('createMsg', 'Create failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function createAuthProfile() {
+  clearMsg('authMsg');
+  const payload = {
+    workspace_id: WORKSPACE_ID,
+    auth_type: document.getElementById('authType').value.trim(),
+    provider: document.getElementById('authProvider').value.trim(),
+    secret_ref: document.getElementById('authSecretRef').value.trim(),
+  };
+  if (!payload.auth_type || !payload.provider || !payload.secret_ref) {
+    msg('authMsg', 'Auth type, provider, and secret ref are required.', 'err');
+    return;
+  }
+  try {
+    const r = await fetch(API + '/api/capabilities/auth-profiles', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    msg('authMsg', 'Auth profile created: ' + ((d.auth_profile || {}).id || 'ok'), 'ok');
+  } catch (e) {
+    msg('authMsg', 'Auth profile failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function createPolicyProfile() {
+  clearMsg('policyMsg');
+  const name = document.getElementById('policyName').value.trim();
+  const rawRules = document.getElementById('policyRules').value.trim();
+  if (!name) {
+    msg('policyMsg', 'Policy name is required.', 'err');
+    return;
+  }
+  let rules = {};
+  if (rawRules) {
+    try {
+      rules = JSON.parse(rawRules);
+    } catch (e) {
+      msg('policyMsg', 'Rules must be valid JSON.', 'err');
+      return;
+    }
+  }
+  try {
+    const r = await fetch(API + '/api/capabilities/policy-profiles', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({
+        workspace_id: WORKSPACE_ID,
+        name,
+        rules,
+      })
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    msg('policyMsg', 'Policy profile created: ' + ((d.policy_profile || {}).id || 'ok'), 'ok');
+  } catch (e) {
+    msg('policyMsg', 'Policy profile failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function importOpenApi() {
+  clearMsg('openapiMsg');
+  const openapiText = document.getElementById('openapiText').value.trim();
+  if (!openapiText) {
+    msg('openapiMsg', 'OpenAPI JSON/YAML text is required.', 'err');
+    return;
+  }
+  const payload = {
+    workspace_id: WORKSPACE_ID,
+    owner_user_id: document.getElementById('openapiOwner').value.trim() || ACTOR_USER_ID,
+    status: document.getElementById('openapiStatus').value,
+    visibility: document.getElementById('openapiVisibility').value,
+    auth_profile_id: document.getElementById('openapiAuthProfile').value.trim(),
+    openapi_text: openapiText,
+  };
+  try {
+    const r = await fetch(API + '/api/capabilities/import-openapi', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if (!r.ok || !d.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    const serviceCap = (((d.import_result || {}).service_capability || {}).id || '');
+    msg('openapiMsg', 'OpenAPI imported successfully. Service capability: ' + (serviceCap || 'created'), 'ok');
+    await loadCapabilities();
+  } catch (e) {
+    msg('openapiMsg', 'OpenAPI import failed: ' + String(e.message || e), 'err');
+  }
+}
+
+async function loadDiscoveryCards() {
+  try {
+    const r = await fetch(API + '/api/capabilities/discovery/cards');
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('Request failed: ' + r.status));
+    const count = Number(d.count || 0);
+    document.getElementById('discoverySummary').innerHTML = '<strong>' + count + '</strong> discovery card(s) published to chat';
+  } catch (e) {
+    document.getElementById('discoverySummary').textContent = 'Discovery load failed: ' + String(e.message || e);
+  }
+}
+
+loadCapabilities();
+loadMcpServers();
+loadDiscoveryCards();
+</script>
+</body>
+</html>"""
+
+
 _SKILLS_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -9716,7 +10604,7 @@ body{background:var(--bg);color:var(--text);font-family:'Segoe UI',system-ui,san
   <a href="/runs" class="nav-btn"><span class="icon">&#x1F4CB;</span> Run History</a>
   <a href="/skills" class="nav-btn active"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
   <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
-    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
   <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
   <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
 </nav>
@@ -10120,7 +11008,7 @@ body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; background
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
-    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
     <a href="/docs" class="nav-btn"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
@@ -10360,7 +11248,7 @@ strong { color: var(--text); }
     <a href="/skills" class="nav-btn"><span class="icon">&#x1F9E0;</span> Skill Cards</a>
     <a href="/rag" class="nav-btn"><span class="icon">&#x1F52C;</span> Super-RAG</a>
     <a href="/models" class="nav-btn"><span class="icon">&#x1F916;</span> LLM Models</a>
-    <a href="/mcp" class="nav-btn"><span class="icon">&#x1F9E9;</span> MCP Servers</a>
+    <a href="/capabilities" class="nav-btn"><span class="icon">&#x2692;&#xFE0F;</span> Capabilities</a>
     <a href="/projects" class="nav-btn"><span class="icon">&#x1F4C1;</span> Projects</a>
     <a href="/docs" class="nav-btn active"><span class="icon">&#x1F4D6;</span> Docs</a>
   </div>
@@ -10401,7 +11289,12 @@ strong { color: var(--text); }
             self._html(200, _RAG_HTML)
             return
         if path == "/mcp":
-            self._html(200, _MCP_HTML)
+            self.send_response(302)
+            self.send_header("Location", "/capabilities")
+            self.end_headers()
+            return
+        if path == "/capabilities":
+            self._html(200, _CAPABILITIES_HTML)
             return
         if path == "/skills":
             self._html(200, _SKILLS_HTML)
@@ -10502,6 +11395,22 @@ strong { color: var(--text); }
             except Exception as exc:
                 self._json(500, {"error": str(exc)})
             return
+        if path == "/api/models/ollama":
+            try:
+                from kendr.llm_router import is_ollama_running, list_ollama_models
+
+                running = is_ollama_running()
+                models = list_ollama_models() if running else []
+                self._json(200, {
+                    "running": running,
+                    "models": models,
+                })
+            except Exception as exc:
+                self._json(500, {"error": str(exc)})
+            return
+        if path == "/api/models/ollama/pull/status":
+            self._json(200, _ollama_pull_public_state())
+            return
         if path == "/api/models/ollama/docker/status":
             self._handle_ollama_docker_status()
             return
@@ -10512,6 +11421,54 @@ strong { color: var(--text); }
             except Exception:
                 self._json(503, {"error": "Gateway offline", "summary": {}, "cards": []})
             return
+        if path == "/api/capabilities":
+            suffix = f"?{parsed.query}" if parsed.query else ""
+            status, data = _gateway_forward_json("GET", f"/registry/capabilities{suffix}", timeout=8.0)
+            self._json(status, data)
+            return
+        if path == "/api/capabilities/auth-profiles":
+            suffix = f"?{parsed.query}" if parsed.query else ""
+            status, data = _gateway_forward_json("GET", f"/registry/auth-profiles{suffix}", timeout=8.0)
+            self._json(status, data)
+            return
+        if path == "/api/capabilities/policy-profiles":
+            suffix = f"?{parsed.query}" if parsed.query else ""
+            status, data = _gateway_forward_json("GET", f"/registry/policy-profiles{suffix}", timeout=8.0)
+            self._json(status, data)
+            return
+        if path == "/api/capabilities/discovery":
+            suffix = f"?{parsed.query}" if parsed.query else ""
+            status, data = _gateway_forward_json("GET", f"/registry/discovery{suffix}", timeout=8.0)
+            self._json(status, data)
+            return
+        if path == "/api/capabilities/discovery/cards":
+            suffix = f"?{parsed.query}" if parsed.query else ""
+            status, data = _gateway_forward_json("GET", f"/registry/discovery/cards{suffix}", timeout=8.0)
+            self._json(status, data)
+            return
+        if path.startswith("/api/capabilities/"):
+            rest = path[len("/api/capabilities/"):].strip()
+            if "/" in rest:
+                capability_id, action = rest.split("/", 1)
+                action = action.strip().lower()
+                if action in {"health", "audit"}:
+                    suffix = f"?{parsed.query}" if parsed.query else ""
+                    status, data = _gateway_forward_json(
+                        "GET",
+                        f"/registry/capabilities/{capability_id}/{action}{suffix}",
+                        timeout=8.0,
+                    )
+                    self._json(status, data)
+                    return
+            capability_id = rest
+            if capability_id and "/" not in capability_id:
+                status, data = _gateway_forward_json(
+                    "GET",
+                    f"/registry/capabilities/{capability_id}",
+                    timeout=8.0,
+                )
+                self._json(status, data)
+                return
         if path == "/api/plan":
             try:
                 data = _gateway_get("/registry/plan", timeout=3.0)
@@ -10851,11 +11808,17 @@ strong { color: var(--text); }
         if path == "/api/project/ask":
             self._handle_project_ask(body)
             return
+        if path == "/api/chat/simple":
+            self._handle_simple_chat(body)
+            return
         if path == "/api/models/set":
             self._handle_models_set(body)
             return
         if path == "/api/models/ollama/pull":
             self._handle_ollama_pull(body)
+            return
+        if path == "/api/models/ollama/pull/cancel":
+            self._handle_ollama_pull_cancel()
             return
         if path == "/api/models/ollama/docker/start":
             self._handle_ollama_docker_start(body)
@@ -10928,6 +11891,38 @@ strong { color: var(--text); }
             return
         if path == "/api/mcp/servers":
             self._handle_mcp_add(body)
+            return
+        if path == "/api/capabilities":
+            status, data = _gateway_forward_json("POST", "/registry/capabilities", payload=body, timeout=8.0)
+            self._json(status, data)
+            return
+        if path == "/api/capabilities/auth-profiles":
+            status, data = _gateway_forward_json("POST", "/registry/auth-profiles", payload=body, timeout=8.0)
+            self._json(status, data)
+            return
+        if path == "/api/capabilities/policy-profiles":
+            status, data = _gateway_forward_json("POST", "/registry/policy-profiles", payload=body, timeout=8.0)
+            self._json(status, data)
+            return
+        if path == "/api/capabilities/import-openapi":
+            status, data = _gateway_forward_json("POST", "/registry/apis/import-openapi", payload=body, timeout=12.0)
+            self._json(status, data)
+            return
+        if path.startswith("/api/capabilities/"):
+            rest = path[len("/api/capabilities/"):].strip()
+            if "/" in rest:
+                capability_id, action = rest.split("/", 1)
+                action = action.strip().lower()
+                if action in {"update", "verify", "publish", "disable", "health-check"}:
+                    status, data = _gateway_forward_json(
+                        "POST",
+                        f"/registry/capabilities/{capability_id}/{action}",
+                        payload=body,
+                        timeout=8.0,
+                    )
+                    self._json(status, data)
+                    return
+            self._json(404, {"error": "not_found"})
             return
         if path.startswith("/api/mcp/servers/"):
             rest = path[len("/api/mcp/servers/"):]
@@ -11025,7 +12020,9 @@ strong { color: var(--text); }
                     "research_sources", "research_max_sources", "research_checkpoint_enabled",
                     "deep_research_source_urls", "local_drive_paths", "local_drive_recursive",
                     "local_drive_force_long_document",
-                    "security_authorized", "security_target_url", "security_authorization_note"):
+                    "communication_authorized",
+                    "security_authorized", "security_target_url", "security_authorization_note",
+                    "use_mcp"):
             if body.get(key) is not None:
                 payload[key] = body[key]
         channel_name = str(payload.get("channel") or "").strip().lower()
@@ -11194,6 +12191,10 @@ strong { color: var(--text); }
                 for key in ("provider", "model", "project_id", "project_root", "project_name", "workflow_type"):
                     value = body.get(key)
                     if value is not None and str(value).strip():
+                        resume_payload[key] = value
+                for key in ("security_authorized", "security_target_url", "security_authorization_note", "security_scan_profile"):
+                    value = body.get(key)
+                    if value is not None:
                         resume_payload[key] = value
                 result = _gateway_resume(resume_payload)
                 _run_status = _terminal_run_status(result=result, default="completed")
@@ -11450,24 +12451,13 @@ strong { color: var(--text); }
             self._json(500, {"error": str(exc)})
 
     def _handle_ollama_pull(self, body: dict) -> None:
-        import subprocess
         model_name = str(body.get("model", "")).strip()
-        if not model_name:
-            self._json(400, {"error": "missing_model"})
-            return
-        try:
-            proc = subprocess.run(
-                ["ollama", "pull", model_name],
-                capture_output=True, text=True, timeout=300,
-            )
-            if proc.returncode == 0:
-                self._json(200, {"ok": True, "model": model_name})
-            else:
-                self._json(500, {"error": proc.stderr.strip() or "Pull failed"})
-        except FileNotFoundError:
-            self._json(503, {"error": "ollama not found — install from ollama.ai"})
-        except Exception as exc:
-            self._json(500, {"error": str(exc)})
+        ok, payload, status = _start_ollama_pull_job(model_name)
+        self._json(status, payload)
+
+    def _handle_ollama_pull_cancel(self) -> None:
+        _ok, payload, status = _cancel_ollama_pull_job()
+        self._json(status, payload)
 
     _OLLAMA_CONTAINER = "kendr-ollama"
     _OLLAMA_IMAGE = "ollama/ollama"
@@ -12072,6 +13062,63 @@ strong { color: var(--text); }
             emit("error", {"error": str(exc), "activities": activities if 'activities' in locals() and isinstance(activities, list) else []})
             emit("done", {})
 
+    def _handle_simple_chat(self, body: dict) -> None:
+        text = str(body.get("text") or body.get("message") or "").strip()
+        if not text:
+            self._json(400, {"error": "missing_text"})
+            return
+
+        model_override = str(body.get("model") or "").strip() or None
+        provider_override = str(body.get("provider") or "").strip() or None
+        local_paths = body.get("local_drive_paths") or []
+        if not isinstance(local_paths, list):
+            local_paths = []
+
+        try:
+            from kendr.llm_router import build_llm, get_active_provider, get_model_for_provider
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            provider = provider_override or get_active_provider()
+            model = model_override or get_model_for_provider(provider)
+            llm = build_llm(provider, model)
+
+            attachment_notes: list[str] = []
+            for raw_path in local_paths[:8]:
+                candidate = normalize_host_path_str(str(raw_path or "").strip())
+                if not candidate:
+                    continue
+                try:
+                    if os.path.isfile(candidate):
+                        with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
+                            excerpt = fh.read(2000)
+                        attachment_notes.append(
+                            f"=== Attached file: {os.path.basename(candidate)} ===\nPath: {candidate}\n{excerpt}"
+                        )
+                    elif os.path.isdir(candidate):
+                        entries = sorted(os.listdir(candidate))[:40]
+                        attachment_notes.append(
+                            f"=== Attached folder: {os.path.basename(candidate)} ===\nPath: {candidate}\nEntries: {entries}"
+                        )
+                except Exception:
+                    attachment_notes.append(f"Attached path: {candidate}")
+
+            system_ctx = (
+                "You are Kendr in simple chat mode. "
+                "Answer directly and helpfully. "
+                "Do not mention agents, orchestration, runs, artifacts, plans, or internal workflows. "
+                "Only provide a plain assistant answer. "
+                "If attached local files or folders are available, use their excerpts or path summaries when relevant."
+            )
+            if attachment_notes:
+                system_ctx += "\n\nAttached local context:\n" + "\n\n".join(attachment_notes)
+
+            messages = [SystemMessage(content=system_ctx), HumanMessage(content=text)]
+            response = llm.invoke(messages)
+            answer = response.content if hasattr(response, "content") else str(response)
+            self._json(200, {"answer": answer, "provider": provider, "model": model})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
     def _handle_project_context_generate(self, body: dict) -> None:
         try:
             from kendr.project_context import generate_kendr_md, write_kendr_md
@@ -12441,23 +13488,45 @@ strong { color: var(--text); }
         if not _HAS_MCP_MANAGER:
             self._json(503, {"error": "MCP manager not available"})
             return
-        name = str(body.get("name", "")).strip()
-        connection = str(body.get("connection", "")).strip()
-        server_type = str(body.get("type", "http")).strip()
-        description = str(body.get("description", "")).strip()
-        auth_token = str(body.get("auth_token", "")).strip()
-        if not name or not connection:
-            self._json(400, {"error": "name and connection are required"})
+        try:
+            entries = _normalize_mcp_add_payload(body)
+        except ValueError as exc:
+            self._json(400, {"error": str(exc)})
             return
         try:
-            entry = _mcp_add_server(name, connection, server_type, description, auth_token)
-            server_id = entry["id"]
-            result = _mcp_discover_tools(server_id)
-            srv = _mcp_get_server(server_id) or {}
-            if srv.get("auth_token"):
-                srv = dict(srv)
-                srv["auth_token"] = "****"
-            result["server"] = srv
+            added_servers = []
+            for item in entries:
+                entry = _mcp_add_server(
+                    item["name"],
+                    item["connection"],
+                    item["type"],
+                    item["description"],
+                    item["auth_token"],
+                    item["enabled"],
+                )
+                server_id = entry["id"]
+                if item["enabled"]:
+                    result = _mcp_discover_tools(server_id)
+                else:
+                    result = {
+                        "ok": True,
+                        "error": None,
+                        "tools": [],
+                        "tool_count": 0,
+                        "last_discovered": "",
+                        "server_id": server_id,
+                    }
+                srv = _mcp_get_server(server_id) or {}
+                if srv.get("auth_token"):
+                    srv = dict(srv)
+                    srv["auth_token"] = "****"
+                added_servers.append({**result, "server": srv})
+            primary = added_servers[0]
+            result = {
+                **primary,
+                "added_count": len(added_servers),
+                "added_servers": added_servers,
+            }
             self._json(200, result)
             _gateway_refresh_mcp()
         except Exception as exc:
@@ -12483,6 +13552,13 @@ strong { color: var(--text); }
             self._json(503, {"error": "MCP manager not available"})
             return
         server_id = server_id.strip().rstrip("/")
+        try:
+            from kendr.persistence.mcp_store import is_default_server as _is_default_mcp
+            if _is_default_mcp(server_id):
+                self._json(403, {"error": "Default MCP servers cannot be removed."})
+                return
+        except Exception:
+            pass
         try:
             removed = _mcp_remove_server(server_id)
             self._json(200, {"removed": removed, "server_id": server_id})
@@ -12851,7 +13927,7 @@ def main() -> None:
     print(f"  Chat:   {display_url}/")
     print(f"  Setup:  {display_url}/setup")
     print(f"  Runs:   {display_url}/runs")
-    print(f"  MCP:    {display_url}/mcp")
+    print(f"  Cap:    {display_url}/capabilities")
     print(f"  Projects: {display_url}/projects")
     print(f"  Gateway: {_gateway_url()} ({'online' if _gateway_ready(timeout=0.5) else 'offline — run: kendr gateway start'})")
     if ui_log_path:

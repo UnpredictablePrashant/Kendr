@@ -375,7 +375,30 @@ def unauthenticated_endpoint_audit_agent(state):
     api_surface = state.get("api_surface_map", {})
     endpoints = api_surface.get("discovered_endpoints", [])
     if not endpoints:
-        raise ValueError("unauthenticated_endpoint_audit_agent requires api_surface_map from api_surface_mapper_agent.")
+        # api_surface_mapper_agent hasn't run yet — do a minimal passive discovery
+        target = _target_base_url(state, task_content)
+        if target.startswith(("http://", "https://")):
+            doc_limit = int(state.get("security_api_doc_limit", 26))
+            for url in _candidate_api_doc_urls(target)[:doc_limit]:
+                fetched = _fetch_url(url, timeout=int(state.get("security_timeout", 20)))
+                body = fetched.get("body", "")
+                if body:
+                    try:
+                        parsed = json.loads(body)
+                        if isinstance(parsed, dict) and parsed.get("paths"):
+                            for op in _extract_openapi_operations(parsed):
+                                op["doc_url"] = url
+                                endpoints.append(op)
+                    except Exception:
+                        for op in _extract_endpoints_from_text(body):
+                            op["doc_url"] = url
+                            endpoints.append(op)
+        if not endpoints:
+            # Still nothing — emit a skipped result rather than failing
+            summary = "No API surface map available yet. unauthenticated_endpoint_audit_agent skipped — run api_surface_mapper_agent first."
+            state["unauthenticated_endpoint_report"] = {"risk_level": "unknown", "prioritized_endpoints": [], "summary": summary}
+            state["draft_response"] = summary
+            return publish_agent_output(state, "unauthenticated_endpoint_audit_agent", summary, f"unauthenticated_endpoint_report_{call_number}", recipients=["orchestrator_agent"])
 
     candidate_findings = []
     for item in endpoints[:500]:
@@ -505,7 +528,29 @@ def idor_bola_risk_agent(state):
     api_surface = state.get("api_surface_map", {})
     endpoints = api_surface.get("discovered_endpoints", [])
     if not endpoints:
-        raise ValueError("idor_bola_risk_agent requires api_surface_map from api_surface_mapper_agent.")
+        # api_surface_mapper_agent hasn't run yet — do a minimal passive discovery
+        target = _target_base_url(state, task_content)
+        if target.startswith(("http://", "https://")):
+            doc_limit = int(state.get("security_api_doc_limit", 26))
+            for url in _candidate_api_doc_urls(target)[:doc_limit]:
+                fetched = _fetch_url(url, timeout=int(state.get("security_timeout", 20)))
+                body = fetched.get("body", "")
+                if body:
+                    try:
+                        parsed = json.loads(body)
+                        if isinstance(parsed, dict) and parsed.get("paths"):
+                            for op in _extract_openapi_operations(parsed):
+                                op["doc_url"] = url
+                                endpoints.append(op)
+                    except Exception:
+                        for op in _extract_endpoints_from_text(body):
+                            op["doc_url"] = url
+                            endpoints.append(op)
+        if not endpoints:
+            summary = "No API surface map available yet. idor_bola_risk_agent skipped — run api_surface_mapper_agent first."
+            state["idor_bola_risk_report"] = {"risk_level": "unknown", "idor_candidates": [], "summary": summary}
+            state["draft_response"] = summary
+            return publish_agent_output(state, "idor_bola_risk_agent", summary, f"idor_bola_risk_result_{call_number}", recipients=["orchestrator_agent"])
 
     object_patterns = re.compile(r"(\{[^}]*id[^}]*\}|/[0-9]+|/[a-f0-9-]{8,}|/users?/|/accounts?/|/files?/|/documents?/|/messages?/|/workspaces?/|/agents?/)", re.IGNORECASE)
     candidates = []

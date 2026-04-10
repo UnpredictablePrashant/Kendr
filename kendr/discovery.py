@@ -177,6 +177,12 @@ def _register_mcp_tools(registry: Registry) -> None:
     best-effort at build_registry() time.
     """
     try:
+        from kendr.capability_sync import sync_mcp_capabilities
+        sync_mcp_capabilities(workspace_id="default", actor_user_id="system:discovery")
+    except Exception:
+        pass
+
+    try:
         from kendr.mcp_manager import list_servers as _mcp_list_servers
     except Exception:
         return
@@ -271,10 +277,22 @@ def _register_mcp_tools(registry: Registry) -> None:
                             tool_input = candidate
 
                     async def _call():
+                        import shlex as _shlex
                         client_kwargs: dict = {}
-                        if stype != "stdio" and tok:
-                            client_kwargs = {"headers": {"Authorization": f"Bearer {tok}"}}
-                        async with _MCPClient(conn, timeout=30, **client_kwargs) as client:
+                        if stype == "stdio":
+                            from fastmcp.client.transports.stdio import StdioTransport as _StdioTransport
+                            try:
+                                parts = _shlex.split(conn)
+                            except Exception:
+                                parts = conn.split()
+                            if not parts:
+                                parts = [conn]
+                            transport = _StdioTransport(command=parts[0], args=parts[1:])
+                        else:
+                            transport = conn
+                            if tok:
+                                client_kwargs = {"headers": {"Authorization": f"Bearer {tok}"}}
+                        async with _MCPClient(transport, timeout=30, **client_kwargs) as client:
                             return await client.call_tool(tname, tool_input)
 
                     try:

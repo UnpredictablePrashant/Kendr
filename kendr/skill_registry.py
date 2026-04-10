@@ -310,13 +310,39 @@ class SkillRegistry:
         for c in self._cards:
             if c.is_active and not c.needs_config:
                 by_cat[c.category] = by_cat.get(c.category, 0) + 1
+        user_skills = _get_installed_user_skills()
         return {
             "total": len(self._cards),
             "active": active,
             "needs_config": needs_config,
             "inactive": inactive + needs_config,
             "by_category": by_cat,
+            "installed_user_skills": len(user_skills),
         }
+
+    def user_skills_prompt_block(self) -> str:
+        """Return a text block describing installed user skills for injection into agent prompts."""
+        skills = _get_installed_user_skills()
+        if not skills:
+            return ""
+        lines = ["## Installed Custom Skills\n",
+                 "You can invoke these skills by calling `execute_skill(slug, inputs)`:\n"]
+        for s in skills:
+            kind = s.get("skill_type", "")
+            icon = s.get("icon", "⚡")
+            desc = (s.get("description", "") or "").strip()
+            slug = s.get("slug", "")
+            lines.append(f"- {icon} **{s['name']}** (`{slug}`, type={kind}): {desc}")
+        return "\n".join(lines)
+
+
+def _get_installed_user_skills() -> list[dict]:
+    """Fetch installed user skills from persistence (fails silently if DB not ready)."""
+    try:
+        from kendr.persistence.skill_store import list_user_skills
+        return list_user_skills(is_installed=True)
+    except Exception:
+        return []
 
 
 def build_skill_registry(registry: "Registry") -> SkillRegistry:

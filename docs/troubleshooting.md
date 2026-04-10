@@ -96,6 +96,36 @@ If a security feature is missing, confirm both:
 - scope and authorization flags are present
 - local tooling is installed or auto-install is enabled
 
+## Communication Agent Dispatch Loop / Authorization Error
+
+If a run ends with:
+
+- `Agent 'communication_summary_agent' appears stuck in a dispatch loop`
+- `Communication agents require explicit authorization`
+
+the runtime safety policy blocked communication access and the circuit breaker stopped retries.
+
+Use one of these fixes:
+
+1. You actually want inbox/messaging access and disabled it explicitly:
+
+```bash
+kendr run --communication-authorized "Check my latest Gmail and Slack messages."
+```
+
+2. You only wanted capability/skill listing (not message access):
+
+```bash
+kendr agents list
+curl http://127.0.0.1:8790/registry/skills
+```
+
+3. You are using gateway/state payloads directly:
+
+- `communication_authorized` now defaults to `true`
+- set `communication_authorized=false` for runs/workspaces that should not touch inbox or messaging data
+- set `KENDR_COMMUNICATION_AUTHORIZED=false` to change the global default in CLI, web, and Electron-backed runtimes
+
 ## Verification Caveats
 
 The current repo documents these limits:

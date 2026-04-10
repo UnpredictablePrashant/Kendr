@@ -193,6 +193,71 @@ class TestUIStepFormatting(unittest.TestCase):
         self.assertIn("Connection error", formatted["failure_reason"])
 
 
+class TestMcpAddPayloadNormalization(unittest.TestCase):
+    def test_normalizes_fastmcp_json_config(self):
+        import kendr.ui_server as ui_server
+
+        payload = {
+            "config_json": json.dumps({
+                "mcpServers": {
+                    "aws-knowledge-mcp-server": {
+                        "command": "uvx",
+                        "args": ["fastmcp", "run", "https://knowledge-mcp.global.api.aws"],
+                    }
+                }
+            })
+        }
+
+        entries = ui_server._normalize_mcp_add_payload(payload)
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["name"], "aws-knowledge-mcp-server")
+        self.assertEqual(entries[0]["type"], "http")
+        self.assertEqual(
+            entries[0]["connection"],
+            "https://knowledge-mcp.global.api.aws",
+        )
+        self.assertTrue(entries[0]["enabled"])
+
+    def test_normalizes_kiro_json_config_and_preserves_disabled_state(self):
+        import kendr.ui_server as ui_server
+
+        entries = ui_server._normalize_mcp_add_payload({
+            "mcpServers": {
+                "aws-knowledge-mcp-server": {
+                    "url": "https://knowledge-mcp.global.api.aws",
+                    "type": "http",
+                    "disabled": True,
+                }
+            }
+        })
+
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["name"], "aws-knowledge-mcp-server")
+        self.assertEqual(entries[0]["type"], "http")
+        self.assertEqual(entries[0]["connection"], "https://knowledge-mcp.global.api.aws")
+        self.assertFalse(entries[0]["enabled"])
+
+
+class TestMcpManagerEnabledFlag(unittest.TestCase):
+    def test_add_server_passes_enabled_to_store(self):
+        import kendr.mcp_manager as mcp_manager
+
+        with (
+            patch("kendr.persistence.mcp_store.add_mcp_server", return_value={"id": "srv-1", "enabled": False}) as mock_add,
+            patch("kendr.capability_sync.sync_mcp_capabilities"),
+        ):
+            result = mcp_manager.add_server(
+                name="Test Server",
+                connection="https://example.com/mcp",
+                enabled=False,
+            )
+
+        self.assertEqual(result["id"], "srv-1")
+        self.assertFalse(result["enabled"])
+        self.assertEqual(mock_add.call_args.kwargs["enabled"], False)
+
+
 class TestProjectActivityFormatting(unittest.TestCase):
     def test_project_activity_event_includes_actor_and_duration(self):
         import kendr.ui_server as ui_server
@@ -1051,6 +1116,138 @@ class TestUIModelInventory(unittest.TestCase):
         self.assertEqual(body.get("active_provider"), "openai")
         self.assertEqual(body.get("active_model"), "gpt-5.1")
 
+    def test_ollama_models_endpoint_returns_pulled_models(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        with (
+            patch("kendr.llm_router.is_ollama_running", return_value=True),
+            patch("kendr.llm_router.list_ollama_models", return_value=[
+                {"name": "llama3.2", "size": 2013265920},
+            ]),
+        ):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+            _, port = srv.server_address
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=3)
+                conn.request("GET", "/api/models/ollama")
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+            finally:
+                srv.server_close()
+                t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(body.get("running"))
+        self.assertEqual(body.get("models"), [{"name": "llama3.2", "size": 2013265920}])
+
+    def test_ollama_pull_status_endpoint_returns_progress_snapshot(self):
+        from kendr.ui_server import KendrUIHandler
+
+        snapshot = {
+            "active": True,
+            "status": "running",
+            "model": "gemma4",
+            "completed": 512,
+            "total": 1024,
+            "percent": 50.0,
+            "message": "downloading",
+            "error": "",
+            "cancellable": True,
+        }
+        with patch("kendr.ui_server._ollama_pull_public_state", return_value=snapshot):
+            handler = KendrUIHandler.__new__(KendrUIHandler)
+            handler.path = "/api/models/ollama/pull/status"
+            handler.headers = {}
+            handler.rfile = io.BytesIO()
+            handler.wfile = io.BytesIO()
+            handler.client_address = ("127.0.0.1", 0)
+            handler.server = None
+            handler.command = "GET"
+            handler._json = MagicMock()
+            handler.do_GET()
+
+        handler._json.assert_called_once_with(200, snapshot)
+
+    def test_ollama_pull_endpoint_starts_background_pull(self):
+        from kendr.ui_server import KendrUIHandler
+
+        payload = {
+            "ok": True,
+            "pull": {"active": True, "status": "starting", "model": "gemma4"},
+        }
+        with patch("kendr.ui_server._start_ollama_pull_job", return_value=(True, payload, 202)):
+            raw = json.dumps({"model": "gemma4"}).encode("utf-8")
+            handler = KendrUIHandler.__new__(KendrUIHandler)
+            handler.path = "/api/models/ollama/pull"
+            handler.headers = {"Content-Length": str(len(raw)), "Content-Type": "application/json"}
+            handler.rfile = io.BytesIO(raw)
+            handler.wfile = io.BytesIO()
+            handler.client_address = ("127.0.0.1", 0)
+            handler.server = None
+            handler.command = "POST"
+            handler._json = MagicMock()
+            handler.do_POST()
+
+        handler._json.assert_called_once_with(202, payload)
+
+    def test_ollama_pull_cancel_endpoint_cancels_active_pull(self):
+        from kendr.ui_server import KendrUIHandler
+
+        payload = {
+            "ok": True,
+            "pull": {"active": True, "status": "cancelling", "model": "gemma4"},
+        }
+        with patch("kendr.ui_server._cancel_ollama_pull_job", return_value=(True, payload, 200)):
+            raw = b"{}"
+            handler = KendrUIHandler.__new__(KendrUIHandler)
+            handler.path = "/api/models/ollama/pull/cancel"
+            handler.headers = {"Content-Length": str(len(raw)), "Content-Type": "application/json"}
+            handler.rfile = io.BytesIO(raw)
+            handler.wfile = io.BytesIO()
+            handler.client_address = ("127.0.0.1", 0)
+            handler.server = None
+            handler.command = "POST"
+            handler._json = MagicMock()
+            handler.do_POST()
+
+        handler._json.assert_called_once_with(200, payload)
+
+
+class TestOllamaPullProgressHelpers(unittest.TestCase):
+    def test_apply_ollama_pull_event_updates_progress_and_completion(self):
+        import kendr.ui_server as ui_server
+
+        with ui_server._ollama_pull_lock:
+            original = dict(ui_server._ollama_pull_state)
+            ui_server._ollama_pull_state.clear()
+            ui_server._ollama_pull_state.update({
+                "active": True,
+                "status": "running",
+                "model": "gemma4",
+                "completed": 0,
+                "total": 0,
+                "message": "",
+                "error": "",
+                "cancel_requested": False,
+            })
+        try:
+            mid = ui_server._apply_ollama_pull_event({"status": "pulling", "completed": 256, "total": 1024})
+            done = ui_server._apply_ollama_pull_event({"status": "success", "completed": 1024, "total": 1024})
+        finally:
+            with ui_server._ollama_pull_lock:
+                ui_server._ollama_pull_state.clear()
+                ui_server._ollama_pull_state.update(original)
+
+        self.assertEqual(mid.get("status"), "running")
+        self.assertEqual(mid.get("percent"), 25.0)
+        self.assertEqual(done.get("status"), "completed")
+        self.assertFalse(done.get("active"))
+        self.assertEqual(done.get("percent"), 100.0)
+
 
 class TestUIChatPayloads(unittest.TestCase):
     def test_chat_endpoint_forwards_provider_and_model_to_runtime_payload(self):
@@ -1094,6 +1291,49 @@ class TestUIChatPayloads(unittest.TestCase):
         self.assertTrue(body.get("streaming"))
         self.assertEqual(captured["payload"]["provider"], "openai")
         self.assertEqual(captured["payload"]["model"], "gpt-5.1")
+
+    def test_simple_chat_endpoint_returns_direct_answer_without_runtime(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        class _LLM:
+            def invoke(self, messages):
+                class _Resp:
+                    content = "Direct answer"
+                return _Resp()
+
+        with (
+            patch("kendr.llm_router.get_active_provider", return_value="ollama"),
+            patch("kendr.llm_router.get_model_for_provider", return_value="llama3.2"),
+            patch("kendr.llm_router.build_llm", return_value=_LLM()),
+        ):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+            _, port = srv.server_address
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=3)
+                payload = json.dumps({
+                    "text": "Hi",
+                    "local_drive_paths": [],
+                }).encode()
+                conn.request(
+                    "POST",
+                    "/api/chat/simple",
+                    body=payload,
+                    headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+            finally:
+                srv.server_close()
+                t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body.get("answer"), "Direct answer")
+        self.assertEqual(body.get("provider"), "ollama")
+        self.assertEqual(body.get("model"), "llama3.2")
 
     def test_webchat_does_not_auto_inject_active_project_context(self):
         from kendr.ui_server import KendrUIHandler
@@ -1501,6 +1741,196 @@ class TestDeepResearchChatPayload(unittest.TestCase):
         )
         persist_user.assert_called_once()
         persist_result.assert_called_once()
+
+
+class TestUICapabilitiesSurface(unittest.TestCase):
+    def test_capabilities_html_includes_registry_actions(self):
+        import kendr.ui_server as ui_server
+
+        self.assertIn("Capability Studio", ui_server._CAPABILITIES_HTML)
+        self.assertIn("/api/capabilities", ui_server._CAPABILITIES_HTML)
+        self.assertIn("createCapability()", ui_server._CAPABILITIES_HTML)
+        self.assertIn("importOpenApi()", ui_server._CAPABILITIES_HTML)
+        self.assertIn("addMcpServer()", ui_server._CAPABILITIES_HTML)
+
+    def test_capabilities_route_serves_page(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+        _, port = srv.server_address
+        t = threading.Thread(target=srv.handle_request, daemon=True)
+        t.start()
+
+        try:
+            conn = HTTPConnection("127.0.0.1", port, timeout=3)
+            conn.request("GET", "/capabilities")
+            resp = conn.getresponse()
+            body = resp.read().decode("utf-8", errors="replace")
+            conn.close()
+        finally:
+            srv.server_close()
+            t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertIn("Capability Studio", body)
+
+    def test_mcp_route_redirects_to_capabilities(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+        _, port = srv.server_address
+        t = threading.Thread(target=srv.handle_request, daemon=True)
+        t.start()
+
+        try:
+            conn = HTTPConnection("127.0.0.1", port, timeout=3)
+            conn.request("GET", "/mcp")
+            resp = conn.getresponse()
+            location = resp.getheader("Location")
+            resp.read()
+            conn.close()
+        finally:
+            srv.server_close()
+            t.join(timeout=3)
+
+        self.assertEqual(resp.status, 302)
+        self.assertEqual(location, "/capabilities")
+
+    def test_api_capabilities_get_forwards_to_gateway_registry(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        calls = []
+
+        def _forward(method, path, payload=None, timeout=5.0):
+            calls.append((method, path, payload))
+            return 200, {"workspace_id": "default", "count": 0, "items": []}
+
+        with patch("kendr.ui_server._gateway_forward_json", side_effect=_forward):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+            _, port = srv.server_address
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=3)
+                conn.request("GET", "/api/capabilities?status=active&limit=10")
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+            finally:
+                srv.server_close()
+                t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body.get("count"), 0)
+        self.assertEqual(calls[0][0], "GET")
+        self.assertEqual(calls[0][1], "/registry/capabilities?status=active&limit=10")
+
+    def test_api_capabilities_verify_forwards_to_gateway_registry(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        calls = []
+
+        def _forward(method, path, payload=None, timeout=5.0):
+            calls.append((method, path, payload))
+            return 200, {"ok": True, "capability": {"id": "cap-1", "status": "verified"}}
+
+        with patch("kendr.ui_server._gateway_forward_json", side_effect=_forward):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+            _, port = srv.server_address
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=3)
+                payload = json.dumps({"workspace_id": "default", "actor_user_id": "ui:test"}).encode()
+                conn.request(
+                    "POST",
+                    "/api/capabilities/cap-1/verify",
+                    body=payload,
+                    headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+            finally:
+                srv.server_close()
+                t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(calls[0][0], "POST")
+        self.assertEqual(calls[0][1], "/registry/capabilities/cap-1/verify")
+        self.assertEqual(calls[0][2].get("actor_user_id"), "ui:test")
+
+    def test_api_capabilities_health_get_forwards_to_gateway_registry(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        calls = []
+
+        def _forward(method, path, payload=None, timeout=5.0):
+            calls.append((method, path, payload))
+            return 200, {"workspace_id": "default", "capability_id": "cap-1", "count": 1, "items": [{"status": "healthy"}]}
+
+        with patch("kendr.ui_server._gateway_forward_json", side_effect=_forward):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+            _, port = srv.server_address
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=3)
+                conn.request("GET", "/api/capabilities/cap-1/health?limit=20")
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+            finally:
+                srv.server_close()
+                t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body.get("count"), 1)
+        self.assertEqual(calls[0][0], "GET")
+        self.assertEqual(calls[0][1], "/registry/capabilities/cap-1/health?limit=20")
+
+    def test_api_capabilities_policy_post_forwards_to_gateway_registry(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        calls = []
+
+        def _forward(method, path, payload=None, timeout=5.0):
+            calls.append((method, path, payload))
+            return 200, {"ok": True, "policy_profile": {"id": "pp-1"}}
+
+        with patch("kendr.ui_server._gateway_forward_json", side_effect=_forward):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+            _, port = srv.server_address
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=3)
+                payload = json.dumps({"workspace_id": "default", "name": "readonly-policy", "rules": {"deny_write": True}}).encode()
+                conn.request(
+                    "POST",
+                    "/api/capabilities/policy-profiles",
+                    body=payload,
+                    headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+            finally:
+                srv.server_close()
+                t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(calls[0][0], "POST")
+        self.assertEqual(calls[0][1], "/registry/policy-profiles")
+        self.assertEqual(calls[0][2].get("name"), "readonly-policy")
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ _PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     PROVIDER_OPENAI: "gpt-4o-mini",
     PROVIDER_ANTHROPIC: "claude-haiku-4-5",
     PROVIDER_GOOGLE: "gemini-2.0-flash",
-    PROVIDER_XAI: "grok-3",
+    PROVIDER_XAI: "grok-4",
     PROVIDER_MINIMAX: "MiniMax-M2",
     PROVIDER_QWEN: "qwen-plus",
     PROVIDER_GLM: "glm-4",
@@ -102,7 +102,7 @@ _PROVIDER_RELEASE_MODELS: dict[str, list[str]] = {
     PROVIDER_OPENAI: ["gpt-5", "gpt-5.1", "gpt-5-mini", "gpt-4o", "gpt-4o-mini", "o3"],
     PROVIDER_ANTHROPIC: ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
     PROVIDER_GOOGLE: ["gemini-2.5-pro", "gemini-2.0-flash", "gemini-1.5-pro"],
-    PROVIDER_XAI: ["grok-3", "grok-3-mini", "grok-2"],
+    PROVIDER_XAI: ["grok-4", "grok-4.20-beta-latest-non-reasoning", "grok-4-1-fast-reasoning"],
     PROVIDER_MINIMAX: ["MiniMax-M2", "image-01"],
     PROVIDER_QWEN: ["qwen-max", "qwen-plus", "qwen-turbo"],
     PROVIDER_GLM: ["glm-5", "glm-4", "glm-4-flash"],
@@ -116,6 +116,43 @@ _PROVIDER_RELEASE_MODELS: dict[str, list[str]] = {
     ],
     PROVIDER_CUSTOM: [],
 }
+
+_PROVIDER_MODEL_BADGE_CANDIDATES: dict[str, dict[str, list[str]]] = {
+    PROVIDER_OPENAI: {
+        "latest": ["gpt-5.4", "gpt-5.4-pro", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.1", "gpt-5"],
+        "best": ["gpt-5.4", "gpt-5.4-pro", "gpt-5.1", "gpt-5", "o3"],
+        "cheapest": ["gpt-5-nano", "gpt-5.4-nano", "gpt-4.1-nano", "gpt-4o-mini"],
+    },
+    PROVIDER_XAI: {
+        "latest": ["grok-4.20-beta-latest-non-reasoning", "grok-4"],
+        "best": ["grok-4.20-beta-latest-non-reasoning", "grok-4", "grok-4-1-fast-reasoning"],
+        "cheapest": ["grok-4-1-fast-reasoning", "grok-4"],
+    },
+    PROVIDER_ANTHROPIC: {
+        "best": ["claude-opus-4-6", "claude-sonnet-4-6"],
+        "cheapest": ["claude-haiku-4-5"],
+    },
+    PROVIDER_GOOGLE: {
+        "best": ["gemini-2.5-pro"],
+        "cheapest": ["gemini-2.0-flash"],
+    },
+}
+
+_MODEL_CAPABILITY_RULES: list[tuple[str, dict[str, bool]]] = [
+    ("gpt-5", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("gpt-4o", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": False}),
+    ("o3", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("claude", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("gemini", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("grok-4.20", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("grok-4-1-fast-reasoning", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("grok-4", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("grok", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("llama", {"tool_calling": True, "vision": False, "structured_output": False, "reasoning": False}),
+    ("mistral", {"tool_calling": True, "vision": False, "structured_output": False, "reasoning": False}),
+    ("qwen", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+    ("glm", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
+]
 
 # OpenAI-compatible base URLs per provider (None means use provider SDK)
 _PROVIDER_BASE_URLS: dict[str, str] = {
@@ -152,7 +189,8 @@ _CONTEXT_WINDOWS: dict[str, int] = {
     "gemini-1.5-pro": 2097152,
     "gemini-1.5-flash": 1048576,
     "gemini": 1048576,
-    "grok-3": 131072,
+    "grok-4.20": 2000000,
+    "grok-4": 2000000,
     "grok": 131072,
     "llama3": 131072,
     "llama": 131072,
@@ -171,6 +209,20 @@ def get_context_window(model: str) -> int:
         if key in m:
             return size
     return 128000
+
+
+def get_model_capabilities(model: str) -> dict[str, bool]:
+    name = str(model or "").strip().lower()
+    default = {
+        "tool_calling": False,
+        "vision": False,
+        "structured_output": False,
+        "reasoning": False,
+    }
+    for needle, capabilities in _MODEL_CAPABILITY_RULES:
+        if needle in name:
+            return {**default, **capabilities}
+    return default
 
 
 # ── provider detection ────────────────────────────────────────────────────────
@@ -251,6 +303,85 @@ def _merge_model_choices(*groups: list[str]) -> list[str]:
     return merged
 
 
+def _get_remote_model_inventory(provider: str) -> tuple[list[str], str]:
+    provider = str(provider or "").strip().lower()
+    if provider not in {
+        PROVIDER_OPENAI,
+        PROVIDER_XAI,
+        PROVIDER_MINIMAX,
+        PROVIDER_QWEN,
+        PROVIDER_GLM,
+        PROVIDER_OPENROUTER,
+        PROVIDER_CUSTOM,
+    }:
+        return [], ""
+
+    api_key = get_api_key(provider)
+    if provider != PROVIDER_CUSTOM and not api_key:
+        return [], ""
+
+    try:
+        if provider == PROVIDER_XAI:
+            import requests
+
+            base_url = get_base_url(provider).rstrip("/")
+            response = requests.get(
+                f"{base_url}/models",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=5,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            items = payload.get("data") if isinstance(payload, dict) else payload
+            ids = [str((item or {}).get("id", "")).strip() for item in (items or []) if isinstance(item, dict)]
+            return [item for item in ids if item], ""
+
+        from openai import OpenAI
+
+        init: dict[str, Any] = {"timeout": 5.0}
+        if api_key:
+            init["api_key"] = api_key
+        base_url = get_base_url(provider)
+        if base_url:
+            init["base_url"] = base_url
+
+        client = OpenAI(**init)
+        response = client.models.list()
+        data = getattr(response, "data", None)
+        items = data if isinstance(data, list) else list(response)
+        ids = [str(getattr(item, "id", "") or "").strip() for item in items]
+        return [item for item in ids if item], ""
+    except Exception as exc:
+        return [], str(exc).strip() or "Failed to fetch models"
+
+
+def _sort_model_choices(provider: str, models: list[str]) -> list[str]:
+    preferred = list(_PROVIDER_RELEASE_MODELS.get(provider, []))
+    preferred_index = {name: idx for idx, name in enumerate(preferred)}
+    seen = _merge_model_choices(models)
+    return sorted(
+        seen,
+        key=lambda item: (
+            0 if item in preferred_index else 1,
+            preferred_index.get(item, 10_000),
+            item.lower(),
+        ),
+    )
+
+
+def _model_badges_for_provider(provider: str, models: list[str]) -> dict[str, list[str]]:
+    available = {str(item or "").strip() for item in models if str(item or "").strip()}
+    badges: dict[str, list[str]] = {}
+
+    for badge, candidates in _PROVIDER_MODEL_BADGE_CANDIDATES.get(provider, {}).items():
+        for candidate in candidates:
+            if candidate in available:
+                badges.setdefault(candidate, []).append(badge)
+                break
+
+    return badges
+
+
 def selectable_models_for_provider(provider: str) -> list[str]:
     provider = str(provider or "").strip().lower()
     if provider == PROVIDER_OLLAMA:
@@ -263,7 +394,8 @@ def selectable_models_for_provider(provider: str) -> list[str]:
         return [current] if current else []
     if not provider_status(provider).get("ready"):
         return []
-    return known_models_for_provider(provider)
+    remote, _ = _get_remote_model_inventory(provider)
+    return _sort_model_choices(provider, _merge_model_choices(remote, [get_model_for_provider(provider)], known_models_for_provider(provider)))
 
 
 # ── Ollama health check ───────────────────────────────────────────────────────
@@ -330,15 +462,28 @@ def provider_status(provider: str) -> dict:
             "note": "Configured" if url else "Set CUSTOM_LLM_BASE_URL",
         }
 
+    remote_models, remote_error = _get_remote_model_inventory(provider) if has_key else ([], "")
+    selectable = _sort_model_choices(
+        provider,
+        _merge_model_choices(remote_models, [model], known_models_for_provider(provider)),
+    ) if has_key else []
+
     return {
         "provider": provider,
         "ready": has_key,
         "has_key": has_key,
         "base_url": base_url,
         "model": model,
-        "selectable_models": _merge_model_choices([model], known_models_for_provider(provider)) if has_key else [],
+        "model_capabilities": get_model_capabilities(model),
+        "selectable_models": selectable,
         "api_key_env": api_key_env,
-        "note": "API key configured" if has_key else f"Set {api_key_env}",
+        "model_badges": _model_badges_for_provider(provider, selectable) if has_key else {},
+        "model_fetch_error": remote_error,
+        "note": (
+            f"Error fetching models: {remote_error}"
+            if remote_error
+            else ("API key configured" if has_key else f"Set {api_key_env}")
+        ),
     }
 
 

@@ -31,11 +31,74 @@ from kendr.persistence import (
 )
 from kendr.persistence.run_store import scan_manifest_runs
 from kendr.recovery import discover_resume_candidates, load_resume_candidate
+from kendr.capability_registry import CapabilityRegistryService
+from kendr.capability_sync import sync_mcp_capabilities
+from kendr.openapi_importer import import_openapi_as_capabilities, parse_openapi_payload
+from kendr.skill_manager import (
+    get_marketplace,
+    install_catalog_skill,
+    uninstall_catalog_skill,
+    create_custom_skill,
+    edit_custom_skill,
+    remove_custom_skill,
+    test_skill,
+)
+from kendr.persistence import get_user_skill, list_user_skills
 
 
 REGISTRY = build_registry()
 RUNTIME = AgentRuntime(REGISTRY)
 SKILL_REGISTRY = RUNTIME.skill_registry
+CAPABILITY_REGISTRY = CapabilityRegistryService()
+
+
+def _workspace_id_from_query(parsed) -> str:
+    params = parse_qs(parsed.query or "")
+    workspace_id = str((params.get("workspace_id") or params.get("workspace") or ["default"])[0] or "default").strip()
+    return workspace_id or "default"
+
+
+def _capability_discovery_snapshot(workspace_id: str) -> dict:
+    sync_result = sync_mcp_capabilities(workspace_id=workspace_id, actor_user_id="system:gateway-discovery")
+    capabilities = CAPABILITY_REGISTRY.list(workspace_id=workspace_id, limit=5000)
+    active = [c for c in capabilities if str(c.get("status", "")).strip().lower() == "active"]
+    by_type: dict[str, int] = {}
+    for item in capabilities:
+        ctype = str(item.get("type", "unknown")).strip() or "unknown"
+        by_type[ctype] = by_type.get(ctype, 0) + 1
+    return {
+        "workspace_id": workspace_id,
+        "summary": {
+            "total": len(capabilities),
+            "active": len(active),
+            "by_type": by_type,
+        },
+        "sync": sync_result,
+        "capabilities": capabilities,
+        "skill_registry_summary": SKILL_REGISTRY.summary(),
+    }
+
+
+def _capability_discovery_cards(workspace_id: str) -> list[dict]:
+    snapshot = _capability_discovery_snapshot(workspace_id)
+    cards = []
+    for item in snapshot.get("capabilities", []):
+        cards.append(
+            {
+                "id": item.get("id"),
+                "type": item.get("type"),
+                "key": item.get("key"),
+                "name": item.get("name"),
+                "description": item.get("description"),
+                "status": item.get("status"),
+                "health_status": item.get("health_status"),
+                "visibility": item.get("visibility"),
+                "version": item.get("version"),
+                "tags": item.get("tags", []),
+                "metadata": item.get("metadata", {}),
+            }
+        )
+    return cards
 
 
 def _task_session_summary(task_session: dict | None) -> dict:
@@ -150,6 +213,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(page)
 
+    def _read_json_body(self) -> tuple[dict | None, str]:
+        try:
+            content_length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(content_length)
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+            if not isinstance(payload, dict):
+                return None, "JSON body must be an object."
+            return payload, ""
+        except Exception as exc:
+            return None, str(exc)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -164,7 +238,92 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(200, {
                 "summary": summary,
                 "cards": [c.to_dict() for c in cards],
+                "user_skills_prompt": SKILL_REGISTRY.user_skills_prompt_block(),
             })
+            return
+        if parsed.path == "/registry/auth-profiles":
+            workspace_id = _workspace_id_from_query(parsed)
+            params = parse_qs(parsed.query or "")
+            provider = str((params.get("provider") or [""])[0] or "").strip()
+            limit = int(str((params.get("limit") or ["200"])[0] or "200"))
+            items = CAPABILITY_REGISTRY.list_auth_profiles(
+                workspace_id=workspace_id,
+                provider=provider,
+                limit=max(1, min(limit, 1000)),
+            )
+            self._send_json(200, {"workspace_id": workspace_id, "count": len(items), "items": items})
+            return
+        if parsed.path == "/registry/policy-profiles":
+            workspace_id = _workspace_id_from_query(parsed)
+            params = parse_qs(parsed.query or "")
+            limit = int(str((params.get("limit") or ["200"])[0] or "200"))
+            items = CAPABILITY_REGISTRY.list_policy_profiles(
+                workspace_id=workspace_id,
+                limit=max(1, min(limit, 1000)),
+            )
+            self._send_json(200, {"workspace_id": workspace_id, "count": len(items), "items": items})
+            return
+        if parsed.path == "/registry/capabilities":
+            workspace_id = _workspace_id_from_query(parsed)
+            params = parse_qs(parsed.query or "")
+            capability_type = str((params.get("type") or [""])[0] or "").strip()
+            status = str((params.get("status") or [""])[0] or "").strip()
+            visibility = str((params.get("visibility") or [""])[0] or "").strip()
+            search = str((params.get("q") or [""])[0] or "").strip()
+            limit = int(str((params.get("limit") or ["200"])[0] or "200"))
+            items = CAPABILITY_REGISTRY.list(
+                workspace_id=workspace_id,
+                capability_type=capability_type,
+                status=status,
+                visibility=visibility,
+                search=search,
+                limit=max(1, min(limit, 5000)),
+            )
+            self._send_json(200, {"workspace_id": workspace_id, "count": len(items), "items": items})
+            return
+        if parsed.path.startswith("/registry/capabilities/"):
+            suffix = parsed.path.split("/registry/capabilities/", 1)[1].strip()
+            capability_id, action = (suffix.split("/", 1) + [""])[:2] if "/" in suffix else (suffix, "")
+            capability_id = capability_id.strip()
+            action = action.strip().lower()
+            if not capability_id:
+                self._send_json(400, {"error": "missing_capability_id"})
+                return
+            workspace_id = _workspace_id_from_query(parsed)
+            params = parse_qs(parsed.query or "")
+            if action == "health":
+                limit = int(str((params.get("limit") or ["50"])[0] or "50"))
+                runs = CAPABILITY_REGISTRY.list_health_runs(
+                    workspace_id=workspace_id,
+                    capability_id=capability_id,
+                    limit=max(1, min(limit, 1000)),
+                )
+                self._send_json(200, {"workspace_id": workspace_id, "capability_id": capability_id, "count": len(runs), "items": runs})
+                return
+            if action == "audit":
+                limit = int(str((params.get("limit") or ["100"])[0] or "100"))
+                events = CAPABILITY_REGISTRY.list_audit_events(
+                    workspace_id=workspace_id,
+                    capability_id=capability_id,
+                    action=str((params.get("action") or [""])[0] or "").strip(),
+                    limit=max(1, min(limit, 2000)),
+                )
+                self._send_json(200, {"workspace_id": workspace_id, "capability_id": capability_id, "count": len(events), "items": events})
+                return
+            item = CAPABILITY_REGISTRY.get(capability_id)
+            if not item:
+                self._send_json(404, {"error": "capability_not_found", "capability_id": capability_id})
+                return
+            self._send_json(200, item)
+            return
+        if parsed.path == "/registry/discovery":
+            workspace_id = _workspace_id_from_query(parsed)
+            self._send_json(200, _capability_discovery_snapshot(workspace_id))
+            return
+        if parsed.path == "/registry/discovery/cards":
+            workspace_id = _workspace_id_from_query(parsed)
+            cards = _capability_discovery_cards(workspace_id)
+            self._send_json(200, {"workspace_id": workspace_id, "cards": cards, "count": len(cards)})
             return
         if parsed.path == "/registry/plan":
             plan = getattr(RUNTIME, "_live_plan_data", {}) or {}
@@ -293,6 +452,33 @@ class GatewayHandler(BaseHTTPRequestHandler):
         if parsed.path == "/audit/privileged":
             self._send_json(200, list_privileged_audit_events())
             return
+        # ── Skill Marketplace ──────────────────────────────────────────────
+        if parsed.path == "/api/marketplace/skills":
+            params = parse_qs(parsed.query or "")
+            q = str((params.get("q") or [""])[0] or "").strip()
+            category = str((params.get("category") or [""])[0] or "").strip()
+            try:
+                result = get_marketplace(q=q, category=category)
+                self._send_json(200, result)
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+        if parsed.path == "/api/marketplace/skills/installed":
+            try:
+                rows = list_user_skills(is_installed=True)
+                self._send_json(200, {"items": rows, "count": len(rows)})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+        if parsed.path.startswith("/api/marketplace/skills/"):
+            skill_id = parsed.path.split("/api/marketplace/skills/", 1)[1].strip()
+            if skill_id:
+                row = get_user_skill(skill_id=skill_id)
+                if row:
+                    self._send_json(200, row)
+                else:
+                    self._send_json(404, {"error": "not_found", "skill_id": skill_id})
+                return
         self._send_json(404, {"error": "not_found"})
 
     def do_POST(self):
@@ -304,13 +490,258 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     REGISTRY.agents.pop(name, None)
                 _register_mcp_tools(REGISTRY)
                 mcp_agents = [n for n in REGISTRY.agents if n.startswith("mcp_")]
+                sync_result = sync_mcp_capabilities(workspace_id="default", actor_user_id="system:gateway-mcp-refresh")
                 self._send_json(200, {
                     "ok": True,
                     "mcp_agent_count": len(mcp_agents),
                     "removed_stale": len(stale),
+                    "capability_sync": sync_result,
                 })
             except Exception as exc:
                 self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+        if self.path == "/registry/auth-profiles":
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            workspace_id = str(payload.get("workspace_id", "default") or "default").strip() or "default"
+            auth_type = str(payload.get("auth_type", "")).strip()
+            provider = str(payload.get("provider", "")).strip()
+            secret_ref = str(payload.get("secret_ref", "")).strip()
+            if not (auth_type and provider and secret_ref):
+                self._send_json(
+                    400,
+                    {"error": "missing_required_fields", "detail": "auth_type, provider, and secret_ref are required."},
+                )
+                return
+            result = CAPABILITY_REGISTRY.create_auth_profile(
+                workspace_id=workspace_id,
+                auth_type=auth_type,
+                provider=provider,
+                secret_ref=secret_ref,
+                scopes=payload.get("scopes", []) if isinstance(payload.get("scopes", []), list) else [],
+                metadata=payload.get("metadata", {}) if isinstance(payload.get("metadata", {}), dict) else {},
+            )
+            self._send_json(200, {"ok": True, "auth_profile": result})
+            return
+        if self.path == "/registry/policy-profiles":
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            workspace_id = str(payload.get("workspace_id", "default") or "default").strip() or "default"
+            name = str(payload.get("name", "")).strip()
+            rules = payload.get("rules", {}) if isinstance(payload.get("rules", {}), dict) else {}
+            if not name:
+                self._send_json(400, {"error": "missing_required_fields", "detail": "name is required."})
+                return
+            result = CAPABILITY_REGISTRY.create_policy_profile(
+                workspace_id=workspace_id,
+                name=name,
+                rules=rules,
+            )
+            self._send_json(200, {"ok": True, "policy_profile": result})
+            return
+        if self.path == "/registry/capabilities":
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            try:
+                workspace_id = str(payload.get("workspace_id", "default") or "default").strip() or "default"
+                actor_user_id = str(payload.get("actor_user_id", "system:gateway") or "system:gateway").strip()
+                result = CAPABILITY_REGISTRY.create(
+                    workspace_id=workspace_id,
+                    capability_type=str(payload.get("type", "")).strip(),
+                    key=str(payload.get("key", "")).strip(),
+                    name=str(payload.get("name", "")).strip(),
+                    description=str(payload.get("description", "")).strip(),
+                    owner_user_id=str(payload.get("owner_user_id", actor_user_id) or actor_user_id).strip(),
+                    visibility=str(payload.get("visibility", "workspace") or "workspace").strip(),
+                    status=str(payload.get("status", "draft") or "draft").strip(),
+                    version=int(payload.get("version", 1) or 1),
+                    tags=payload.get("tags", []) if isinstance(payload.get("tags", []), list) else [],
+                    metadata=payload.get("metadata", {}) if isinstance(payload.get("metadata", {}), dict) else {},
+                    schema_in=payload.get("schema_in", {}) if isinstance(payload.get("schema_in", {}), dict) else {},
+                    schema_out=payload.get("schema_out", {}) if isinstance(payload.get("schema_out", {}), dict) else {},
+                    auth_profile_id=str(payload.get("auth_profile_id", "")).strip(),
+                    policy_profile_id=str(payload.get("policy_profile_id", "")).strip(),
+                )
+                self._send_json(200, {"ok": True, "capability": result})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if self.path.startswith("/registry/capabilities/"):
+            suffix = self.path.split("/registry/capabilities/", 1)[1].strip()
+            if not suffix:
+                self._send_json(400, {"error": "missing_capability_id"})
+                return
+            if "/" in suffix:
+                capability_id, action = suffix.split("/", 1)
+                action = action.strip().lower()
+            else:
+                capability_id, action = suffix, ""
+            capability_id = capability_id.strip()
+            if not capability_id:
+                self._send_json(400, {"error": "missing_capability_id"})
+                return
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            workspace_id = str(payload.get("workspace_id", "default") or "default").strip() or "default"
+            actor_user_id = str(payload.get("actor_user_id", "system:gateway") or "system:gateway").strip()
+            try:
+                if action == "publish":
+                    result = CAPABILITY_REGISTRY.publish(capability_id, workspace_id=workspace_id, actor_user_id=actor_user_id)
+                elif action == "disable":
+                    result = CAPABILITY_REGISTRY.disable(capability_id, workspace_id=workspace_id, actor_user_id=actor_user_id)
+                elif action == "verify":
+                    result = CAPABILITY_REGISTRY.verify(capability_id, workspace_id=workspace_id, actor_user_id=actor_user_id)
+                elif action == "health-check":
+                    result = CAPABILITY_REGISTRY.record_health(
+                        capability_id,
+                        workspace_id=workspace_id,
+                        actor_user_id=actor_user_id,
+                        status=str(payload.get("status", "healthy") or "healthy"),
+                        latency_ms=payload.get("latency_ms", None),
+                        error=str(payload.get("error", "") or ""),
+                    )
+                elif action == "update":
+                    allowed = {
+                        "name",
+                        "description",
+                        "status",
+                        "visibility",
+                        "tags",
+                        "metadata",
+                        "schema_in",
+                        "schema_out",
+                        "auth_profile_id",
+                        "policy_profile_id",
+                    }
+                    updates = {k: v for k, v in payload.items() if k in allowed}
+                    result = CAPABILITY_REGISTRY.update(
+                        capability_id,
+                        actor_user_id=actor_user_id,
+                        workspace_id=workspace_id,
+                        **updates,
+                    )
+                else:
+                    self._send_json(404, {"error": "not_found"})
+                    return
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+                return
+            if not result:
+                self._send_json(404, {"error": "capability_not_found", "capability_id": capability_id})
+                return
+            self._send_json(200, {"ok": True, "capability": result})
+            return
+        if self.path == "/registry/apis/import-openapi":
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            try:
+                openapi_spec = parse_openapi_payload(
+                    spec=payload.get("openapi") if isinstance(payload.get("openapi"), dict) else None,
+                    spec_text=str(payload.get("openapi_text", "")).strip(),
+                )
+            except Exception as exc:
+                self._send_json(400, {"error": "invalid_openapi", "detail": str(exc)})
+                return
+            workspace_id = str(payload.get("workspace_id", "default") or "default").strip() or "default"
+            owner_user_id = str(payload.get("owner_user_id", "system:gateway-openapi") or "system:gateway-openapi").strip()
+            try:
+                result = import_openapi_as_capabilities(
+                    workspace_id=workspace_id,
+                    owner_user_id=owner_user_id,
+                    openapi_spec=openapi_spec,
+                    auth_profile_id=str(payload.get("auth_profile_id", "")).strip(),
+                    policy_profile_id=str(payload.get("policy_profile_id", "")).strip(),
+                    visibility=str(payload.get("visibility", "workspace") or "workspace").strip(),
+                    status=str(payload.get("status", "draft") or "draft").strip(),
+                )
+                self._send_json(200, {"ok": True, "import_result": result})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+        # ── Skill Marketplace POST routes ──────────────────────────────────────
+        if self.path == "/api/marketplace/skills/create":
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            try:
+                skill = create_custom_skill(
+                    name=str(payload.get("name", "")).strip(),
+                    description=str(payload.get("description", "")).strip(),
+                    category=str(payload.get("category", "Custom")).strip() or "Custom",
+                    icon=str(payload.get("icon", "⚡")).strip() or "⚡",
+                    skill_type=str(payload.get("skill_type", "python")).strip(),
+                    code=str(payload.get("code", "")).strip(),
+                    input_schema=payload.get("input_schema") if isinstance(payload.get("input_schema"), dict) else None,
+                    output_schema=payload.get("output_schema") if isinstance(payload.get("output_schema"), dict) else None,
+                    tags=payload.get("tags") if isinstance(payload.get("tags"), list) else None,
+                )
+                self._send_json(200, {"ok": True, "skill": skill})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if self.path.startswith("/api/marketplace/skills/") and self.path.endswith("/install"):
+            catalog_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/install", 1)[0].strip()
+            try:
+                skill = install_catalog_skill(catalog_id)
+                self._send_json(200, {"ok": True, "skill": skill})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if self.path.startswith("/api/marketplace/skills/") and self.path.endswith("/uninstall"):
+            catalog_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/uninstall", 1)[0].strip()
+            try:
+                ok = uninstall_catalog_skill(catalog_id)
+                self._send_json(200, {"ok": ok})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if self.path.startswith("/api/marketplace/skills/") and self.path.endswith("/test"):
+            skill_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/test", 1)[0].strip()
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            try:
+                result = test_skill(skill_id, payload.get("inputs", payload))
+                self._send_json(200, result)
+            except Exception as exc:
+                self._send_json(500, {"success": False, "error": str(exc)})
+            return
+        if self.path.startswith("/api/marketplace/skills/") and self.path.endswith("/edit"):
+            skill_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/edit", 1)[0].strip()
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            try:
+                allowed = {"name", "description", "category", "icon", "code", "input_schema", "output_schema", "tags", "status"}
+                updates = {k: v for k, v in payload.items() if k in allowed}
+                skill = edit_custom_skill(skill_id, **updates)
+                if skill:
+                    self._send_json(200, {"ok": True, "skill": skill})
+                else:
+                    self._send_json(404, {"ok": False, "error": "skill_not_found"})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if self.path.startswith("/api/marketplace/skills/") and self.path.endswith("/delete"):
+            skill_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/delete", 1)[0].strip()
+            try:
+                ok = remove_custom_skill(skill_id)
+                self._send_json(200, {"ok": ok})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
             return
         if self.path not in {"/ingest", "/resume"}:
             self._send_json(404, {"error": "not_found"})
@@ -555,6 +986,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         for key in passthrough_keys:
             if key in payload:
                 state_overrides[key] = payload.get(key)
+        if "communication_authorized" in payload:
+            state_overrides["communication_authorized"] = bool(payload.get("communication_authorized"))
         if bool(payload.get("security_authorized", False)):
             state_overrides["security_authorized"] = True
         if payload.get("security_target_url"):
@@ -627,6 +1060,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             <p>Agents: <strong>{len(agents)}</strong></p>
             <p>Plugins: <strong>{len(plugins)}</strong></p>
             <p><a href="/registry/agents">/registry/agents</a></p>
+            <p><a href="/registry/capabilities">/registry/capabilities</a></p>
+            <p><a href="/registry/discovery">/registry/discovery</a></p>
+            <p><a href="/registry/auth-profiles">/registry/auth-profiles</a></p>
+            <p><a href="/registry/policy-profiles">/registry/policy-profiles</a></p>
             <p><a href="/registry/plugins">/registry/plugins</a></p>
           </div>
           <div class="card">

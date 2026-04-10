@@ -2211,11 +2211,28 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         action="store_true",
         help="Disable automatic installation of missing security tools for security workflows.",
     )
-    run_parser.add_argument(
-        "--communication-authorized",
-        action="store_true",
-        help="Confirm you are authorized to access the communication channels for this run.",
-    )
+    _communication_bool_action = getattr(argparse, "BooleanOptionalAction", None)
+    if _communication_bool_action is not None:
+        run_parser.add_argument(
+            "--communication-authorized",
+            action=_communication_bool_action,
+            default=None,
+            help="Enable or disable communication-channel access for this run (default: enabled).",
+        )
+    else:
+        run_parser.add_argument(
+            "--communication-authorized",
+            dest="communication_authorized",
+            action="store_true",
+            default=None,
+            help="Enable communication-channel access for this run (default: enabled).",
+        )
+        run_parser.add_argument(
+            "--no-communication-authorized",
+            dest="communication_authorized",
+            action="store_false",
+            help="Disable communication-channel access for this run.",
+        )
     run_parser.add_argument(
         "--communication-lookback-hours",
         type=int,
@@ -5304,8 +5321,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         base_ingest_payload["security_authorization_note"] = security_authorization_note
     if security_scan_profile:
         base_ingest_payload["security_scan_profile"] = security_scan_profile
-    if bool(getattr(args, "communication_authorized", False)):
-        base_ingest_payload["communication_authorized"] = True
+    if getattr(args, "communication_authorized", None) is not None:
+        base_ingest_payload["communication_authorized"] = bool(getattr(args, "communication_authorized"))
     _comm_lookback = int(getattr(args, "communication_lookback_hours", 0) or 0)
     if _comm_lookback > 0:
         base_ingest_payload["communication_lookback_hours"] = _comm_lookback
@@ -6312,7 +6329,7 @@ def _cmd_hello(args: argparse.Namespace) -> int:
             },
             {
                 "name": "Communication Suite",
-                "command": 'kendr run --communication-authorized "Summarize my communications from the last 24 hours."',
+                "command": 'kendr run "Summarize my communications from the last 24 hours."',
                 "description": "Unified digest across Gmail, Slack, Telegram, WhatsApp, and Microsoft 365.",
             },
         ],

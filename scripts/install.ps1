@@ -77,7 +77,34 @@ if ($Full) {
     Write-Host "    $VenvPip install 'kendr-runtime[full]'       -- All of the above" -ForegroundColor Cyan
 }
 
-# -- 5. Bootstrap runtime state -----------------------------------------------
+# -- 5. Install scpr (web-scraping MCP tool) ----------------------------------
+Write-Info "Installing scpr web scraper..."
+$ScprInstalled = $false
+if (Get-Command scpr -ErrorAction SilentlyContinue) {
+    Write-Ok "scpr already installed"
+    $ScprInstalled = $true
+}
+if (-not $ScprInstalled -and (Get-Command npm -ErrorAction SilentlyContinue)) {
+    try {
+        npm install -g @cle-does-things/scpr --quiet 2>$null
+        Write-Ok "scpr installed via npm"
+        $ScprInstalled = $true
+    } catch {
+        # fall through to Go
+    }
+}
+if (-not $ScprInstalled -and (Get-Command go -ErrorAction SilentlyContinue)) {
+    try {
+        go install github.com/AstraBert/scpr@latest 2>$null
+        Write-Ok "scpr installed via Go"
+        $ScprInstalled = $true
+    } catch {}
+}
+if (-not $ScprInstalled) {
+    Write-Warn "scpr not installed - npm or Go required. Run: npm install -g @cle-does-things/scpr"
+}
+
+# -- 6. Bootstrap runtime state -----------------------------------------------
 $BootstrapScript = Join-Path $RepoRoot 'scripts\bootstrap_local_state.py'
 if (Test-Path $BootstrapScript) {
     Write-Info "Bootstrapping runtime state..."
@@ -89,7 +116,7 @@ if (Test-Path $BootstrapScript) {
     }
 }
 
-# -- 6. Add Scripts dir to User PATH ------------------------------------------
+# -- 7. Add Scripts dir to User PATH ------------------------------------------
 $UserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
 if ($null -eq $UserPath) { $UserPath = '' }
 $PathParts = $UserPath -split ';' | Where-Object { $_ -ne '' }
@@ -105,7 +132,7 @@ if (($env:Path -split ';') -notcontains $VenvScripts) {
     $env:Path = "$VenvScripts;$env:Path"
 }
 
-# -- 7. Done ------------------------------------------------------------------
+# -- 8. Done ------------------------------------------------------------------
 Write-Host ""
 Write-Host "  [OK] kendr v$KendrVersion is ready!" -ForegroundColor Green
 Write-Host ""

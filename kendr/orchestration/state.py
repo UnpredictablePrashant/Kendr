@@ -70,6 +70,10 @@ class RuntimeState(TypedDict, total=False):
     quality_gate_passed: bool
     quality_gate_report: str
     test_agent_status: str
+    security_authorized: bool
+    security_target_url: str
+    security_authorization_note: str
+    security_scan_profile: str
     security_scan_status: str
     verifier_status: str
     codebase_mode: bool
@@ -202,6 +206,10 @@ class ResumeStateOverrides(TypedDict, total=False):
     incoming_payload: dict[str, Any]
     run_output_dir: str
     user_query: NotRequired[str]
+    security_authorized: bool
+    security_target_url: str
+    security_authorization_note: str
+    security_scan_profile: str
 
 
 def state_awaiting_user_input(state: Mapping[str, Any]) -> bool:

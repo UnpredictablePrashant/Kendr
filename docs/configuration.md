@@ -167,6 +167,8 @@ The HTTP gateway server (`kendr gateway start`) exposes a REST API and is used f
 
 These variables control the safety boundaries for privileged automation (local command execution, OS agent, security scans). All are disabled by default.
 
+Communication workflows are enabled by default. Set `KENDR_COMMUNICATION_AUTHORIZED=false` to disable inbox and messaging access by default for CLI, web, and Electron-backed runs; explicit run payloads and CLI flags can still override that per request.
+
 | Variable | Required | Default | Description | Example |
 |---|---|---|---|---|
 | `KENDR_PRIVILEGED_MODE` | no | `false` | Enable privileged policy controls for runs that use `os_agent` or security agents. | `true` |

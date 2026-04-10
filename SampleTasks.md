@@ -420,7 +420,6 @@ Prerequisites:
 
 ```bash
 kendr run \
-  --communication-authorized \
   "Summarize my communications across all channels from the last 24 hours"
 ```
 
@@ -428,7 +427,6 @@ With a custom lookback window:
 
 ```bash
 kendr run \
-  --communication-authorized \
   "What did I miss on Slack and Gmail in the last 4 hours?"
 ```
 
@@ -452,7 +450,6 @@ Prerequisites:
 
 ```bash
 kendr run \
-  --communication-authorized \
   --whatsapp-to "+15551234567" \
   --whatsapp-message "Hello from kendr — your briefing is ready." \
   "Send a WhatsApp message to my contact."
@@ -462,7 +459,6 @@ Send using a pre-approved template:
 
 ```bash
 kendr run \
-  --communication-authorized \
   --whatsapp-to "+15551234567" \
   --whatsapp-template "hello_world" \
   "Send a WhatsApp template message."

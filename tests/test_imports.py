@@ -13,6 +13,9 @@ class ImportSmokeTests(unittest.TestCase):
         import plugin_templates.project_stacks  # noqa: F401
         import kendr.domain.local_drive  # noqa: F401
         import kendr.setup.catalog  # noqa: F401
+        import kendr.capability_registry  # noqa: F401
+        import kendr.capability_sync  # noqa: F401
+        import kendr.openapi_importer  # noqa: F401
 
     def test_legacy_persistence_imports_remain_compatible(self):
         import kendr.persistence as persistence

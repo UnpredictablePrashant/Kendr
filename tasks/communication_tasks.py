@@ -91,7 +91,7 @@ def _write_outputs(agent_name: str, call_number: int, summary: str, payload: dic
 def _require_comm_authorization(state: dict):
     if not state.get("communication_authorized", False):
         raise PermissionError(
-            "Communication agents require explicit authorization. Set state['communication_authorized']=True only for accounts and workspaces you are permitted to access."
+            "Communication access is disabled for this run. Set state['communication_authorized']=True only for accounts and workspaces you are permitted to access."
         )
 
 

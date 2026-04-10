@@ -21,6 +21,14 @@ from typing import Any
 _log = logging.getLogger("kendr.mcp_manager")
 
 
+def _sync_mcp_capabilities_safe() -> None:
+    try:
+        from kendr.capability_sync import sync_mcp_capabilities
+        sync_mcp_capabilities(workspace_id="default", actor_user_id="system:mcp-manager")
+    except Exception as exc:
+        _log.warning("MCP capability sync skipped: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Public registry API  (delegates to SQLite persistence layer)
 # ---------------------------------------------------------------------------
@@ -54,6 +62,7 @@ def add_server(
     server_type: str = "http",
     description: str = "",
     auth_token: str = "",
+    enabled: bool = True,
 ) -> dict:
     """Register a new MCP server.
 
@@ -74,24 +83,31 @@ def add_server(
     """
     from kendr.persistence.mcp_store import add_mcp_server
     server_id = uuid.uuid4().hex[:12]
-    return add_mcp_server(
+    entry = add_mcp_server(
         server_id=server_id,
         name=name.strip() or "Unnamed Server",
         connection=connection.strip(),
         server_type=server_type if server_type in ("http", "stdio") else "http",
         description=description.strip(),
         auth_token=auth_token.strip(),
+        enabled=enabled,
     )
+    _sync_mcp_capabilities_safe()
+    return entry
 
 
 def remove_server(server_id: str) -> bool:
     from kendr.persistence.mcp_store import remove_mcp_server
-    return remove_mcp_server(server_id)
+    ok = remove_mcp_server(server_id)
+    _sync_mcp_capabilities_safe()
+    return ok
 
 
 def toggle_server(server_id: str, enabled: bool) -> bool:
     from kendr.persistence.mcp_store import toggle_mcp_server
-    return toggle_mcp_server(server_id, enabled)
+    ok = toggle_mcp_server(server_id, enabled)
+    _sync_mcp_capabilities_safe()
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -108,13 +124,24 @@ async def _async_discover(server: dict) -> tuple[list[dict], str | None]:
     except ImportError:
         return [], "fastmcp is not installed"
 
+    import shlex
+
     connection = server.get("connection", "")
     server_type = server.get("type", "http")
     auth_token = server.get("auth_token", "")
 
     try:
         if server_type == "stdio":
-            transport = connection
+            # fastmcp 3.x infer_transport only handles .py/.js paths and HTTP URLs.
+            # For arbitrary commands (e.g. "scpr mcp") use StdioTransport directly.
+            from fastmcp.client.transports.stdio import StdioTransport
+            try:
+                parts = shlex.split(connection)
+            except Exception:
+                parts = connection.split()
+            if not parts:
+                parts = [connection]
+            transport = StdioTransport(command=parts[0], args=parts[1:])
             client_kwargs: dict = {}
         else:
             transport = connection
@@ -168,7 +195,7 @@ def discover_tools(server_id: str) -> dict:
         last_discovered=now,
     )
 
-    return {
+    result = {
         "ok": error is None,
         "error": error,
         "tools": tools,
@@ -176,6 +203,8 @@ def discover_tools(server_id: str) -> dict:
         "last_discovered": now,
         "server_id": server_id,
     }
+    _sync_mcp_capabilities_safe()
+    return result
 
 
 # ---------------------------------------------------------------------------

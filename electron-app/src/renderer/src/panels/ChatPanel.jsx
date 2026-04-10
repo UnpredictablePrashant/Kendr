@@ -1,0 +1,964 @@
+import React, { useState, useRef, useEffect, useCallback, useReducer } from 'react'
+import { useApp } from '../contexts/AppContext'
+import { basename, resolveSelectedModel } from '../lib/modelSelection'
+
+// ─── Chat-local state ────────────────────────────────────────────────────────
+const initChat = {
+  messages: [],          // [{id,role,content,steps,status,runId,artifacts,ts}]
+  streaming: false,
+  activeRunId: null,
+  mode: 'chat',          // chat | agent | research | security
+  awaitingContext: null, // {runId,workflowId,prompt,kind}
+}
+
+function chatReducer(s, a) {
+  switch (a.type) {
+    case 'ADD_MSG':     return { ...s, messages: [...s.messages, a.msg] }
+    case 'UPD_MSG':     return { ...s, messages: s.messages.map(m => m.id === a.id ? { ...m, ...a.patch } : m) }
+    case 'ADD_STEP': {
+      const msgs = s.messages.map(m => {
+        if (m.runId !== a.runId) return m
+        const steps = [...(m.steps || [])]
+        const idx = steps.findIndex(st => st.stepId === a.step.stepId)
+        if (idx >= 0) { steps[idx] = { ...steps[idx], ...a.step } }
+        else steps.push(a.step)
+        return { ...m, steps }
+      })
+      return { ...s, messages: msgs }
+    }
+    case 'SET_STREAMING':  return { ...s, streaming: a.val }
+    case 'SET_RUN':        return { ...s, activeRunId: a.id }
+    case 'SET_MODE':       return { ...s, mode: a.mode }
+    case 'SET_AWAITING':   return { ...s, awaitingContext: a.ctx }
+    case 'CLEAR_AWAITING': return { ...s, awaitingContext: null }
+    case 'CLEAR':          return { ...initChat, mode: s.mode }
+    default: return s
+  }
+}
+
+// ─── Build POST payload ───────────────────────────────────────────────────────
+function buildPayload(text, chatId, runId, projectRoot, mode, dr, attachments = [], studioMode = false, useMcp = false) {
+  const localPaths = Array.isArray(attachments) ? attachments.map(item => item.path).filter(Boolean) : []
+  const normalizedText = mode === 'agent'
+    ? `Handle this in agent mode. Do the detailed work, think step by step, use attached local files/folders if relevant, and return a concise final answer.\n\nUser request: ${text}`
+    : text
+  const base = {
+    text: normalizedText,
+    channel:           'webchat',
+    sender_id:         'desktop_user',
+    chat_id:           chatId,
+    run_id:            runId,
+    working_directory: studioMode ? undefined : (projectRoot || undefined),
+    use_mcp:           useMcp,
+  }
+  if (mode === 'agent') {
+    return {
+      ...base,
+      local_drive_paths: localPaths.length ? localPaths : undefined,
+      local_drive_recursive: localPaths.length ? true : undefined,
+    }
+  }
+  if (mode !== 'research') {
+    return {
+      ...base,
+      local_drive_paths: localPaths.length ? localPaths : undefined,
+      local_drive_recursive: localPaths.length ? true : undefined,
+    }
+  }
+
+  // Parse explicit links from textarea
+  const links = (dr.links || '').split(/[\n,\s]+/)
+    .map(s => s.trim()).filter(s => /^https?:\/\//i.test(s))
+  const webLinks = dr.webSearchEnabled ? links : []
+
+  // Compute research_sources: checked remote + 'local' if paths present
+  const remoteSources = dr.webSearchEnabled ? dr.sources : []
+  const mergedLocalPaths = Array.from(new Set([...(dr.localPaths || []), ...localPaths]))
+  const allSources = mergedLocalPaths.length
+    ? Array.from(new Set([...remoteSources, 'local']))
+    : remoteSources
+
+  const payload = {
+    ...base,
+    deep_research_mode:              true,
+    long_document_mode:              true,
+    workflow_type:                   'deep_research',
+    long_document_pages:             dr.pages,
+    research_output_formats:         dr.outputFormats,
+    research_citation_style:         dr.citationStyle,
+    research_enable_plagiarism_check: dr.plagiarismCheck,
+    research_web_search_enabled:     dr.webSearchEnabled,
+    research_date_range:             dr.dateRange,
+    research_sources:                allSources,
+    research_max_sources:            dr.maxSources || 0,
+    research_checkpoint_enabled:     dr.checkpointing,
+    deep_research_source_urls:       webLinks,
+  }
+  if (mergedLocalPaths.length) {
+    payload.local_drive_paths              = mergedLocalPaths
+    payload.local_drive_recursive          = true
+    payload.local_drive_force_long_document = true
+  }
+  return payload
+}
+
+function readBlobAsDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('read_failed'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+// ─── Deep Research default settings ─────────────────────────────────────────
+const DR_DEFAULTS = {
+  pages: 25,
+  citationStyle: 'apa',
+  dateRange: 'all_time',
+  maxSources: 0,
+  outputFormats: ['pdf', 'docx', 'html', 'md'],
+  webSearchEnabled: true,
+  sources: ['web'],
+  plagiarismCheck: true,
+  checkpointing: false,
+  localPaths: [],   // native FS paths (Electron folder picker)
+  links: '',        // newline-separated URLs
+  collapsed: false,
+}
+
+// ─── Component ───────────────────────────────────────────────────────────────
+export default function ChatPanel({ fullWidth = false, hideHeader = false, studioMode = false }) {
+  const { state: appState, dispatch: appDispatch, refreshModelInventory } = useApp()
+  const [chat, dispatch] = useReducer(chatReducer, initChat)
+  const [input, setInput] = useState('')
+  const [resumeInput, setResumeInput] = useState('')
+  const [chatId] = useState(() => `chat-${Date.now()}`)
+  const [dr, setDr] = useState(DR_DEFAULTS)
+  const [attachments, setAttachments] = useState([])
+  const [mcpEnabled, setMcpEnabled] = useState(false)
+  const [mcpServerCount, setMcpServerCount] = useState(0)
+  const messagesEndRef = useRef(null)
+  const inputRef = useRef(null)
+  const esRef = useRef(null)
+  const apiBase = appState.backendUrl || 'http://127.0.0.1:2151'
+  const updateDr = (patch) => setDr(s => ({ ...s, ...patch }))
+  const selectedModelMeta = resolveSelectedModel(appState.selectedModel)
+  const isSimpleStudioChat = studioMode && chat.mode === 'chat'
+  const modelInventory = appState.modelInventory
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [chat.messages])
+
+  useEffect(() => {
+    refreshModelInventory(false)
+  }, [refreshModelInventory])
+
+  // Auto-enable MCP when switching to agent mode; keep state when switching away
+  useEffect(() => {
+    if (chat.mode === 'agent') setMcpEnabled(true)
+  }, [chat.mode])
+
+  // Fetch enabled MCP server count for display
+  useEffect(() => {
+    fetch(`${apiBase}/api/mcp/servers`)
+      .then(r => r.ok ? r.json() : [])
+      .then(data => {
+        const servers = Array.isArray(data) ? data : (data.servers || [])
+        setMcpServerCount(servers.filter(s => s.enabled !== false).length)
+      })
+      .catch(() => {})
+  }, [apiBase])
+
+  // ── Send message ────────────────────────────────────────────────────────────
+  const send = useCallback(async (text, isResume = false) => {
+    const msg = text?.trim() || input.trim()
+    if (!msg || chat.streaming) return
+    setInput('')
+    setResumeInput('')
+
+    const runId = `ui-${Date.now().toString(36)}`
+    const userMsgId = `u-${runId}`
+    const asstMsgId = `a-${runId}`
+
+    dispatch({ type: 'ADD_MSG', msg: { id: userMsgId, role: 'user', content: msg, ts: new Date() } })
+    dispatch({ type: 'SET_STREAMING', val: true })
+    dispatch({ type: 'SET_RUN', id: runId })
+    dispatch({ type: 'CLEAR_AWAITING' })
+
+    dispatch({
+      type: 'ADD_MSG',
+      msg: { id: asstMsgId, role: 'assistant', content: '', steps: [], status: 'thinking', runId: isSimpleStudioChat ? null : runId, ts: new Date() }
+    })
+
+    appDispatch({ type: 'SET_STREAMING', streaming: true })
+
+    try {
+      const endpoint = isResume && chat.awaitingContext
+        ? `${apiBase}/api/chat/resume`
+        : isSimpleStudioChat
+          ? `${apiBase}/api/chat/simple`
+          : `${apiBase}/api/chat`
+
+      const body = isResume && chat.awaitingContext
+        ? {
+            run_id:      chat.awaitingContext.runId,
+            workflow_id: chat.awaitingContext.workflowId,
+            reply:       msg,
+            channel:     'webchat',
+          }
+        : buildPayload(msg, chatId, runId, appState.projectRoot, chat.mode, dr, attachments, studioMode, mcpEnabled)
+      if (!isResume && appState.selectedModel) {
+        const selected = resolveSelectedModel(appState.selectedModel)
+        if (selected.provider) body.provider = selected.provider
+        if (selected.model) body.model = selected.model
+      }
+
+      if (isSimpleStudioChat && !isResume) {
+        const resp = await fetch(endpoint, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify(body),
+        })
+        const data = await resp.json().catch(() => ({}))
+        if (!resp.ok) {
+          refreshModelInventory(true)
+          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: data.error || data.detail || resp.statusText, status: 'error', runId: null } })
+        } else {
+          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: data.answer || '', status: 'done', runId: null, artifacts: [] } })
+        }
+        dispatch({ type: 'SET_STREAMING', val: false })
+        appDispatch({ type: 'SET_STREAMING', streaming: false })
+        return
+      }
+
+      const resp = await fetch(endpoint, {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(body),
+      })
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({}))
+        refreshModelInventory(true)
+        dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: err.error || err.detail || resp.statusText, status: 'error' } })
+        dispatch({ type: 'SET_STREAMING', val: false })
+        appDispatch({ type: 'SET_STREAMING', streaming: false })
+        return
+      }
+
+      const { run_id: srvRunId } = await resp.json().catch(() => ({}))
+      const effectiveRunId = srvRunId || runId
+
+      // Update the assistant message with the real run_id
+      dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { runId: effectiveRunId, status: 'thinking' } })
+      dispatch({ type: 'SET_RUN', id: effectiveRunId })
+
+      openStream(effectiveRunId, asstMsgId)
+    } catch (err) {
+      refreshModelInventory(true)
+      dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: `Cannot reach backend: ${err.message}`, status: 'error' } })
+      dispatch({ type: 'SET_STREAMING', val: false })
+      appDispatch({ type: 'SET_STREAMING', streaming: false })
+    }
+  }, [input, chat.streaming, chat.awaitingContext, chat.mode, apiBase, appState.projectRoot, appState.selectedModel, chatId, dr, attachments, studioMode, isSimpleStudioChat, mcpEnabled, appDispatch, refreshModelInventory])
+
+  // ── SSE stream ──────────────────────────────────────────────────────────────
+  const openStream = useCallback((runId, asstMsgId) => {
+    esRef.current?.close()
+    const es = new EventSource(`${apiBase}/api/stream?run_id=${encodeURIComponent(runId)}`)
+    esRef.current = es
+
+    let stepCounter = 0
+
+    es.addEventListener('status', e => {
+      try {
+        const d = JSON.parse(e.data)
+        if (d.status && d.status !== 'connected') {
+          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { statusText: d.message || d.status } })
+        }
+      } catch (_) {}
+    })
+
+    es.addEventListener('step', e => {
+      try {
+        const step = JSON.parse(e.data)
+        const stepId = step.step_id || step.id || `step-${++stepCounter}`
+        dispatch({
+          type: 'ADD_STEP',
+          runId,
+          step: {
+            stepId,
+            agent:         step.agent || step.name || 'agent',
+            status:        step.status || 'running',
+            message:       step.message || '',
+            reason:        step.reason || '',
+            durationLabel: step.duration_label || '',
+            startedAt:     step.started_at || '',
+          }
+        })
+        dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: 'streaming' } })
+      } catch (_) {}
+    })
+
+    es.addEventListener('result', e => {
+      try {
+        const d = JSON.parse(e.data)
+        const output = d.final_output || d.output || d.draft_response || d.response || ''
+        const awaiting = !!(
+          d.awaiting_user_input || d.plan_waiting_for_approval || d.plan_needs_clarification ||
+          d.pending_user_input_kind || d.approval_pending_scope || d.pending_user_question ||
+          (d.approval_request && Object.keys(d.approval_request).length > 0)
+        )
+        if (awaiting) {
+          dispatch({
+            type: 'SET_AWAITING',
+            ctx: {
+              runId,
+              workflowId: d.workflow_id || runId,
+              prompt: d.pending_user_question || output || 'Waiting for your input.',
+              kind:   d.pending_user_input_kind || '',
+            }
+          })
+          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: output, status: 'awaiting', artifacts: d.artifact_files || [] } })
+        } else {
+          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: output, status: 'done', artifacts: d.artifact_files || [] } })
+        }
+      } catch (_) {}
+    })
+
+    es.addEventListener('done', e => {
+      try {
+        const d = JSON.parse(e.data)
+        if (d.awaiting_user_input || String(d.status).toLowerCase() === 'awaiting_user_input') {
+          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: 'awaiting' } })
+        } else {
+          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: d.status === 'failed' ? 'error' : 'done' } })
+          dispatch({ type: 'CLEAR_AWAITING' })
+        }
+      } catch (_) {}
+      es.close()
+      dispatch({ type: 'SET_STREAMING', val: false })
+      appDispatch({ type: 'SET_STREAMING', streaming: false })
+    })
+
+    es.addEventListener('error', e => {
+      try {
+        const d = JSON.parse(e.data)
+        dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: d.message || 'Run failed.', status: 'error' } })
+      } catch (_) {
+        dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: 'error' } })
+      }
+      refreshModelInventory(true)
+      es.close()
+      dispatch({ type: 'SET_STREAMING', val: false })
+      appDispatch({ type: 'SET_STREAMING', streaming: false })
+    })
+
+    es.onerror = () => {
+      refreshModelInventory(true)
+      dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: chat.messages.find(m => m.id === asstMsgId)?.content ? 'done' : 'error' } })
+      es.close()
+      dispatch({ type: 'SET_STREAMING', val: false })
+      appDispatch({ type: 'SET_STREAMING', streaming: false })
+    }
+  }, [apiBase, appDispatch, chat.messages, refreshModelInventory])
+
+  // ── Stop run ────────────────────────────────────────────────────────────────
+  const stopRun = useCallback(async () => {
+    esRef.current?.close()
+    if (chat.activeRunId) {
+      await fetch(`${apiBase}/api/runs/stop`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: chat.activeRunId })
+      }).catch(() => {})
+    }
+    dispatch({ type: 'SET_STREAMING', val: false })
+    appDispatch({ type: 'SET_STREAMING', streaming: false })
+  }, [chat.activeRunId, apiBase])
+
+  const handleKey = (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send() }
+  }
+
+  const isOnline = appState.backendStatus === 'running'
+  const studioModelLabel = (() => {
+    if (selectedModelMeta.model) return `Selected · ${selectedModelMeta.label}`
+    const provider = String(modelInventory?.configured_provider || '').trim()
+    const model = String(modelInventory?.configured_model || '').trim()
+    if (provider && model) return `Auto · ${resolveSelectedModel(`${provider}/${model}`).label}`
+    return 'Auto · Backend default'
+  })()
+  const attachFiles = useCallback(async () => {
+    const paths = await window.kendrAPI?.dialog.openFiles([{ name: 'All Files', extensions: ['*'] }])
+    if (!Array.isArray(paths) || !paths.length) return
+    setAttachments((prev) => {
+      const seen = new Set(prev.map(item => item.path))
+      const next = [...prev]
+      for (const filePath of paths) {
+        if (seen.has(filePath)) continue
+        next.push({ path: filePath, type: 'file', name: basename(filePath) })
+        seen.add(filePath)
+      }
+      return next
+    })
+  }, [])
+  const attachFolder = useCallback(async () => {
+    const dir = await window.kendrAPI?.dialog.openDirectory()
+    if (!dir) return
+    setAttachments((prev) => prev.some(item => item.path === dir)
+      ? prev
+      : [...prev, { path: dir, type: 'folder', name: basename(dir) }])
+  }, [])
+  const removeAttachment = useCallback((path) => {
+    setAttachments((prev) => prev.filter(item => item.path !== path))
+  }, [])
+  const handlePaste = useCallback(async (e) => {
+    const items = Array.from(e.clipboardData?.items || [])
+    const imageItems = items.filter(item => item.kind === 'file' && String(item.type || '').startsWith('image/'))
+    if (!imageItems.length) return
+    e.preventDefault()
+    const api = window.kendrAPI
+    const saved = []
+    for (const item of imageItems) {
+      const file = item.getAsFile()
+      if (!file) continue
+      try {
+        const dataUrl = await readBlobAsDataUrl(file)
+        const result = await api?.clipboard?.saveImage({
+          dataUrl,
+          name: file.name ? file.name.replace(/\.[^.]+$/, '') : 'pasted-screenshot',
+        })
+        if (result?.path) {
+          saved.push({
+            path: result.path,
+            type: 'image',
+            name: basename(result.path),
+          })
+        }
+      } catch (_) {}
+    }
+    if (!saved.length) return
+    setAttachments((prev) => {
+      const seen = new Set(prev.map(item => item.path))
+      const next = [...prev]
+      for (const item of saved) {
+        if (seen.has(item.path)) continue
+        next.push(item)
+        seen.add(item.path)
+      }
+      return next
+    })
+  }, [])
+  const MODES = [
+    { id: 'chat',     label: '💬 Chat' },
+    { id: 'agent',    label: '✨ Agent' },
+    { id: 'research', label: '🔬 Deep Research' },
+    { id: 'security', label: '🛡 Security' },
+  ]
+
+  return (
+    <div className={`kc-panel${fullWidth ? ' kc-panel--full' : ''}`}>
+      {/* ── Header ── */}
+      {!hideHeader && <div className="kc-header">
+        <div className="kc-logo">K<span>endr</span></div>
+        <div className="kc-header-model" title={studioModelLabel}>
+          <span className={`kc-header-model-dot ${selectedModelMeta.isLocal || String(modelInventory?.configured_provider || '').toLowerCase() === 'ollama' ? 'local' : ''}`} />
+          <span>{studioModelLabel}</span>
+          {!studioMode && appState.projectRoot && <span className="kc-header-model-project">{basename(appState.projectRoot)}</span>}
+        </div>
+        <div className="kc-header-status">
+          <span className={`kc-dot ${isOnline ? 'kc-dot--on' : ''}`} />
+          <span className="kc-header-status-text">{isOnline ? 'connected' : appState.backendStatus}</span>
+        </div>
+        <div className="kc-header-actions">
+          <button className="kc-icon-btn" title="Clear chat" onClick={() => dispatch({ type: 'CLEAR' })}>
+            <ClearIcon />
+          </button>
+          {!fullWidth && (
+            <button className="kc-icon-btn" title="Close" onClick={() => appDispatch({ type: 'TOGGLE_CHAT' })}>✕</button>
+          )}
+        </div>
+      </div>}
+
+      {/* ── Mode pills ── */}
+      <div className="kc-mode-bar">
+        {MODES.map(m => (
+          <button
+            key={m.id}
+            className={`kc-mode-pill ${chat.mode === m.id ? 'kc-mode-pill--active' : ''}`}
+            onClick={() => dispatch({ type: 'SET_MODE', mode: m.id })}
+          >{m.label}</button>
+        ))}
+      </div>
+
+      {/* ── Deep Research Panel ── */}
+      {chat.mode === 'research' && (
+        <DeepResearchPanel dr={dr} updateDr={updateDr} />
+      )}
+
+      {/* ── Messages ── */}
+      <div className="kc-messages">
+        {chat.messages.length === 0 && <WelcomeScreen onSuggest={s => { setInput(s); inputRef.current?.focus() }} />}
+
+        {chat.messages.map(msg =>
+          msg.role === 'user'
+            ? <UserMessage key={msg.id} msg={msg} />
+            : <AssistantMessage key={msg.id} msg={msg} />
+        )}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* ── Awaiting input banner ── */}
+      {chat.awaitingContext && (
+        <div className="kc-awaiting">
+          <div className="kc-awaiting-label">⏳ {chat.awaitingContext.prompt?.slice(0, 120)}</div>
+          <div className="kc-awaiting-row">
+            <textarea
+              className="kc-awaiting-input"
+              placeholder="Your reply…"
+              value={resumeInput}
+              onChange={e => setResumeInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send(resumeInput, true) }}
+              rows={2}
+            />
+            <button className="kc-send-btn" onClick={() => send(resumeInput, true)}>
+              <SendIcon />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── Input area ── */}
+      <div className="kc-input-area">
+        <div className="kc-attach-bar">
+          <div className="kc-attach-actions">
+            <button className="kc-attach-btn" onClick={attachFiles}>+ Files</button>
+            {studioMode && <button className="kc-attach-btn" onClick={attachFolder}>+ Folder</button>}
+            {chat.mode === 'agent' ? (
+              <span className="kc-mcp-indicator" title={`${mcpServerCount} MCP server${mcpServerCount !== 1 ? 's' : ''} active`}>
+                🔌 MCP {mcpServerCount > 0 ? `· ${mcpServerCount}` : ''}
+              </span>
+            ) : (
+              <button
+                className={`kc-attach-btn kc-mcp-toggle${mcpEnabled ? ' kc-mcp-toggle--on' : ''}`}
+                onClick={() => setMcpEnabled(v => !v)}
+                title={mcpEnabled ? 'Disable MCP tools for this chat' : `Enable MCP tools (${mcpServerCount} server${mcpServerCount !== 1 ? 's' : ''} available)`}
+              >
+                🔌 MCP {mcpEnabled ? 'ON' : 'OFF'}
+              </button>
+            )}
+          </div>
+          {!!attachments.length && (
+            <div className="kc-attach-list">
+              {attachments.map(item => (
+                <span key={item.path} className="kc-attach-chip" title={item.path}>
+                  <span>
+                    {item.type === 'folder' ? '📁' : item.type === 'image' ? '🖼' : '📄'} {item.name}
+                  </span>
+                  <button onClick={() => removeAttachment(item.path)}>×</button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+        {!studioMode && appState.projectRoot && (
+          <div className="kc-project-badge">
+            <span>📁 {appState.projectRoot.split(/[\\/]/).pop()}</span>
+          </div>
+        )}
+        <div className="kc-input-row">
+          <textarea
+            ref={inputRef}
+            className="kc-input"
+            placeholder={
+              chat.mode === 'research'  ? 'Describe the deep research task, scope, and output you want…'  :
+              chat.mode === 'security'  ? 'Describe the target and scope…'     :
+              chat.mode === 'agent'     ? 'Ask the agent to investigate, reason step by step, and do the detailed work… (Ctrl+Enter)' :
+              'Ask a direct question… (Ctrl+Enter)'
+            }
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            onPaste={handlePaste}
+            onKeyDown={handleKey}
+            rows={3}
+            disabled={chat.streaming}
+          />
+          <button
+            className={`kc-send-btn ${chat.streaming ? 'kc-send-btn--stop' : ''}`}
+            onClick={chat.streaming ? stopRun : send}
+            disabled={!chat.streaming && !input.trim()}
+            title={chat.streaming ? 'Stop (sends cancellation)' : 'Send (Ctrl+Enter)'}
+          >
+            {chat.streaming ? <StopIcon /> : <SendIcon />}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Deep Research Panel ──────────────────────────────────────────────────────
+function DeepResearchPanel({ dr, updateDr }) {
+  const api = window.kendrAPI
+
+  const toggleFormat = (fmt) => {
+    const cur = dr.outputFormats
+    const next = cur.includes(fmt) ? cur.filter(f => f !== fmt) : [...cur, fmt]
+    updateDr({ outputFormats: next })
+  }
+
+  const toggleSource = (src) => {
+    const cur = dr.sources
+    const next = cur.includes(src) ? cur.filter(s => s !== src) : [...cur, src]
+    updateDr({ sources: next })
+  }
+
+  const addLocalPath = async () => {
+    const dir = await api?.dialog.openDirectory()
+    if (dir && !dr.localPaths.includes(dir)) {
+      updateDr({ localPaths: [...dr.localPaths, dir] })
+    }
+  }
+
+  const removeLocalPath = (p) => updateDr({ localPaths: dr.localPaths.filter(x => x !== p) })
+
+  return (
+    <div className="dr-panel">
+      <div className="dr-panel-header" onClick={() => updateDr({ collapsed: !dr.collapsed })}>
+        <span className="dr-panel-title">🔬 Deep Research Settings</span>
+        <div className="dr-summary">
+          <span className="dr-sum-pill">{dr.pages}p</span>
+          <span className="dr-sum-pill">{dr.citationStyle.toUpperCase()}</span>
+          <span className="dr-sum-pill">{dr.outputFormats.join('·')}</span>
+          {!dr.webSearchEnabled && <span className="dr-sum-pill dr-sum-warn">Local only</span>}
+        </div>
+        <span className="dr-collapse-btn">{dr.collapsed ? '▸' : '▾'}</span>
+      </div>
+
+      {!dr.collapsed && (
+        <div className="dr-body">
+          {/* Row 1 */}
+          <div className="dr-grid">
+            <div className="dr-field">
+              <label className="dr-label">Page Target</label>
+              <select className="dr-select" value={dr.pages} onChange={e => updateDr({ pages: +e.target.value })}>
+                <option value={10}>10 pages</option>
+                <option value={25}>25 pages</option>
+                <option value={50}>50 pages</option>
+                <option value={100}>100 pages</option>
+              </select>
+            </div>
+            <div className="dr-field">
+              <label className="dr-label">Citation Style</label>
+              <select className="dr-select" value={dr.citationStyle} onChange={e => updateDr({ citationStyle: e.target.value })}>
+                <option value="apa">APA</option>
+                <option value="mla">MLA</option>
+                <option value="chicago">Chicago</option>
+                <option value="ieee">IEEE</option>
+              </select>
+            </div>
+            <div className="dr-field">
+              <label className="dr-label">Date Range</label>
+              <select className="dr-select" value={dr.dateRange} onChange={e => updateDr({ dateRange: e.target.value })}>
+                <option value="all_time">All time</option>
+                <option value="1y">Last year</option>
+                <option value="2y">Last 2 years</option>
+                <option value="5y">Last 5 years</option>
+              </select>
+            </div>
+            <div className="dr-field">
+              <label className="dr-label">Max Sources</label>
+              <input className="dr-input-sm" type="number" min={0} step={10} value={dr.maxSources}
+                onChange={e => updateDr({ maxSources: +e.target.value })} placeholder="0 = auto" />
+            </div>
+          </div>
+
+          {/* Row 2 */}
+          <div className="dr-grid" style={{ marginTop: 8 }}>
+            <div className="dr-field">
+              <label className="dr-label">Output Formats</label>
+              <div className="dr-checks">
+                {['pdf','docx','html','md'].map(f => (
+                  <label key={f} className="dr-check">
+                    <input type="checkbox" checked={dr.outputFormats.includes(f)} onChange={() => toggleFormat(f)} />
+                    {f.toUpperCase()}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="dr-field">
+              <label className="dr-label">Source Families</label>
+              <div className="dr-checks">
+                <label className="dr-check dr-check--web">
+                  <input type="checkbox" checked={dr.webSearchEnabled}
+                    onChange={e => updateDr({ webSearchEnabled: e.target.checked })} />
+                  🌐 Web Search
+                </label>
+                {[['web','Web'],['arxiv','Academic'],['patents','Patents'],['news','News'],['reddit','Community']].map(([v,l]) => (
+                  <label key={v} className="dr-check" style={{ opacity: dr.webSearchEnabled ? 1 : 0.4 }}>
+                    <input type="checkbox" checked={dr.sources.includes(v)} disabled={!dr.webSearchEnabled}
+                      onChange={() => toggleSource(v)} />
+                    {l}
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="dr-field">
+              <label className="dr-label">Quality Gates</label>
+              <div className="dr-checks">
+                <label className="dr-check">
+                  <input type="checkbox" checked={dr.plagiarismCheck} onChange={e => updateDr({ plagiarismCheck: e.target.checked })} />
+                  Plagiarism Check
+                </label>
+                <label className="dr-check">
+                  <input type="checkbox" checked={dr.checkpointing} onChange={e => updateDr({ checkpointing: e.target.checked })} />
+                  Checkpointing
+                </label>
+              </div>
+            </div>
+          </div>
+
+          {/* Local paths */}
+          <div className="dr-field" style={{ marginTop: 8 }}>
+            <label className="dr-label">Local Folders / Files</label>
+            <div className="dr-path-row">
+              <button className="dr-action-btn" onClick={addLocalPath}>+ Browse Folder</button>
+            </div>
+            {dr.localPaths.length > 0 && (
+              <div className="dr-chips">
+                {dr.localPaths.map(p => (
+                  <span key={p} className="dr-chip">
+                    <span>📁 {p.split(/[\\/]/).slice(-2).join('/')}</span>
+                    <button onClick={() => removeLocalPath(p)}>✕</button>
+                  </span>
+                ))}
+              </div>
+            )}
+            <div className="dr-note">Folders are read recursively by the backend (local machine paths).</div>
+          </div>
+
+          {/* Explicit links */}
+          <div className="dr-field" style={{ marginTop: 8 }}>
+            <label className="dr-label">Explicit Content Links</label>
+            <textarea
+              className="dr-textarea"
+              rows={3}
+              placeholder={"https://example.com/report\nhttps://example.com/dataset"}
+              value={dr.links}
+              onChange={e => updateDr({ links: e.target.value })}
+              disabled={!dr.webSearchEnabled}
+            />
+            <div className="dr-note">
+              {dr.webSearchEnabled
+                ? 'These exact URLs will be fetched as part of the report.'
+                : 'Enable Web Search to use explicit links.'}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─── Welcome screen ───────────────────────────────────────────────────────────
+function WelcomeScreen({ onSuggest }) {
+  const SUGGESTIONS = [
+    'Summarize the attached files for me',
+    'Explain this topic simply',
+    'Investigate this problem step by step',
+    'Run a security assessment',
+    'Write a detailed technical report',
+    'Compare two approaches and recommend one',
+  ]
+  return (
+    <div className="kc-welcome">
+      <div className="kc-welcome-logo">⚡</div>
+      <h2 className="kc-welcome-title">Kendr Studio</h2>
+      <p className="kc-welcome-sub">Use Chat for direct answers. Use Agent when you want the assistant to do the detailed work and reason through the task.</p>
+      <div className="kc-suggestions">
+        {SUGGESTIONS.map(s => (
+          <button key={s} className="kc-suggest" onClick={() => onSuggest(s)}>{s}</button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ─── User message ─────────────────────────────────────────────────────────────
+function UserMessage({ msg }) {
+  return (
+    <div className="kc-row kc-row--user">
+      <div className="kc-bubble kc-bubble--user">
+        <div className="kc-bubble-text">{msg.content}</div>
+        <div className="kc-bubble-ts">{formatTs(msg.ts)}</div>
+      </div>
+      <div className="kc-avatar kc-avatar--user">👤</div>
+    </div>
+  )
+}
+
+// ─── Assistant message ────────────────────────────────────────────────────────
+function AssistantMessage({ msg }) {
+  const [copied, setCopied] = useState(false)
+  const copy = () => { navigator.clipboard.writeText(msg.content); setCopied(true); setTimeout(() => setCopied(false), 1500) }
+
+  return (
+    <div className="kc-row kc-row--assistant">
+      <div className="kc-avatar kc-avatar--kendr">K</div>
+      <div className="kc-bubble kc-bubble--assistant">
+
+        {/* Run hero */}
+        {msg.runId && (
+          <div className="kc-run-hero">
+            <div className="kc-run-eyebrow">Run</div>
+            <div className="kc-run-id">{msg.runId}</div>
+            <div className={`kc-run-badge kc-run-badge--${msg.status || 'thinking'}`}>
+              {msg.status || 'thinking'}
+            </div>
+          </div>
+        )}
+
+        {/* Thinking */}
+        {msg.status === 'thinking' && (
+          <div className="kc-thinking">
+            <span className="kc-typing-dot" />
+            <span className="kc-typing-dot" />
+            <span className="kc-typing-dot" />
+            {msg.statusText && <span className="kc-thinking-text">{msg.statusText}</span>}
+          </div>
+        )}
+
+        {/* Step timeline */}
+        {msg.steps?.length > 0 && (
+          <div className="kc-steps">
+            {msg.steps.map(step => <StepCard key={step.stepId} step={step} />)}
+          </div>
+        )}
+
+        {/* Final content */}
+        {msg.content && (
+          <div className="kc-content">
+            <MarkdownRenderer content={msg.content} />
+            {msg.status !== 'error' && (
+              <button className="kc-copy-btn" onClick={copy}>{copied ? '✓' : '⧉'}</button>
+            )}
+          </div>
+        )}
+
+        {/* Artifacts */}
+        {msg.artifacts?.length > 0 && (
+          <div className="kc-artifacts">
+            <div className="kc-artifacts-label">Artifacts</div>
+            {msg.artifacts.map((a, i) => (
+              <div key={i} className="kc-artifact">{typeof a === 'string' ? a : (a.name || a.path || JSON.stringify(a))}</div>
+            ))}
+          </div>
+        )}
+
+        {/* Error */}
+        {msg.status === 'error' && msg.content && (
+          <div className="kc-error-msg">⚠ {msg.content}</div>
+        )}
+
+        {/* Awaiting */}
+        {msg.status === 'awaiting' && (
+          <div className="kc-awaiting-note">⏳ Waiting for your reply above…</div>
+        )}
+
+        <div className="kc-bubble-ts">{formatTs(msg.ts)}</div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Step card ────────────────────────────────────────────────────────────────
+function StepCard({ step }) {
+  const [open, setOpen] = useState(false)
+  const cls = step.status === 'completed' || step.status === 'success' ? 'done'
+            : step.status === 'failed'    || step.status === 'error'   ? 'failed'
+            : step.status === 'running'                                ? 'running'
+            : 'pending'
+
+  const ICON = { done: '✓', failed: '✗', running: '●', pending: '·' }
+
+  return (
+    <div className={`kc-step kc-step--${cls}`}>
+      <div className="kc-step-dot">{ICON[cls]}</div>
+      <div className="kc-step-inner">
+        <div className="kc-step-header" onClick={() => (step.reason || step.message) && setOpen(o => !o)}>
+          <span className="kc-step-agent">{step.agent}</span>
+          {step.message && <span className="kc-step-msg">{step.message.slice(0, 80)}</span>}
+          {step.durationLabel && <span className="kc-step-dur">{step.durationLabel}</span>}
+          {(step.reason || step.message) && (
+            <span className="kc-step-toggle">{open ? '▾' : '▸'}</span>
+          )}
+        </div>
+        {open && step.reason && (
+          <div className="kc-step-reason">{step.reason}</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ─── Markdown renderer ────────────────────────────────────────────────────────
+function MarkdownRenderer({ content }) {
+  const parts = []
+  const re = /```(\w*)\n?([\s\S]*?)```/g
+  let last = 0, m
+  while ((m = re.exec(content)) !== null) {
+    if (m.index > last) parts.push({ t: 'text', v: content.slice(last, m.index) })
+    parts.push({ t: 'code', lang: m[1], v: m[2].trimEnd() })
+    last = m.index + m[0].length
+  }
+  if (last < content.length) parts.push({ t: 'text', v: content.slice(last) })
+  return (
+    <div className="kc-md">
+      {parts.map((p, i) =>
+        p.t === 'code' ? <CodeBlock key={i} lang={p.lang} code={p.v} /> : <InlineText key={i} text={p.v} />
+      )}
+    </div>
+  )
+}
+
+function InlineText({ text }) {
+  const html = text
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g, '<em>$1</em>')
+    .replace(/`([^`]+)`/g, '<code class="kc-inline-code">$1</code>')
+    .replace(/\n/g, '<br/>')
+  return <span dangerouslySetInnerHTML={{ __html: html }} />
+}
+
+function CodeBlock({ lang, code }) {
+  const [copied, setCopied] = useState(false)
+  const copy = () => { navigator.clipboard.writeText(code); setCopied(true); setTimeout(() => setCopied(false), 1500) }
+  return (
+    <div className="kc-code-block">
+      <div className="kc-code-header">
+        <span className="kc-code-lang">{lang || 'code'}</span>
+        <button className="kc-code-copy" onClick={copy}>{copied ? '✓ copied' : '⧉ copy'}</button>
+      </div>
+      <pre className="kc-code-body"><code>{code}</code></pre>
+    </div>
+  )
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function formatTs(ts) {
+  if (!ts) return ''
+  try { return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }
+  catch (_) { return '' }
+}
+
+function SendIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+}
+function StopIcon() {
+  return <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2.5"/></svg>
+}
+function ClearIcon() {
+  return <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+}

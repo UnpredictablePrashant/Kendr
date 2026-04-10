@@ -207,7 +207,7 @@ kendr gateway stop
 | 3 | **Multi-agent project generation** | `kendr generate` | Beta |
 | 4 | **SuperRAG knowledge engine** | `kendr run --superrag-mode` | Stable |
 | 5 | **Local command execution** | `kendr run --os-command` | Beta |
-| 6 | **Unified communication suite** | `kendr run --communication-authorized` | Beta |
+| 6 | **Unified communication suite** | `kendr run` | Beta |
 
 ---
 

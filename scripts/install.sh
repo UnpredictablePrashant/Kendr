@@ -83,13 +83,31 @@ else
   echo -e "    ${TEAL}.venv/bin/pip install 'kendr-runtime[full]'${RESET}       — All of the above"
 fi
 
-# ── 5. Bootstrap runtime state ───────────────────────────────────────────────
+# ── 5. Install scpr (web-scraping MCP tool) ──────────────────────────────────
+_install_scpr() {
+  if command -v scpr &>/dev/null; then
+    ok "scpr already installed ($(scpr --version 2>/dev/null || echo 'ok'))"
+    return 0
+  fi
+  if command -v npm &>/dev/null; then
+    info "Installing scpr via npm..."
+    npm install -g @cle-does-things/scpr --quiet 2>/dev/null && ok "scpr installed via npm" && return 0
+  fi
+  if command -v go &>/dev/null; then
+    info "Installing scpr via Go..."
+    go install github.com/AstraBert/scpr@latest 2>/dev/null && ok "scpr installed via Go" && return 0
+  fi
+  warn "scpr not installed — npm or Go required. Run manually: npm install -g @cle-does-things/scpr"
+}
+_install_scpr
+
+# ── 6. Bootstrap runtime state ───────────────────────────────────────────────
 if [ -f "scripts/bootstrap_local_state.py" ]; then
   info "Bootstrapping runtime state..."
   "$VENV_PYTHON" scripts/bootstrap_local_state.py 2>/dev/null && ok "Runtime state ready" || warn "Bootstrap skipped (non-fatal)"
 fi
 
-# ── 6. Add .venv/bin to PATH ─────────────────────────────────────────────────
+# ── 7. Add .venv/bin to PATH ─────────────────────────────────────────────────
 SHELL_NAME="$(basename "${SHELL:-bash}")"
 if [[ "$SHELL_NAME" == "zsh" ]]; then
   RC_FILE="$HOME/.zshrc"
@@ -107,7 +125,7 @@ fi
 
 [[ ":$PATH:" != *":$VENV_BIN:"* ]] && export PATH="$VENV_BIN:$PATH"
 
-# ── 7. Done ──────────────────────────────────────────────────────────────────
+# ── 8. Done ──────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}  ✔ kendr v${KENDR_VERSION} is ready!${RESET}"
 echo ""

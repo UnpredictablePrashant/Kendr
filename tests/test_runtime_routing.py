@@ -352,6 +352,86 @@ class RuntimeRoutingTests(unittest.TestCase):
             message = runtime._stuck_agent_message(state, "project_blueprint_agent")
         self.assertIn("packaging/import issue", message)
 
+    def test_stuck_agent_message_classifies_communication_authorization_errors(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = {
+                "_consecutive_failures": {
+                    "communication_summary_agent": {
+                        "count": 3,
+                        "last_error": "Communication agents require explicit authorization. Set state['communication_authorized']=True.",
+                    }
+                }
+            }
+            message = runtime._stuck_agent_message(state, "communication_summary_agent")
+        self.assertIn("--communication-authorized", message)
+        self.assertIn("--no-communication-authorized", message)
+        self.assertIn("/registry/skills", message)
+        self.assertIn("/registry/discovery/cards", message)
+
+    def test_build_initial_state_enables_communication_by_default(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Summarize my communications.")
+        self.assertTrue(state.get("communication_authorized"))
+
+    def test_build_initial_state_honors_explicit_communication_override(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state(
+                "Summarize my communications.",
+                communication_authorized=False,
+            )
+        self.assertFalse(state.get("communication_authorized"))
+
+    def test_direct_conversational_skills_query_returns_skill_snapshot(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = {
+                "available_agent_cards": [
+                    {"agent_name": "worker_agent", "category_label": "General"},
+                    {"agent_name": "mcp_example_tool_agent", "category_label": "MCP Tools"},
+                ]
+            }
+            message = runtime._direct_response_if_conversational("what all skills do you have, kendr?", state)
+        self.assertIsNotNone(message)
+        self.assertIn("active skills/agents", message)
+        self.assertIn("kendr agents list", message)
+        self.assertIn("kendr mcp list", message)
+
+    def test_communication_summary_detector_ignores_registry_discovery_query(self):
+        with (
+            patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
+            patch("tasks.a2a_protocol.upsert_agent_card"),
+            patch("tasks.a2a_protocol.insert_message"),
+            patch("tasks.a2a_protocol.upsert_task"),
+            patch("tasks.a2a_protocol.insert_artifact"),
+        ):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("what all skills do you have, kendr?")
+            detected = runtime._is_communication_summary_request(state)
+        self.assertFalse(detected)
+
+    def test_registry_discovery_shortcut_triggers_after_conversational_guard_window(self):
+        with (
+            patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
+            patch("tasks.a2a_protocol.upsert_agent_card"),
+            patch("tasks.a2a_protocol.insert_message"),
+            patch("tasks.a2a_protocol.upsert_task"),
+            patch("tasks.a2a_protocol.insert_artifact"),
+        ):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state(
+                "Agent 'communication_summary_agent' appears stuck in a dispatch loop. what all skills do you have, kendr?"
+            )
+            state["orchestrator_calls"] = 8
+
+            routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "__finish__")
+        self.assertIn("active skills/agents", routed_state.get("final_output", ""))
+        self.assertIn("kendr agents list", routed_state.get("final_output", ""))
+
     def test_explicit_os_command_routes_to_os_agent(self):
         with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
             runtime = AgentRuntime(build_registry())

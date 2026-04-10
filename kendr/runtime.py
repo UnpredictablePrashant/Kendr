@@ -74,6 +74,14 @@ from .recovery import write_recovery_files
 from .registry import Registry
 
 
+def _truthy(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class AgentRuntime:
     def __init__(self, registry: Registry):
         self.registry = registry
@@ -114,6 +122,10 @@ class AgentRuntime:
 
         snapshot = build_setup_snapshot(self._agent_cards())
         available_agents = snapshot.get("available_agents", [])
+        # Exclude MCP-backed agents when use_mcp is explicitly False
+        use_mcp = state.get("use_mcp")
+        if use_mcp is False:
+            available_agents = [a for a in available_agents if not str(a).startswith("mcp_")]
         filtered_cards = [card for card in self._agent_cards() if card["agent_name"] in available_agents]
         state["setup_status"] = snapshot
         state["available_agents"] = available_agents
@@ -121,6 +133,22 @@ class AgentRuntime:
         state["setup_actions"] = snapshot.get("setup_actions", [])
         state["setup_summary"] = snapshot.get("summary_text", "")
         state["available_agent_cards"] = filtered_cards
+        # Build a compact MCP context string for the orchestrator prompt
+        try:
+            from kendr.mcp_manager import list_servers_safe as _list_mcp_safe
+            _mcp_servers = _list_mcp_safe()
+            _mcp_lines = []
+            for _s in _mcp_servers:
+                if not _s.get("enabled", True):
+                    continue
+                _tools = [t.get("name", "") for t in (_s.get("tools") or []) if t.get("name")]
+                _mcp_lines.append(
+                    f"  - {_s.get('name', _s.get('id', 'unknown'))}"
+                    + (f": {', '.join(_tools)}" if _tools else " (no tools discovered)")
+                )
+            state["mcp_servers_context"] = "\n".join(_mcp_lines) if _mcp_lines else "None connected"
+        except Exception:
+            state["mcp_servers_context"] = "unavailable"
         ensure_a2a_state(state, filtered_cards)
         return state
 
@@ -209,6 +237,19 @@ class AgentRuntime:
             return (
                 "Likely missing credentials. Verify required API keys are configured in env/setup and "
                 "available to the runtime process."
+            )
+        if (
+            "communication agents require explicit authorization" in error
+            or "communication access is disabled" in error
+            or "communication_authorized" in error
+        ):
+            return (
+                "Communication access is disabled for this run. Communication workflows are enabled by default; "
+                "use `--communication-authorized` / `--no-communication-authorized` (CLI), send "
+                "`communication_authorized` in gateway payloads, or set `KENDR_COMMUNICATION_AUTHORIZED` "
+                "for a global default. If you only wanted capability listing, ask "
+                "`what skills/capabilities do you have` in chat, run `kendr agents list`, or call "
+                "`GET /registry/skills` / `GET /registry/discovery/cards`."
             )
         if "outside allowed scope" in error or "read-only mode" in error or "permission" in error:
             return (
@@ -1239,6 +1280,11 @@ class AgentRuntime:
         return any(marker in text for marker in markers)
 
     def _is_communication_summary_request(self, state: dict) -> bool:
+        # Do not route capability/skills inventory prompts into communication
+        # inbox aggregation workflows.
+        if self._is_registry_discovery_request(state):
+            return False
+
         text = " ".join(
             [
                 str(state.get("user_query", "")),
@@ -1306,6 +1352,32 @@ class AgentRuntime:
         r"|^help[\s!?.]*$|how\s+can\s+you\s+help|what\s+features|what\s+(else\s+)?can\s+you\s+help)",
         re.IGNORECASE,
     )
+    _SKILLS_RE = re.compile(
+        r"(what(\s+all)?\s+skills\s+do\s+you\s+have"
+        r"|which\s+skills\s+do\s+you\s+have"
+        r"|show(\s+me)?\s+(your|available)\s+skills"
+        r"|list(\s+your|\s+available)?\s+skills"
+        r"|what\s+agents\s+do\s+you\s+have"
+        r"|which\s+agents\s+are\s+available)",
+        re.IGNORECASE,
+    )
+    _REGISTRY_DISCOVERY_RE = re.compile(
+        r"(what(\s+all)?\s+(skills|agents|capabilities|mcp(\s+servers)?|apis?)\s+do\s+you\s+have"
+        r"|list(\s+your|\s+available)?\s+(skills|agents|capabilities|mcp(\s+servers)?|apis?)"
+        r"|show(\s+me)?\s+(your|available)\s+(skills|agents|capabilities|mcp(\s+servers)?|apis?)"
+        r"|which\s+(skills|agents|capabilities|mcp(\s+servers)?|apis?)\s+are\s+available"
+        r"|what\s+can\s+you\s+access)",
+        re.IGNORECASE,
+    )
+    _MCP_QUERY_RE = re.compile(
+        r"(what(\s+all)?\s+mcp(\s+servers?)?\s*(are\s*)?(connected|available|active|running|enabled|linked|configured)"
+        r"|(which|what)\s+mcp\s+servers?"
+        r"|mcp\s+servers?\s+(are\s+)?(connected|available|active|running|enabled)"
+        r"|connected\s+mcp(\s+servers?)?"
+        r"|list\s+(the\s+)?mcp(\s+servers?)?"
+        r"|show\s+(the\s+)?mcp(\s+servers?)?)",
+        re.IGNORECASE,
+    )
 
     _KENDR_CAPABILITIES = (
         "Here's what I can help you with:\n\n"
@@ -1319,6 +1391,80 @@ class AgentRuntime:
         "- **System setup** — configure integrations and API connections\n\n"
         "Just describe what you want and I'll figure out the best way to help."
     )
+
+    def _skills_overview(self, state: dict) -> str:
+        cards = state.get("available_agent_cards")
+        if not isinstance(cards, list) or not cards:
+            cards = [card.to_dict() for card in self.skill_registry.get_active_cards()]
+
+        total = len(cards)
+        mcp_count = sum(
+            1
+            for card in cards
+            if str(card.get("agent_name", "")).startswith("mcp_")
+        )
+        category_counts: dict[str, int] = {}
+        for card in cards:
+            category = str(card.get("category_label") or card.get("category") or "General").strip()
+            if not category:
+                category = "General"
+            category_counts[category] = category_counts.get(category, 0) + 1
+
+        top_categories = sorted(
+            category_counts.items(),
+            key=lambda item: (-item[1], item[0].lower()),
+        )[:6]
+        category_summary = ", ".join(f"{name}: {count}" for name, count in top_categories) or "No active categories."
+
+        return (
+            f"I currently have {total} active skills/agents available.\n"
+            f"- MCP-backed agents: {mcp_count}\n"
+            f"- Top categories: {category_summary}\n"
+            "- Run `kendr agents list` for the full list\n"
+            "- Run `kendr mcp list` to inspect connected MCP servers and tools\n"
+            "- Open `GET /registry/skills` for structured skill cards (category, config hints, status)"
+        )
+
+    def _mcp_servers_overview(self) -> str:
+        """Return a human-readable summary of connected MCP servers and their tools."""
+        try:
+            from kendr.mcp_manager import list_servers_safe
+            servers = list_servers_safe()
+        except Exception:
+            servers = []
+        if not servers:
+            return "No MCP servers are currently registered. Add one via the MCP Servers panel or `kendr mcp add`."
+        lines = [f"I have {len(servers)} MCP server(s) registered:\n"]
+        for srv in servers:
+            name = str(srv.get("name") or srv.get("id") or "unknown")
+            status = str(srv.get("status") or "unknown")
+            enabled = bool(srv.get("enabled", True))
+            tools = srv.get("tools") or []
+            tool_names = [str(t.get("name", "")) for t in tools if t.get("name")]
+            status_label = "connected" if status == "connected" and enabled else ("disabled" if not enabled else status)
+            line = f"• **{name}** — {status_label}"
+            if tool_names:
+                line += f"\n  Tools: {', '.join(tool_names)}"
+            else:
+                line += "\n  Tools: none discovered yet (click Re-discover in MCP panel)"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _is_registry_discovery_request(self, state: dict) -> bool:
+        text = " ".join(
+            [
+                str(state.get("user_query", "")),
+                str(state.get("current_objective", "")),
+            ]
+        ).strip()
+        if not text:
+            return False
+        if self._REGISTRY_DISCOVERY_RE.search(text):
+            return True
+        if self._MCP_QUERY_RE.search(text):
+            return True
+        lowered = text.lower()
+        return "what all skills do you have" in lowered
 
     def _direct_response_if_conversational(
         self, text: str, state: dict
@@ -1354,6 +1500,10 @@ class AgentRuntime:
             return "You're welcome! Let me know if there's anything else I can help with."
         if self._ACK_RE.match(text):
             return "Got it! Let me know whenever you're ready to continue."
+        if self._MCP_QUERY_RE.search(text):
+            return self._mcp_servers_overview()
+        if self._SKILLS_RE.search(text):
+            return self._skills_overview(state)
         if self._CAPABILITY_RE.search(text):
             return self._KENDR_CAPABILITIES
 
@@ -2085,6 +2235,20 @@ class AgentRuntime:
                 )
                 log_task_update("Orchestrator", "Conversational shortcut — skipping planner.")
                 return state
+
+        # Capability inventory prompt should always resolve deterministically,
+        # even after prior retries where the conversational shortcut no longer
+        # applies due call-count guardrails.
+        if in_task_phase and self._is_registry_discovery_request(state):
+            direct = self._skills_overview(state)
+            state["next_agent"] = "__finish__"
+            state["final_output"] = direct
+            state = append_message(
+                state,
+                make_message("orchestrator_agent", "user", "final", direct),
+            )
+            log_task_update("Orchestrator", "Capability discovery shortcut — returning inventory directly.")
+            return state
 
         # --- Skill registry: single-agent direct routing (bypass planner) ---
         # Fire only on the very first orchestrator call so we don't re-route mid-plan.
@@ -3130,6 +3294,9 @@ Reviewer corrected values:
 Current setup summary:
 {state.get("setup_summary", "")}
 
+Connected MCP servers (tools you can call via mcp_* agents):
+{state.get("mcp_servers_context", "None")}
+
 File memory context:
 {self._truncate(state.get("file_memory_context", "") or "None", 1800)}
 
@@ -3631,6 +3798,10 @@ Return ONLY valid JSON in this exact schema:
         resolved_workflow_id = overrides.get("workflow_id", resolved_run_id)
         resolved_attempt_id = overrides.get("attempt_id", resolved_run_id)
         session_started_at = overrides.get("session_started_at") or datetime.now(timezone.utc).isoformat()
+        communication_authorized = _truthy(
+            overrides.get("communication_authorized"),
+            default=_truthy(os.getenv("KENDR_COMMUNICATION_AUTHORIZED"), True),
+        )
         initial_state: RuntimeState = {
             "run_id": resolved_run_id,
             "workflow_id": resolved_workflow_id,
@@ -3731,6 +3902,7 @@ Return ONLY valid JSON in this exact schema:
             "max_steps": overrides.get("max_steps", 20),
             "research_target": "",
             "use_vector_memory": True,
+            "communication_authorized": communication_authorized,
             "local_drive_auto_generate_extension_handlers": False,
             "local_drive_unknown_extensions": [],
             "local_drive_handler_registry": {},
@@ -3923,6 +4095,27 @@ Return ONLY valid JSON in this exact schema:
         app = self.build_workflow()
         return app.invoke(initial_state)
 
+    def _refresh_mcp_agents(self) -> None:
+        """Refresh MCP-backed agents from the current database state.
+
+        Called at the start of each run_query so servers added or discovered
+        after gateway startup are available for routing without a restart.
+        """
+        try:
+            from kendr.discovery import _register_mcp_tools
+            from kendr.skill_registry import build_skill_registry as _build_sr
+            # Remove stale MCP agents and plugin entry
+            for name in list(self.registry.agents.keys()):
+                if name.startswith("mcp_"):
+                    del self.registry.agents[name]
+            self.registry.plugins.pop("builtin.mcp", None)
+            # Re-register from current DB state
+            _register_mcp_tools(self.registry)
+            # Rebuild skill index so new agents are routable
+            self.skill_registry = _build_sr(self.registry)
+        except Exception:
+            pass
+
     def run_query(
         self,
         user_query: str,
@@ -3988,6 +4181,7 @@ Return ONLY valid JSON in this exact schema:
         self._write_session_record(initial_state, status="running")
         provider_override = str(initial_state.get("provider") or "").strip().lower()
         model_override = str(initial_state.get("model") or "").strip()
+        self._refresh_mcp_agents()
         try:
             with runtime_model_override(provider_override, model_override):
                 app = self.build_workflow()

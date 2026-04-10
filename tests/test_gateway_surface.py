@@ -49,6 +49,265 @@ class GatewaySurfaceSmokeTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(any(item["name"] == "worker_agent" for item in payload))
 
+    def test_registry_discovery_endpoint_returns_unified_snapshot(self):
+        fake_caps = [
+            {
+                "id": "cap-1",
+                "type": "mcp_server",
+                "key": "mcp.server.s1",
+                "name": "MCP Server 1",
+                "description": "Test server",
+                "status": "active",
+                "health_status": "healthy",
+                "visibility": "workspace",
+                "version": 1,
+                "tags": ["mcp"],
+                "metadata": {"managed_by": "mcp_sync"},
+            }
+        ]
+        with (
+            patch("kendr.gateway_server.sync_mcp_capabilities", return_value={"servers_synced": 1}),
+            patch.object(gateway.CAPABILITY_REGISTRY, "list", return_value=fake_caps),
+        ):
+            status, payload = self._json_get("/registry/discovery?workspace_id=default")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["workspace_id"], "default")
+        self.assertEqual(payload["summary"]["total"], 1)
+        self.assertEqual(payload["summary"]["by_type"]["mcp_server"], 1)
+
+    def test_registry_discovery_cards_endpoint_returns_cards(self):
+        fake_caps = [
+            {
+                "id": "cap-1",
+                "type": "tool",
+                "key": "mcp.tool.s1.echo",
+                "name": "echo",
+                "description": "Echo tool",
+                "status": "active",
+                "health_status": "healthy",
+                "visibility": "workspace",
+                "version": 1,
+                "tags": ["mcp", "tool"],
+                "metadata": {"managed_by": "mcp_sync"},
+            }
+        ]
+        with (
+            patch("kendr.gateway_server.sync_mcp_capabilities", return_value={"tools_synced": 1}),
+            patch.object(gateway.CAPABILITY_REGISTRY, "list", return_value=fake_caps),
+        ):
+            status, payload = self._json_get("/registry/discovery/cards")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["count"], 1)
+        self.assertEqual(payload["cards"][0]["key"], "mcp.tool.s1.echo")
+
+    def test_create_auth_profile_endpoint(self):
+        fake_auth = {"id": "auth-1", "provider": "github", "auth_type": "api_key"}
+        request = urllib.request.Request(
+            f"{self.base_url}/registry/auth-profiles",
+            data=json.dumps(
+                {
+                    "workspace_id": "default",
+                    "auth_type": "api_key",
+                    "provider": "github",
+                    "secret_ref": "vault://default/github/token",
+                    "scopes": ["repo:read"],
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with patch.object(gateway.CAPABILITY_REGISTRY, "create_auth_profile", return_value=fake_auth):
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["auth_profile"]["id"], "auth-1")
+
+    def test_import_openapi_endpoint(self):
+        request = urllib.request.Request(
+            f"{self.base_url}/registry/apis/import-openapi",
+            data=json.dumps(
+                {
+                    "workspace_id": "default",
+                    "owner_user_id": "u1",
+                    "openapi": {
+                        "openapi": "3.0.0",
+                        "info": {"title": "Sample API"},
+                        "paths": {"/health": {"get": {"summary": "Health check", "responses": {"200": {"description": "ok"}}}}},
+                    },
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with patch(
+            "kendr.gateway_server.import_openapi_as_capabilities",
+            return_value={"operations_synced": 1, "service_capability_id": "cap-1"},
+        ):
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["import_result"]["operations_synced"], 1)
+
+    def test_capability_crud_and_lifecycle_endpoints(self):
+        created = {
+            "id": "cap-skill-1",
+            "type": "skill",
+            "key": "skill.code.review",
+            "name": "Code Review Skill",
+            "description": "Reviews code quality.",
+            "status": "draft",
+        }
+        verified = {**created, "status": "verified"}
+        active = {**created, "status": "active"}
+        disabled = {**created, "status": "disabled"}
+        listed = [disabled]
+
+        create_req = urllib.request.Request(
+            f"{self.base_url}/registry/capabilities",
+            data=json.dumps(
+                {
+                    "workspace_id": "default",
+                    "actor_user_id": "u1",
+                    "type": "skill",
+                    "key": "skill.code.review",
+                    "name": "Code Review Skill",
+                    "description": "Reviews code quality.",
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        verify_req = urllib.request.Request(
+            f"{self.base_url}/registry/capabilities/cap-skill-1/verify",
+            data=json.dumps({"workspace_id": "default", "actor_user_id": "u1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        publish_req = urllib.request.Request(
+            f"{self.base_url}/registry/capabilities/cap-skill-1/publish",
+            data=json.dumps({"workspace_id": "default", "actor_user_id": "u1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        disable_req = urllib.request.Request(
+            f"{self.base_url}/registry/capabilities/cap-skill-1/disable",
+            data=json.dumps({"workspace_id": "default", "actor_user_id": "u1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+        with (
+            patch.object(gateway.CAPABILITY_REGISTRY, "create", return_value=created),
+            patch.object(gateway.CAPABILITY_REGISTRY, "verify", return_value=verified),
+            patch.object(gateway.CAPABILITY_REGISTRY, "publish", return_value=active),
+            patch.object(gateway.CAPABILITY_REGISTRY, "disable", return_value=disabled),
+            patch.object(gateway.CAPABILITY_REGISTRY, "list", return_value=listed),
+            patch.object(gateway.CAPABILITY_REGISTRY, "get", return_value=disabled),
+        ):
+            with urllib.request.urlopen(create_req, timeout=5) as response:
+                create_payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(verify_req, timeout=5) as response:
+                verify_payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(publish_req, timeout=5) as response:
+                publish_payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(disable_req, timeout=5) as response:
+                disable_payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(f"{self.base_url}/registry/capabilities?workspace_id=default", timeout=5) as response:
+                list_payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(f"{self.base_url}/registry/capabilities/cap-skill-1", timeout=5) as response:
+                get_payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertTrue(create_payload["ok"])
+        self.assertEqual(verify_payload["capability"]["status"], "verified")
+        self.assertEqual(publish_payload["capability"]["status"], "active")
+        self.assertEqual(disable_payload["capability"]["status"], "disabled")
+        self.assertEqual(list_payload["count"], 1)
+        self.assertEqual(get_payload["id"], "cap-skill-1")
+
+    def test_capability_invalid_transition_returns_400(self):
+        publish_req = urllib.request.Request(
+            f"{self.base_url}/registry/capabilities/cap-skill-1/publish",
+            data=json.dumps({"workspace_id": "default", "actor_user_id": "u1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with (
+            patch.object(gateway.CAPABILITY_REGISTRY, "publish", side_effect=ValueError("Invalid status transition: error -> active")),
+            self.assertRaises(urllib.error.HTTPError) as exc,
+        ):
+            urllib.request.urlopen(publish_req, timeout=5)
+        self.assertEqual(exc.exception.code, 400)
+        payload = json.loads(exc.exception.read().decode("utf-8"))
+        self.assertFalse(payload["ok"])
+        self.assertIn("Invalid status transition", payload["error"])
+
+    def test_policy_profile_endpoints(self):
+        create_req = urllib.request.Request(
+            f"{self.base_url}/registry/policy-profiles",
+            data=json.dumps(
+                {
+                    "workspace_id": "default",
+                    "name": "readonly-policy",
+                    "rules": {"deny_write": True},
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        fake_created = {"id": "pp-1", "name": "readonly-policy", "rules": {"deny_write": True}}
+        fake_list = [fake_created]
+        with (
+            patch.object(gateway.CAPABILITY_REGISTRY, "create_policy_profile", return_value=fake_created),
+            patch.object(gateway.CAPABILITY_REGISTRY, "list_policy_profiles", return_value=fake_list),
+        ):
+            with urllib.request.urlopen(create_req, timeout=5) as response:
+                create_payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(f"{self.base_url}/registry/policy-profiles?workspace_id=default", timeout=5) as response:
+                list_payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertTrue(create_payload["ok"])
+        self.assertEqual(create_payload["policy_profile"]["id"], "pp-1")
+        self.assertEqual(list_payload["count"], 1)
+
+    def test_capability_health_and_audit_get_endpoints(self):
+        fake_health = [{"health_run_id": "hr-1", "status": "healthy"}]
+        fake_audit = [{"id": "ae-1", "action": "capability.health"}]
+        with (
+            patch.object(gateway.CAPABILITY_REGISTRY, "list_health_runs", return_value=fake_health),
+            patch.object(gateway.CAPABILITY_REGISTRY, "list_audit_events", return_value=fake_audit),
+        ):
+            with urllib.request.urlopen(f"{self.base_url}/registry/capabilities/cap-1/health?workspace_id=default", timeout=5) as response:
+                health_payload = json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(f"{self.base_url}/registry/capabilities/cap-1/audit?workspace_id=default", timeout=5) as response:
+                audit_payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(health_payload["count"], 1)
+        self.assertEqual(health_payload["items"][0]["status"], "healthy")
+        self.assertEqual(audit_payload["count"], 1)
+        self.assertEqual(audit_payload["items"][0]["action"], "capability.health")
+
+    def test_capability_health_check_endpoint(self):
+        health_req = urllib.request.Request(
+            f"{self.base_url}/registry/capabilities/cap-skill-1/health-check",
+            data=json.dumps(
+                {
+                    "workspace_id": "default",
+                    "actor_user_id": "u1",
+                    "status": "healthy",
+                    "latency_ms": 25,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        fake_cap = {"id": "cap-skill-1", "health_status": "healthy"}
+        with patch.object(gateway.CAPABILITY_REGISTRY, "record_health", return_value=fake_cap):
+            with urllib.request.urlopen(health_req, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["capability"]["health_status"], "healthy")
+
     def test_runs_endpoint_returns_patched_recent_runs(self):
         with patch("kendr.gateway_server.list_recent_runs", return_value=[{"run_id": "run_smoke"}]):
             status, payload = self._json_get("/runs")
