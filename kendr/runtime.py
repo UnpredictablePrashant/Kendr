@@ -25,7 +25,7 @@ from kendr.persistence import (
 )
 from kendr.path_utils import normalize_host_path_str
 from kendr.setup import build_setup_snapshot
-from kendr.skill_registry import build_skill_registry, SkillRegistry
+from kendr.agent_routing import build_agent_routing_index, AgentRoutingIndex
 from kendr.workflow_contract import (
     approval_request_to_text,
     is_deep_research_workflow_type,
@@ -85,13 +85,13 @@ def _truthy(value: Any, default: bool = False) -> bool:
 class AgentRuntime:
     def __init__(self, registry: Registry):
         self.registry = registry
-        self.skill_registry: SkillRegistry = build_skill_registry(registry)
+        self.agent_routing: AgentRoutingIndex = build_agent_routing_index(registry)
         self._live_plan_data: dict = {}
-        _sr_summary = self.skill_registry.summary()
+        _ar_summary = self.agent_routing.summary()
         print(
-            f"[kendr] Skill registry ready: "
-            f"{_sr_summary['active']} active / {_sr_summary['total']} total agents across "
-            f"{len(_sr_summary.get('by_category', {}))} categories."
+            f"[kendr] Agent routing index ready: "
+            f"{_ar_summary['active']} active / {_ar_summary['total']} total agents across "
+            f"{len(_ar_summary.get('by_category', {}))} categories."
         )
 
     def _agent_cards(self) -> list[dict]:
@@ -133,7 +133,25 @@ class AgentRuntime:
         state["setup_actions"] = snapshot.get("setup_actions", [])
         state["setup_summary"] = snapshot.get("summary_text", "")
         state["available_agent_cards"] = filtered_cards
-        # Build a compact MCP context string for the orchestrator prompt
+        # Build unified connector catalog for the orchestrator prompt.
+        # This replaces the old separate mcp_servers_context / skills_context
+        # and surfaces exact state_input_key + required_inputs for each connector
+        # so the LLM knows precisely how to invoke skills and MCP tools.
+        try:
+            from kendr.connector_registry import (
+                build_connector_catalog as _build_catalog,
+                connector_catalog_prompt_block as _catalog_prompt,
+            )
+            _all_specs = _build_catalog(self.registry, self.agent_routing)
+            # Honour use_mcp flag: hide mcp_tool connectors if toggled off
+            if state.get("use_mcp") is False:
+                _all_specs = [s for s in _all_specs if s.connector_type != "mcp_tool"]
+            state["connector_catalog"] = [s.to_dict() for s in _all_specs]
+            state["connector_catalog_prompt"] = _catalog_prompt(_all_specs)
+        except Exception:
+            state["connector_catalog"] = []
+            state["connector_catalog_prompt"] = ""
+        # Keep legacy keys populated for any code that still reads them
         try:
             from kendr.mcp_manager import list_servers_safe as _list_mcp_safe
             _mcp_servers = _list_mcp_safe()
@@ -149,6 +167,10 @@ class AgentRuntime:
             state["mcp_servers_context"] = "\n".join(_mcp_lines) if _mcp_lines else "None connected"
         except Exception:
             state["mcp_servers_context"] = "unavailable"
+        try:
+            state["skills_context"] = self.agent_routing.user_skills_prompt_block() or "No custom skills installed"
+        except Exception:
+            state["skills_context"] = "unavailable"
         ensure_a2a_state(state, filtered_cards)
         return state
 
@@ -163,11 +185,327 @@ class AgentRuntime:
         "deep_research_agent",
         "local_drive_agent",
     }
+    _CRITICAL_REVIEW_AGENTS = {
+        "master_coding_agent",
+        "backend_builder_agent",
+        "frontend_builder_agent",
+        "database_architect_agent",
+        "auth_security_agent",
+        "devops_agent",
+        "security_scanner_agent",
+        "project_verifier_agent",
+    }
+    _PLANNER_COMPLEXITY_MARKERS = (
+        "build",
+        "implement",
+        "integrate",
+        "migrate",
+        "pipeline",
+        "architecture",
+        "multi-agent",
+        "end-to-end",
+        "full stack",
+        "production",
+        "deploy",
+        "workflow",
+        "coordinate",
+        "analyze",
+        "refactor",
+    )
+    _RISK_MARKERS = (
+        "security",
+        "auth",
+        "payment",
+        "production",
+        "compliance",
+        "legal",
+        "privacy",
+        "delete",
+        "destructive",
+        "credential",
+        "permission",
+        "migration",
+    )
 
     def _is_agent_available(self, state: dict, agent_name: str) -> bool:
         if agent_name in (state.get("_circuit_broken_agents") or {}):
             return False
         return agent_name in set(state.get("available_agents", []))
+
+    def _effective_available_agents(self, state: Mapping[str, Any]) -> list[str]:
+        available = [
+            str(name).strip()
+            for name in state.get("available_agents", [])
+            if str(name).strip()
+        ]
+        blocked = {
+            str(name).strip()
+            for name in state.get("_policy_blocked_agents", [])
+            if str(name).strip()
+        }
+        if not blocked:
+            return available
+        return [name for name in available if name not in blocked]
+
+    def _resolve_policy_mode(
+        self,
+        state: Mapping[str, Any],
+        *,
+        primary_key: str,
+        aliases: tuple[str, ...] = (),
+        default: str = "adaptive",
+    ) -> str:
+        raw_value: Any = None
+        if primary_key in state:
+            raw_value = state.get(primary_key)
+        else:
+            for alias in aliases:
+                if alias in state:
+                    raw_value = state.get(alias)
+                    break
+        if isinstance(raw_value, bool):
+            return "always" if raw_value else "never"
+        value = str(raw_value or default).strip().lower()
+        if value in {"adaptive", "auto", "dynamic", "smart"}:
+            return "adaptive"
+        if value in {"always", "force", "required", "on", "true", "1"}:
+            return "always"
+        if value in {"never", "off", "disabled", "skip", "false", "0"}:
+            return "never"
+        return default
+
+    def _objective_text(self, state: Mapping[str, Any]) -> str:
+        return " ".join(
+            [
+                str(state.get("user_query", "") or ""),
+                str(state.get("current_objective", "") or ""),
+            ]
+        ).strip()
+
+    def _word_count(self, text: str) -> int:
+        return len(re.findall(r"[A-Za-z0-9_]+", str(text or "")))
+
+    def _count_markers(self, text: str, markers: tuple[str, ...]) -> int:
+        lowered = str(text or "").lower()
+        return sum(1 for marker in markers if marker in lowered)
+
+    def _planner_signal_snapshot(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        text = self._objective_text(state).lower()
+        word_count = self._word_count(text)
+        conjunction_count = sum(
+            text.count(token) for token in (" and ", " then ", " after ", " before ", " while ", " also ")
+        )
+        complexity_markers = self._count_markers(text, self._PLANNER_COMPLEXITY_MARKERS)
+        risk_markers = self._count_markers(text, self._RISK_MARKERS)
+        explicit_plan_request = bool(re.search(r"\b(plan|roadmap|step[\s-]*by[\s-]*step|phase[s]?)\b", text))
+        has_structured_inputs = bool(
+            self._has_local_drive_request(dict(state))
+            or self._is_superrag_request(dict(state))
+            or state.get("blueprint_json")
+            or state.get("incoming_payload")
+        )
+        return {
+            "word_count": word_count,
+            "conjunction_count": conjunction_count,
+            "complexity_markers": complexity_markers,
+            "risk_markers": risk_markers,
+            "explicit_plan_request": explicit_plan_request,
+            "has_structured_inputs": has_structured_inputs,
+            "setup_actions": len(state.get("setup_actions", []) or []),
+            "plan_revision_feedback": bool(str(state.get("plan_revision_feedback", "")).strip()),
+        }
+
+    def _should_run_planner(self, state: Mapping[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        mode = self._resolve_policy_mode(
+            state,
+            primary_key="planner_policy_mode",
+            aliases=("planner_mode",),
+            default="adaptive",
+        )
+        adaptive_enabled = _truthy(state.get("adaptive_agent_selection"), True)
+        if mode == "never":
+            return False, "Planner disabled by policy mode.", {"mode": mode}
+        if mode == "always":
+            return True, "Planner required by policy mode.", {"mode": mode}
+        if not adaptive_enabled:
+            return True, "Adaptive selection disabled; planner runs by default.", {"mode": mode}
+        if state.get("plan_steps") or bool(state.get("plan_ready", False)):
+            return False, "Plan already exists in state.", {"mode": mode}
+        if self._awaiting_user_input(state):
+            return False, "Run is waiting for user input.", {"mode": mode}
+        if self._is_local_command_request(dict(state)):
+            return False, "Local command workflow routes directly to os_agent.", {"mode": mode}
+        if self._is_github_request(dict(state)):
+            return False, "GitHub workflow routes directly to github_agent.", {"mode": mode}
+        if self._is_communication_summary_request(dict(state)):
+            return False, "Communication digest workflow routes directly.", {"mode": mode}
+        if self._is_registry_discovery_request(dict(state)):
+            return False, "Capability discovery request does not require planning.", {"mode": mode}
+        if self._is_project_build_request(dict(state)):
+            return True, "Project build workflow requires staged planning.", {"mode": mode}
+        if self._is_long_document_request(dict(state)) or self._is_deep_research_workflow(dict(state)):
+            return True, "Long-document/deep-research workflow requires planning.", {"mode": mode}
+        if self._is_superrag_request(dict(state)):
+            return True, "SuperRAG workflow requires planning.", {"mode": mode}
+        if self._has_local_drive_request(dict(state)):
+            return True, "Local-drive workflows require explicit planning.", {"mode": mode}
+
+        signals = self._planner_signal_snapshot(state)
+        score = 0
+        words = int(signals["word_count"])
+        if words >= 70:
+            score += 3
+        elif words >= 35:
+            score += 2
+        elif words >= 18:
+            score += 1
+        if int(signals["conjunction_count"]) >= 3:
+            score += 2
+        elif int(signals["conjunction_count"]) >= 1:
+            score += 1
+        if int(signals["complexity_markers"]) >= 2:
+            score += 2
+        elif int(signals["complexity_markers"]) >= 1:
+            score += 1
+        if int(signals["risk_markers"]) >= 2:
+            score += 2
+        elif int(signals["risk_markers"]) >= 1:
+            score += 1
+        if bool(signals["explicit_plan_request"]):
+            score += 2
+        if bool(signals["has_structured_inputs"]):
+            score += 2
+        if int(signals["setup_actions"]) > 0:
+            score += 1
+        if bool(signals["plan_revision_feedback"]):
+            score += 1
+        if words <= 12:
+            score -= 2
+
+        threshold = int(state.get("planner_score_threshold", 4) or 4)
+        signals["score"] = score
+        signals["threshold"] = threshold
+        signals["mode"] = mode
+        if score >= threshold:
+            return True, "Adaptive planner policy selected staged planning.", signals
+        return False, "Adaptive planner policy selected direct execution routing.", signals
+
+    def _review_signal_snapshot(self, state: Mapping[str, Any], agent_name: str, output_text: str) -> dict[str, Any]:
+        objective_text = self._objective_text(state).lower()
+        review_subject_step = str(
+            state.get("last_completed_plan_step_id")
+            or state.get("current_plan_step_id")
+            or ""
+        ).strip()
+        review_key = self._review_revision_key(review_subject_step, agent_name)
+        revision_counts = state.get("review_revision_counts", {})
+        if not isinstance(revision_counts, dict):
+            revision_counts = {}
+        success_criteria = str(
+            state.get("last_completed_plan_step_success_criteria")
+            or state.get("current_plan_step_success_criteria")
+            or ""
+        ).strip()
+        output_words = self._word_count(output_text)
+        return {
+            "objective_word_count": self._word_count(objective_text),
+            "output_word_count": output_words,
+            "has_success_criteria": bool(success_criteria),
+            "risk_markers": self._count_markers(f"{objective_text}\n{str(output_text or '').lower()}", self._RISK_MARKERS),
+            "critical_agent": agent_name in self._CRITICAL_REVIEW_AGENTS,
+            "project_build_mode": bool(state.get("project_build_mode", False)),
+            "deep_research_workflow": self._is_deep_research_workflow(dict(state)),
+            "previous_revisions": int(revision_counts.get(review_key, 0) or 0),
+            "quality_gate_enforced": bool(state.get("enforce_quality_gate", True)),
+        }
+
+    def _should_request_review(
+        self,
+        state: Mapping[str, Any],
+        *,
+        agent_name: str,
+        output_text: str,
+        skip_review_once: bool = False,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        mode = self._resolve_policy_mode(
+            state,
+            primary_key="reviewer_policy_mode",
+            aliases=("reviewer_mode",),
+            default="adaptive",
+        )
+        adaptive_enabled = _truthy(state.get("adaptive_agent_selection"), True)
+        if agent_name == "reviewer_agent":
+            return False, "Reviewer does not self-review.", {"mode": mode}
+        if agent_name in self._NON_REVIEW_AGENTS:
+            return False, f"{agent_name} is excluded from review.", {"mode": mode}
+        if skip_review_once:
+            return False, "Review skipped for this step by runtime guard.", {"mode": mode}
+        if bool(state.get("skip_reviews", False)):
+            return False, "Review skipped by run option.", {"mode": mode}
+        if self._awaiting_user_input(state):
+            return False, "Run is waiting for user input.", {"mode": mode}
+        if mode == "never":
+            return False, "Reviewer disabled by policy mode.", {"mode": mode}
+        if mode == "always":
+            return True, "Reviewer required by policy mode.", {"mode": mode}
+        if not adaptive_enabled:
+            return True, "Adaptive selection disabled; reviewer runs by default.", {"mode": mode}
+
+        signals = self._review_signal_snapshot(state, agent_name, output_text)
+        if bool(signals["quality_gate_enforced"]) and bool(signals["project_build_mode"]):
+            return True, "Quality gate requires reviewer in project build mode.", signals
+        if bool(signals["critical_agent"]) and int(signals["output_word_count"]) >= 40:
+            return True, "Critical execution step requires reviewer validation.", signals
+        if int(signals["previous_revisions"]) > 0:
+            return True, "Step is in revision cycle; reviewer remains active.", signals
+
+        score = 0
+        output_words = int(signals["output_word_count"])
+        objective_words = int(signals["objective_word_count"])
+        if bool(signals["has_success_criteria"]):
+            score += 2
+        if output_words >= 250:
+            score += 1
+        if output_words >= 800:
+            score += 2
+        if objective_words >= 25:
+            score += 1
+        if objective_words >= 60:
+            score += 1
+        risk_markers = int(signals["risk_markers"])
+        if risk_markers >= 1:
+            score += 1
+        if risk_markers >= 2:
+            score += 1
+        if bool(signals["critical_agent"]):
+            score += 1
+        if bool(signals["project_build_mode"]):
+            score += 2
+        if bool(signals["deep_research_workflow"]):
+            score += 2
+        if output_words < 60:
+            score -= 2
+        if objective_words < 12 and not bool(signals["has_success_criteria"]):
+            score -= 1
+
+        threshold = int(state.get("reviewer_score_threshold", 5) or 5)
+        signals["score"] = score
+        signals["threshold"] = threshold
+        signals["mode"] = mode
+        if score >= threshold:
+            return True, "Adaptive reviewer policy selected quality validation.", signals
+        return False, "Adaptive reviewer policy skipped review for this low-risk step.", signals
+
+    def _policy_blocked_agents(self, state: Mapping[str, Any]) -> set[str]:
+        blocked: set[str] = set()
+        available = set(state.get("available_agents", []) or [])
+        if "planner_agent" in available and not state.get("plan_steps") and not bool(state.get("plan_ready", False)):
+            run_planner, _, _ = self._should_run_planner(state)
+            if not run_planner:
+                blocked.add("planner_agent")
+        if "reviewer_agent" in available and not bool(state.get("review_pending", False)):
+            blocked.add("reviewer_agent")
+        return blocked
 
     # ------------------------------------------------------------------
     # Stuck-agent detection and circuit breaker
@@ -271,11 +609,11 @@ class AgentRuntime:
         )
 
     def _available_agent_descriptions(self, state: dict) -> dict[str, str]:
-        available = set(state.get("available_agents", []))
+        available = set(self._effective_available_agents(state))
         return {name: description for name, description in self._agent_descriptions().items() if name in available}
 
     def _agent_enum(self, state: dict, include_finish: bool = False) -> str:
-        choices = list(state.get("available_agents", []))
+        choices = self._effective_available_agents(state)
         if include_finish:
             choices.append("finish")
         return "|".join(choices)
@@ -932,6 +1270,11 @@ class AgentRuntime:
                 "long_document_plan_version": int(state.get("long_document_plan_version", 0) or 0),
                 "long_document_outline": state.get("long_document_outline", {}),
                 "superrag_active_session_id": state.get("superrag_active_session_id", ""),
+                "adaptive_agent_selection": _truthy(state.get("adaptive_agent_selection"), True),
+                "planner_policy_mode": str(state.get("planner_policy_mode", "adaptive") or "adaptive").strip().lower(),
+                "reviewer_policy_mode": str(state.get("reviewer_policy_mode", "adaptive") or "adaptive").strip().lower(),
+                "planner_score_threshold": int(state.get("planner_score_threshold", 4) or 4),
+                "reviewer_score_threshold": int(state.get("reviewer_score_threshold", 5) or 5),
                 "history": history,
             },
         }
@@ -1021,8 +1364,11 @@ class AgentRuntime:
         return ""
 
     def _handle_unavailable_agent_choice(self, state: dict, agent_name: str, reason: str) -> tuple[str, str]:
-        if agent_name == "finish" or self._is_agent_available(state, agent_name):
+        policy_blocked = set(state.get("_policy_blocked_agents", []) or [])
+        if agent_name == "finish" or (agent_name not in policy_blocked and self._is_agent_available(state, agent_name)):
             return agent_name, reason
+        if agent_name in policy_blocked:
+            reason = f"{reason} Requested agent {agent_name} is currently gated by the adaptive policy."
         setup_actions = json.dumps(state.get("setup_actions", []), ensure_ascii=False)
         if self._is_agent_available(state, "agent_factory_agent"):
             state["missing_capability"] = agent_name
@@ -1395,7 +1741,7 @@ class AgentRuntime:
     def _skills_overview(self, state: dict) -> str:
         cards = state.get("available_agent_cards")
         if not isinstance(cards, list) or not cards:
-            cards = [card.to_dict() for card in self.skill_registry.get_active_cards()]
+            cards = [card.to_dict() for card in self.agent_routing.get_active_cards()]
 
         total = len(cards)
         mcp_count = sum(
@@ -1465,6 +1811,17 @@ class AgentRuntime:
             return True
         lowered = text.lower()
         return "what all skills do you have" in lowered
+
+    def _is_mcp_discovery_request(self, state: dict) -> bool:
+        text = " ".join(
+            [
+                str(state.get("user_query", "")),
+                str(state.get("current_objective", "")),
+            ]
+        ).strip()
+        if not text:
+            return False
+        return bool(self._MCP_QUERY_RE.search(text))
 
     def _direct_response_if_conversational(
         self, text: str, state: dict
@@ -1834,6 +2191,7 @@ class AgentRuntime:
             )
             state["last_error"] = unavailable_reason
             state["review_pending"] = False
+            state["review_pending_reason"] = ""
             state["failure_checkpoint"] = self._build_failure_checkpoint(state, agent_name, unavailable_reason, state.get("active_task"))
             return self._append_history(state, agent_name, "skipped", state.get("orchestrator_reason", ""), unavailable_reason)
 
@@ -1930,14 +2288,20 @@ class AgentRuntime:
                 state = complete_task(state, active_task["task_id"], "completed")
             skip_review = bool(state.pop("_skip_review_once", False))
             hold_step_completion = bool(state.pop("_hold_planned_step_completion_once", False))
-            requires_review = (
-                agent_name != "reviewer_agent"
-                and agent_name not in self._NON_REVIEW_AGENTS
-                and not skip_review
-                and not bool(state.get("skip_reviews", False))
-                and not self._awaiting_user_input(state)
+            requires_review, review_reason, review_meta = self._should_request_review(
+                state,
+                agent_name=agent_name,
+                output_text=output_text,
+                skip_review_once=skip_review,
             )
             state["review_pending"] = requires_review
+            state["review_pending_reason"] = review_reason if requires_review else ""
+            state["review_policy_last"] = {
+                "run": bool(requires_review),
+                "reason": review_reason,
+                "signals": review_meta,
+                "agent": agent_name,
+            }
             state = self._append_history(state, agent_name, "success", state.get("orchestrator_reason", ""), output_text, start_timestamp=_agent_start_ts)
             self._record_execution_trace(
                 state,
@@ -1985,6 +2349,7 @@ class AgentRuntime:
                 self._mark_step_failed(state, int(state.get("plan_step_index", 0) or 0), error_message)
             state = complete_task(state, active_task["task_id"], "failed")
             state["review_pending"] = False
+            state["review_pending_reason"] = ""
             state = append_message(state, make_message(agent_name, "orchestrator_agent", "error", error_message))
             state = append_artifact(
                 state,
@@ -2034,6 +2399,7 @@ class AgentRuntime:
         effective_steps = int(state.get("effective_steps", 0))
         hard_ceiling = max_steps * 3
         state = self.apply_runtime_setup(state)
+        state["_policy_blocked_agents"] = []
         ensure_a2a_state(state, state.get("available_agent_cards") or self._agent_cards())
         current_objective = state.get("current_objective") or state.get("user_query", "")
 
@@ -2240,7 +2606,7 @@ class AgentRuntime:
         # even after prior retries where the conversational shortcut no longer
         # applies due call-count guardrails.
         if in_task_phase and self._is_registry_discovery_request(state):
-            direct = self._skills_overview(state)
+            direct = self._mcp_servers_overview() if self._is_mcp_discovery_request(state) else self._skills_overview(state)
             state["next_agent"] = "__finish__"
             state["final_output"] = direct
             state = append_message(
@@ -2261,28 +2627,28 @@ class AgentRuntime:
             and current_objective
         )
         if _skill_route_eligible and not self._is_superrag_request(state):
-            _sr_target = self.skill_registry.top_match(current_objective)
-            if _sr_target and self._is_agent_available(state, _sr_target):
-                state["next_agent"] = _sr_target
+            _ar_target = self.agent_routing.top_match(current_objective)
+            if _ar_target and self._is_agent_available(state, _ar_target):
+                state["next_agent"] = _ar_target
                 state["orchestrator_reason"] = (
-                    f"Skill registry matched '{_sr_target}' as the dominant handler — skipping planner."
+                    f"Agent routing matched '{_ar_target}' as the dominant handler — skipping planner."
                 )
                 state = append_task(
                     state,
                     make_task(
                         sender="orchestrator_agent",
-                        recipient=_sr_target,
-                        intent="skill-routed",
+                        recipient=_ar_target,
+                        intent="agent-routed",
                         content=current_objective,
                         state_updates={},
                     ),
                 )
-                log_task_update("Orchestrator", f"Skill route → {_sr_target} (bypassing planner).")
+                log_task_update("Orchestrator", f"Agent route → {_ar_target} (bypassing planner).")
                 return state
             # Ambiguous or no strong match: provide agent hints to the planner
-            _sr_hints = self.skill_registry.hint_agents(current_objective, n=4)
-            if _sr_hints:
-                state["plan_agent_hints"] = _sr_hints
+            _ar_hints = self.agent_routing.hint_agents(current_objective, n=4)
+            if _ar_hints:
+                state["plan_agent_hints"] = _ar_hints
 
         # --- Dev pipeline: finalization — terminate when pipeline is done ---
         dev_pipeline_status = str(state.get("dev_pipeline_status", "")).strip().lower()
@@ -2605,8 +2971,14 @@ class AgentRuntime:
             and not _research_needs_synthesis
             and not _research_synthesis_complete
         ):
-            if state.get("last_agent") != "planner_agent":
-                reason = "Create a detailed step-by-step plan before execution."
+            should_run_planner, planner_reason, planner_signals = self._should_run_planner(state)
+            state["planner_policy_last"] = {
+                "run": bool(should_run_planner),
+                "reason": planner_reason,
+                "signals": planner_signals,
+            }
+            if should_run_planner and state.get("last_agent") != "planner_agent":
+                reason = planner_reason or "Create a detailed step-by-step plan before execution."
                 state["orchestrator_reason"] = reason
                 state["next_agent"] = "planner_agent"
                 state = append_task(
@@ -2726,7 +3098,7 @@ class AgentRuntime:
             return state
 
         if state.get("last_agent") and state.get("last_agent") != "reviewer_agent" and state.get("review_pending") and self._is_agent_available(state, "reviewer_agent"):
-            reason = f"Review the completed step from {state['last_agent']} before continuing."
+            reason = str(state.get("review_pending_reason", "")).strip() or f"Review the completed step from {state['last_agent']} before continuing."
             state["orchestrator_reason"] = reason
             state["next_agent"] = "reviewer_agent"
             state = append_task(state, make_task(sender="orchestrator_agent", recipient="reviewer_agent", intent="step-review", content=reason, state_updates={}))
@@ -2765,6 +3137,7 @@ class AgentRuntime:
                     state["review_reason"] = forced_reason
                     state["review_is_output_correct"] = True
                     state["review_pending"] = False
+                    state["review_pending_reason"] = ""
                     update_planning_file(
                         state,
                         status="executing" if self._next_planned_agents(state) else "completed",
@@ -2815,6 +3188,7 @@ class AgentRuntime:
                 state["review_reason"] = forced_reason
                 state["review_is_output_correct"] = True
                 state["review_pending"] = False
+                state["review_pending_reason"] = ""
                 self._clear_review_revision(state, step_id=subject_step_id, agent_name=subject_agent)
                 update_planning_file(
                     state,
@@ -2872,6 +3246,7 @@ class AgentRuntime:
             )
             if self._next_planned_agents(state):
                 state["review_pending"] = False
+                state["review_pending_reason"] = ""
             else:
                 gate_ok, gate_report = self._quality_gate_report(state)
                 state["quality_gate_passed"] = gate_ok
@@ -3246,12 +3621,17 @@ class AgentRuntime:
                 log_task_update("Orchestrator", reason)
                 return state
 
+        state["_policy_blocked_agents"] = sorted(self._policy_blocked_agents(state))
+
         prompt = f"""
 You are the orchestration agent for a plugin-driven multi-agent AI system.
 
 Your job is to decide which agent should run next, or whether the workflow should finish.
 Choose from exactly these currently available agents:
 {json.dumps(self._available_agent_descriptions(state), indent=2)}
+
+Policy-gated agents for this turn (treat as unavailable):
+{json.dumps(state.get("_policy_blocked_agents", []), ensure_ascii=False)}
 
 Rules:
 - Only choose agents that appear in the available-agent list above.
@@ -3294,8 +3674,7 @@ Reviewer corrected values:
 Current setup summary:
 {state.get("setup_summary", "")}
 
-Connected MCP servers (tools you can call via mcp_* agents):
-{state.get("mcp_servers_context", "None")}
+{state.get("connector_catalog_prompt", "")}
 
 File memory context:
 {self._truncate(state.get("file_memory_context", "") or "None", 1800)}
@@ -3520,6 +3899,32 @@ Return ONLY valid JSON in this exact schema:
                 )
                 return
 
+        if scope in {"shell_command", "shell_plan_step"}:
+            if response["action"] == "approve":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["privileged_mode"] = True
+                initial_state["privileged_approved"] = True
+                approval_note = response.get("feedback", "") or "Approved by user for shell execution."
+                initial_state["privileged_approval_note"] = str(approval_note).strip()
+                approval_mode = str(
+                    (approval_request.get("metadata", {}) if isinstance(approval_request, dict) else {}).get("approval_mode", "")
+                    or prior_channel_state.get("privileged_approval_mode", "")
+                    or "per_command"
+                ).strip()
+                initial_state["privileged_approval_mode"] = approval_mode
+                return
+            if response["action"] == "revise":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["user_cancelled"] = True
+                initial_state["final_output"] = "Shell execution cancelled by user."
+                return
+
         if scope == "deep_research_confirmation":
             if response["action"] == "approve":
                 initial_state["pending_user_input_kind"] = ""
@@ -3725,6 +4130,7 @@ Return ONLY valid JSON in this exact schema:
             initial_state["long_document_plan_status"] = ""
             initial_state["failure_checkpoint"] = {}
             initial_state["review_pending"] = False
+            initial_state["review_pending_reason"] = ""
             initial_state["review_decision"] = ""
             initial_state["review_reason"] = ""
             initial_state["resume_requested"] = False
@@ -3883,9 +4289,21 @@ Return ONLY valid JSON in this exact schema:
             "review_step_assessments": [],
             "review_is_output_correct": False,
             "review_pending": False,
+            "review_pending_reason": "",
             "review_subject_step_id": "",
             "review_subject_agent": "",
             "review_revision_counts": {},
+            "adaptive_agent_selection": _truthy(overrides.get("adaptive_agent_selection"), True),
+            "planner_policy_mode": str(
+                overrides.get("planner_policy_mode", overrides.get("planner_mode", "adaptive")) or "adaptive"
+            ).strip().lower() or "adaptive",
+            "reviewer_policy_mode": str(
+                overrides.get("reviewer_policy_mode", overrides.get("reviewer_mode", "adaptive")) or "adaptive"
+            ).strip().lower() or "adaptive",
+            "planner_score_threshold": int(overrides.get("planner_score_threshold", 4) or 4),
+            "reviewer_score_threshold": int(overrides.get("reviewer_score_threshold", 5) or 5),
+            "planner_policy_last": {},
+            "review_policy_last": {},
             "enforce_quality_gate": bool(overrides.get("enforce_quality_gate", True)),
             "quality_gate_passed": False,
             "quality_gate_report": "",
@@ -3925,12 +4343,50 @@ Return ONLY valid JSON in this exact schema:
             "codebase_mode": False,
         }
         initial_state.update(overrides)
+        initial_state["adaptive_agent_selection"] = _truthy(initial_state.get("adaptive_agent_selection"), True)
+        initial_state["planner_policy_mode"] = self._resolve_policy_mode(
+            initial_state,
+            primary_key="planner_policy_mode",
+            aliases=("planner_mode",),
+            default="adaptive",
+        )
+        initial_state["reviewer_policy_mode"] = self._resolve_policy_mode(
+            initial_state,
+            primary_key="reviewer_policy_mode",
+            aliases=("reviewer_mode",),
+            default="adaptive",
+        )
+        initial_state["planner_score_threshold"] = max(1, int(initial_state.get("planner_score_threshold", 4) or 4))
+        initial_state["reviewer_score_threshold"] = max(1, int(initial_state.get("reviewer_score_threshold", 5) or 5))
         prior_channel_session = initial_state.get("channel_session", {})
         prior_channel_state = prior_channel_session.get("state", {}) if isinstance(prior_channel_session, dict) else {}
         resume_requested = self._looks_like_resume_request(user_query)
         has_pending_session_input = state_awaiting_user_input(prior_channel_state) if isinstance(prior_channel_state, dict) else False
         reuse_session_plan = resume_requested or has_pending_session_input
         if isinstance(prior_channel_state, dict):
+            if "adaptive_agent_selection" not in overrides and "adaptive_agent_selection" in prior_channel_state:
+                initial_state["adaptive_agent_selection"] = _truthy(
+                    prior_channel_state.get("adaptive_agent_selection"),
+                    bool(initial_state.get("adaptive_agent_selection", True)),
+                )
+            if "planner_policy_mode" not in overrides and "planner_mode" not in overrides:
+                persisted_planner_mode = str(
+                    prior_channel_state.get("planner_policy_mode", prior_channel_state.get("planner_mode", ""))
+                    or ""
+                ).strip().lower()
+                if persisted_planner_mode:
+                    initial_state["planner_policy_mode"] = persisted_planner_mode
+            if "reviewer_policy_mode" not in overrides and "reviewer_mode" not in overrides:
+                persisted_reviewer_mode = str(
+                    prior_channel_state.get("reviewer_policy_mode", prior_channel_state.get("reviewer_mode", ""))
+                    or ""
+                ).strip().lower()
+                if persisted_reviewer_mode:
+                    initial_state["reviewer_policy_mode"] = persisted_reviewer_mode
+            if "planner_score_threshold" not in overrides and prior_channel_state.get("planner_score_threshold") is not None:
+                initial_state["planner_score_threshold"] = int(prior_channel_state.get("planner_score_threshold", 4) or 4)
+            if "reviewer_score_threshold" not in overrides and prior_channel_state.get("reviewer_score_threshold") is not None:
+                initial_state["reviewer_score_threshold"] = int(prior_channel_state.get("reviewer_score_threshold", 5) or 5)
             if reuse_session_plan and prior_channel_state.get("last_plan") and not initial_state.get("plan"):
                 initial_state["plan"] = str(prior_channel_state.get("last_plan", ""))
             if reuse_session_plan and prior_channel_state.get("last_plan_data"):
@@ -4037,9 +4493,39 @@ Return ONLY valid JSON in this exact schema:
                 else:
                     initial_state["resume_blocked"] = True
                     initial_state["resume_block_reason"] = block_reason or "missing plan checkpoints for safe restart"
+        initial_state["adaptive_agent_selection"] = _truthy(initial_state.get("adaptive_agent_selection"), True)
+        initial_state["planner_policy_mode"] = self._resolve_policy_mode(
+            initial_state,
+            primary_key="planner_policy_mode",
+            aliases=("planner_mode",),
+            default="adaptive",
+        )
+        initial_state["reviewer_policy_mode"] = self._resolve_policy_mode(
+            initial_state,
+            primary_key="reviewer_policy_mode",
+            aliases=("reviewer_mode",),
+            default="adaptive",
+        )
+        initial_state["planner_score_threshold"] = max(1, int(initial_state.get("planner_score_threshold", 4) or 4))
+        initial_state["reviewer_score_threshold"] = max(1, int(initial_state.get("reviewer_score_threshold", 5) or 5))
         resume_checkpoint_payload = initial_state.get("resume_checkpoint_payload", {})
         if isinstance(resume_checkpoint_payload, dict) and resume_checkpoint_payload:
             self._restore_from_resume_checkpoint(initial_state, resume_checkpoint_payload, user_query)
+        initial_state["adaptive_agent_selection"] = _truthy(initial_state.get("adaptive_agent_selection"), True)
+        initial_state["planner_policy_mode"] = self._resolve_policy_mode(
+            initial_state,
+            primary_key="planner_policy_mode",
+            aliases=("planner_mode",),
+            default="adaptive",
+        )
+        initial_state["reviewer_policy_mode"] = self._resolve_policy_mode(
+            initial_state,
+            primary_key="reviewer_policy_mode",
+            aliases=("reviewer_mode",),
+            default="adaptive",
+        )
+        initial_state["planner_score_threshold"] = max(1, int(initial_state.get("planner_score_threshold", 4) or 4))
+        initial_state["reviewer_score_threshold"] = max(1, int(initial_state.get("reviewer_score_threshold", 5) or 5))
         initial_state = self.apply_runtime_setup(initial_state)
         initial_state["privileged_policy"] = build_privileged_policy(initial_state)
         # Inject project context (kendr.md) for every session with a project root
@@ -4095,15 +4581,59 @@ Return ONLY valid JSON in this exact schema:
         app = self.build_workflow()
         return app.invoke(initial_state)
 
+    def _refresh_skill_agents(self) -> None:
+        """Refresh skill-backed agents from the current database state.
+
+        Called at the start of each run_query so skills installed after
+        gateway startup are available for routing without a restart.
+        """
+        try:
+            from kendr.discovery import _register_skill_agents
+            from kendr.agent_routing import build_agent_routing_index as _build_ar
+            # Remove stale skill agents and plugin entry
+            for name in list(self.registry.agents.keys()):
+                if name.startswith("skill_") and name.endswith("_agent"):
+                    del self.registry.agents[name]
+            self.registry.plugins.pop("builtin.skills", None)
+            # Re-register from current DB state
+            _register_skill_agents(self.registry)
+            # Rebuild routing index so new agents are routable
+            self.agent_routing = _build_ar(self.registry)
+        except Exception:
+            pass
+
     def _refresh_mcp_agents(self) -> None:
         """Refresh MCP-backed agents from the current database state.
 
         Called at the start of each run_query so servers added or discovered
         after gateway startup are available for routing without a restart.
+        Also triggers a background tool-discovery pass for any enabled server
+        that has never had its tools fetched (last_discovered is empty).
         """
+        # Background-discover any server whose tools have never been fetched.
+        # This fires-and-forgets so it doesn't block the current run; the *next*
+        # run will pick up the newly saved tools via the re-registration below.
+        try:
+            from kendr.mcp_manager import list_servers as _mcp_list_servers, discover_tools as _mcp_discover
+            _undiscovered = [
+                s for s in _mcp_list_servers()
+                if s.get("enabled", True) and not str(s.get("last_discovered") or "").strip()
+            ]
+            if _undiscovered:
+                import threading as _threading
+                def _discover_bg():
+                    for _s in _undiscovered:
+                        try:
+                            _mcp_discover(str(_s.get("id", "")))
+                        except Exception:
+                            pass
+                _threading.Thread(target=_discover_bg, daemon=True).start()
+        except Exception:
+            pass
+
         try:
             from kendr.discovery import _register_mcp_tools
-            from kendr.skill_registry import build_skill_registry as _build_sr
+            from kendr.agent_routing import build_agent_routing_index as _build_ar
             # Remove stale MCP agents and plugin entry
             for name in list(self.registry.agents.keys()):
                 if name.startswith("mcp_"):
@@ -4111,8 +4641,8 @@ Return ONLY valid JSON in this exact schema:
             self.registry.plugins.pop("builtin.mcp", None)
             # Re-register from current DB state
             _register_mcp_tools(self.registry)
-            # Rebuild skill index so new agents are routable
-            self.skill_registry = _build_sr(self.registry)
+            # Rebuild routing index so new agents are routable
+            self.agent_routing = _build_ar(self.registry)
         except Exception:
             pass
 
@@ -4182,6 +4712,7 @@ Return ONLY valid JSON in this exact schema:
         provider_override = str(initial_state.get("provider") or "").strip().lower()
         model_override = str(initial_state.get("model") or "").strip()
         self._refresh_mcp_agents()
+        self._refresh_skill_agents()
         try:
             with runtime_model_override(provider_override, model_override):
                 app = self.build_workflow()

@@ -48,8 +48,47 @@ from kendr.persistence import get_user_skill, list_user_skills
 
 REGISTRY = build_registry()
 RUNTIME = AgentRuntime(REGISTRY)
-SKILL_REGISTRY = RUNTIME.skill_registry
 CAPABILITY_REGISTRY = CapabilityRegistryService()
+# NOTE: Always use RUNTIME.agent_routing (not a cached reference) so refreshes
+# via _rebuild_skill_registry() / _refresh_mcp_agents() are reflected.
+
+
+def _rebuild_skill_registry() -> None:
+    """Re-register skill agents in REGISTRY after install/uninstall/create/delete.
+
+    Called after any skill mutation so the in-process registry stays in sync
+    without requiring a full gateway restart.
+    """
+    try:
+        from kendr.discovery import _register_skill_agents
+        from kendr.agent_routing import build_agent_routing_index as _build_ar
+        for name in list(REGISTRY.agents.keys()):
+            if name.startswith("skill_") and name.endswith("_agent"):
+                REGISTRY.agents.pop(name, None)
+        REGISTRY.plugins.pop("builtin.skills", None)
+        _register_skill_agents(REGISTRY)
+        RUNTIME.agent_routing = _build_ar(REGISTRY)
+    except Exception:
+        pass
+
+
+def _rebuild_mcp_registry() -> None:
+    """Re-register MCP tool agents in REGISTRY after add/remove/toggle/discover.
+
+    Mirrors _rebuild_skill_registry() so both connector types stay in sync
+    without requiring a full gateway restart.
+    """
+    try:
+        from kendr.discovery import _register_mcp_tools
+        from kendr.agent_routing import build_agent_routing_index as _build_ar
+        for name in list(REGISTRY.agents.keys()):
+            if name.startswith("mcp_"):
+                REGISTRY.agents.pop(name, None)
+        REGISTRY.plugins.pop("builtin.mcp", None)
+        _register_mcp_tools(REGISTRY)
+        RUNTIME.agent_routing = _build_ar(REGISTRY)
+    except Exception:
+        pass
 
 
 def _workspace_id_from_query(parsed) -> str:
@@ -75,7 +114,7 @@ def _capability_discovery_snapshot(workspace_id: str) -> dict:
         },
         "sync": sync_result,
         "capabilities": capabilities,
-        "skill_registry_summary": SKILL_REGISTRY.summary(),
+        "agent_routing_summary": RUNTIME.agent_routing.summary(),
     }
 
 
@@ -233,12 +272,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
             return
         if parsed.path == "/registry/skills":
-            cards = SKILL_REGISTRY.get_all_cards()
-            summary = SKILL_REGISTRY.summary()
+            try:
+                from kendr.skill_manager import get_marketplace as _get_marketplace
+                _marketplace = _get_marketplace()
+            except Exception:
+                _marketplace = {"catalog": [], "custom": [], "categories": [], "installed_count": 0}
             self._send_json(200, {
-                "summary": summary,
-                "cards": [c.to_dict() for c in cards],
-                "user_skills_prompt": SKILL_REGISTRY.user_skills_prompt_block(),
+                "catalog": _marketplace.get("catalog", []),
+                "custom": _marketplace.get("custom", []),
+                "categories": _marketplace.get("categories", []),
+                "installed_count": _marketplace.get("installed_count", 0),
+                "user_skills_prompt": RUNTIME.agent_routing.user_skills_prompt_block(),
+                "agent_summary": RUNTIME.agent_routing.summary(),
             })
             return
         if parsed.path == "/registry/auth-profiles":
@@ -356,22 +401,64 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 ],
             )
             return
-        if parsed.path == "/registry/plugins":
-            self._send_json(
-                200,
-                [
-                    {
-                        "name": plugin.name,
-                        "source": plugin.source,
-                        "description": plugin.description,
-                        "version": plugin.version,
-                        "sdk_version": plugin.sdk_version,
-                        "runtime_api": plugin.runtime_api,
-                        "kind": plugin.kind,
-                    }
-                    for plugin in REGISTRY.plugins.values()
-                ],
-            )
+        if parsed.path in {"/registry/integrations", "/registry/plugins"}:
+            try:
+                from kendr.integration_registry import list_integrations as _list_integrations
+
+                _integration_cards = [item.to_dict() for item in _list_integrations()]
+            except Exception:
+                _integration_cards = []
+            self._send_json(200, _integration_cards)
+            return
+        # ── Unified connector catalog ──────────────────────────────────────────
+        if parsed.path == "/registry/connectors":
+            try:
+                from kendr.connector_registry import (
+                    build_connector_catalog as _build_catalog,
+                    build_integration_catalog as _build_integrations,
+                )
+                _specs = _build_catalog(REGISTRY, RUNTIME.agent_routing)
+                _integration_specs = _build_integrations()
+                _all = _specs + _integration_specs
+                _by_type = {
+                    t: [s.to_dict() for s in _all if s.connector_type == t]
+                    for t in ("task_agent", "skill", "mcp_tool", "integration")
+                }
+                _by_type["plugin"] = list(_by_type["integration"])
+                self._send_json(200, {
+                    "total": len(_all),
+                    "connectors": [s.to_dict() for s in _all],
+                    "by_type": _by_type,
+                })
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+        # ── MCP server management ──────────────────────────────────────────────
+        if parsed.path == "/api/connectors/mcp":
+            from kendr.mcp_manager import list_servers_safe as _ls
+            try:
+                self._send_json(200, {"servers": _ls()})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+        if parsed.path.startswith("/api/connectors/mcp/") and parsed.path.endswith("/tools"):
+            _sid = parsed.path.split("/api/connectors/mcp/", 1)[1].rsplit("/tools", 1)[0].strip()
+            try:
+                from kendr.mcp_manager import get_server as _get_srv
+                _srv = _get_srv(_sid)
+                if not _srv:
+                    self._send_json(404, {"error": "server_not_found"})
+                    return
+                import json as _json
+                _tools = _srv.get("tools") or []
+                if isinstance(_tools, str):
+                    try:
+                        _tools = _json.loads(_tools)
+                    except Exception:
+                        _tools = []
+                self._send_json(200, {"server_id": _sid, "tools": _tools})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
             return
         if parsed.path == "/runs":
             api_limit = max(100, int(str(os.getenv("KENDR_RUNS_API_LIMIT", "500") or "500")))
@@ -481,20 +568,89 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 return
         self._send_json(404, {"error": "not_found"})
 
+    def do_DELETE(self):
+        parsed = urlparse(self.path)
+        # ── DELETE /api/connectors/mcp/{id} ───────────────────────────────────
+        if parsed.path.startswith("/api/connectors/mcp/"):
+            _sid = parsed.path.split("/api/connectors/mcp/", 1)[1].strip()
+            if not _sid:
+                self._send_json(400, {"error": "missing_server_id"})
+                return
+            try:
+                from kendr.mcp_manager import remove_server as _rm
+                ok = _rm(_sid)
+                if ok:
+                    _rebuild_mcp_registry()
+                self._send_json(200, {"ok": ok})
+            except Exception as exc:
+                self._send_json(500, {"error": str(exc)})
+            return
+        self._send_json(404, {"error": "not_found"})
+
     def do_POST(self):
+        # ── MCP server CRUD ────────────────────────────────────────────────────
+        # POST /api/connectors/mcp  → add a new MCP server
+        if self.path == "/api/connectors/mcp":
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            name = str(payload.get("name", "")).strip()
+            connection = str(payload.get("connection", "")).strip()
+            if not name or not connection:
+                self._send_json(400, {"error": "name and connection are required"})
+                return
+            try:
+                from kendr.mcp_manager import add_server as _add_srv
+                server = _add_srv(
+                    name=name,
+                    connection=connection,
+                    server_type=str(payload.get("type", "http")).strip() or "http",
+                    description=str(payload.get("description", "")).strip(),
+                    auth_token=str(payload.get("auth_token", "")).strip(),
+                    enabled=bool(payload.get("enabled", True)),
+                )
+                _rebuild_mcp_registry()
+                self._send_json(200, {"ok": True, "server": server})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+        # POST /api/connectors/mcp/{id}/discover  → discover tools for server
+        if self.path.startswith("/api/connectors/mcp/") and self.path.endswith("/discover"):
+            _sid = self.path.split("/api/connectors/mcp/", 1)[1].rsplit("/discover", 1)[0].strip()
+            try:
+                from kendr.mcp_manager import discover_tools as _discover
+                result = _discover(_sid)
+                _rebuild_mcp_registry()
+                self._send_json(200, result)
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
+        # POST /api/connectors/mcp/{id}/toggle  → enable / disable server
+        if self.path.startswith("/api/connectors/mcp/") and self.path.endswith("/toggle"):
+            _sid = self.path.split("/api/connectors/mcp/", 1)[1].rsplit("/toggle", 1)[0].strip()
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            try:
+                from kendr.mcp_manager import toggle_server as _toggle
+                ok = _toggle(_sid, bool(payload.get("enabled", True)))
+                _rebuild_mcp_registry()
+                self._send_json(200, {"ok": ok})
+            except Exception as exc:
+                self._send_json(500, {"ok": False, "error": str(exc)})
+            return
         if self.path == "/registry/mcp-refresh":
             try:
-                from kendr.discovery import _register_mcp_tools
-                stale = [n for n in list(REGISTRY.agents) if n.startswith("mcp_")]
-                for name in stale:
-                    REGISTRY.agents.pop(name, None)
-                _register_mcp_tools(REGISTRY)
+                stale_before = [n for n in REGISTRY.agents if n.startswith("mcp_")]
+                _rebuild_mcp_registry()
                 mcp_agents = [n for n in REGISTRY.agents if n.startswith("mcp_")]
                 sync_result = sync_mcp_capabilities(workspace_id="default", actor_user_id="system:gateway-mcp-refresh")
                 self._send_json(200, {
                     "ok": True,
                     "mcp_agent_count": len(mcp_agents),
-                    "removed_stale": len(stale),
+                    "removed_stale": len(stale_before),
                     "capability_sync": sync_result,
                 })
             except Exception as exc:
@@ -685,7 +841,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     input_schema=payload.get("input_schema") if isinstance(payload.get("input_schema"), dict) else None,
                     output_schema=payload.get("output_schema") if isinstance(payload.get("output_schema"), dict) else None,
                     tags=payload.get("tags") if isinstance(payload.get("tags"), list) else None,
+                    metadata=payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None,
+                    permissions=payload.get("permissions") if isinstance(payload.get("permissions"), dict) else None,
                 )
+                _rebuild_skill_registry()
                 self._send_json(200, {"ok": True, "skill": skill})
             except Exception as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
@@ -694,6 +853,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             catalog_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/install", 1)[0].strip()
             try:
                 skill = install_catalog_skill(catalog_id)
+                _rebuild_skill_registry()
                 self._send_json(200, {"ok": True, "skill": skill})
             except Exception as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
@@ -702,6 +862,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             catalog_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/uninstall", 1)[0].strip()
             try:
                 ok = uninstall_catalog_skill(catalog_id)
+                _rebuild_skill_registry()
                 self._send_json(200, {"ok": ok})
             except Exception as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
@@ -713,7 +874,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "invalid_json", "detail": err})
                 return
             try:
-                result = test_skill(skill_id, payload.get("inputs", payload))
+                result = test_skill(
+                    skill_id,
+                    payload.get("inputs", payload),
+                    approval=payload.get("approval") if isinstance(payload.get("approval"), dict) else None,
+                )
                 self._send_json(200, result)
             except Exception as exc:
                 self._send_json(500, {"success": False, "error": str(exc)})
@@ -725,8 +890,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "invalid_json", "detail": err})
                 return
             try:
-                allowed = {"name", "description", "category", "icon", "code", "input_schema", "output_schema", "tags", "status"}
+                allowed = {"name", "description", "category", "icon", "code", "input_schema", "output_schema", "tags", "status", "metadata"}
                 updates = {k: v for k, v in payload.items() if k in allowed}
+                if isinstance(payload.get("permissions"), dict):
+                    updates["permissions"] = payload.get("permissions")
                 skill = edit_custom_skill(skill_id, **updates)
                 if skill:
                     self._send_json(200, {"ok": True, "skill": skill})
@@ -739,6 +906,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             skill_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/delete", 1)[0].strip()
             try:
                 ok = remove_custom_skill(skill_id)
+                _rebuild_skill_registry()
                 self._send_json(200, {"ok": ok})
             except Exception as exc:
                 self._send_json(400, {"ok": False, "error": str(exc)})
@@ -831,6 +999,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
 
         if self.path != "/resume":
+            # use_mcp: pass through as-is (None = default = MCP enabled; False = disable mcp_* agents)
+            _use_mcp_raw = payload.get("use_mcp")
+            _use_mcp = None if _use_mcp_raw is None else bool(_use_mcp_raw)
             state_overrides = {
                 "run_id": str(payload.get("run_id", "")).strip(),
                 "workflow_id": str(payload.get("workflow_id", "")).strip() or str(payload.get("run_id", "")).strip(),
@@ -849,6 +1020,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "channel_session_key": session_id_for_payload(payload, force_new=False),
                 "memory_force_new_session": force_new_session,
                 "working_directory": working_directory,
+                **({} if _use_mcp is None else {"use_mcp": _use_mcp}),
             }
         else:
             state_overrides["max_steps"] = int(payload.get("max_steps", 20))
@@ -902,6 +1074,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "privileged_mode",
             "privileged_approved",
             "privileged_approval_note",
+            "privileged_approval_mode",
             "privileged_require_approvals",
             "privileged_read_only",
             "privileged_allow_root",
@@ -910,11 +1083,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "privileged_allowed_paths",
             "privileged_allowed_domains",
             "kill_switch_file",
+            "shell_auto_approve",
             "auto_approve",
             "auto_approve_blueprint",
             "auto_approve_plan",
             "skip_reviews",
             "max_step_revisions",
+            "adaptive_agent_selection",
+            "planner_policy_mode",
+            "reviewer_policy_mode",
+            "planner_mode",
+            "reviewer_mode",
+            "planner_score_threshold",
+            "reviewer_score_threshold",
             "deep_research_mode",
             "deep_research_confirmed",
             "deep_research_source_urls",
@@ -1044,7 +1225,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _handle_home(self):
         agents = list(REGISTRY.agents.values())
-        plugins = list(REGISTRY.plugins.values())
+        runtime_plugins = list(REGISTRY.plugins.values())
+        try:
+            from kendr.integration_registry import list_integrations as _list_integrations
+
+            integrations = _list_integrations()
+        except Exception:
+            integrations = []
         runs = list_recent_runs(8)
         sessions = list_channel_sessions(8)
         jobs = list_scheduled_jobs(8)
@@ -1053,17 +1240,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
         heartbeats = list_heartbeat_events(8)
         body = f"""
         <h1>Kendr Gateway</h1>
-        <p>Plugin-driven agent runtime with dynamic discovery, CLI control, and HTTP ingress.</p>
+        <p>Integration-aware, runtime-plugin extensible agent runtime with dynamic discovery, CLI control, and HTTP ingress.</p>
         <div class="grid">
           <div class="card">
             <h2>Registry</h2>
             <p>Agents: <strong>{len(agents)}</strong></p>
-            <p>Plugins: <strong>{len(plugins)}</strong></p>
+            <p>Runtime Plugins: <strong>{len(runtime_plugins)}</strong></p>
+            <p>Integrations: <strong>{len(integrations)}</strong></p>
             <p><a href="/registry/agents">/registry/agents</a></p>
             <p><a href="/registry/capabilities">/registry/capabilities</a></p>
             <p><a href="/registry/discovery">/registry/discovery</a></p>
             <p><a href="/registry/auth-profiles">/registry/auth-profiles</a></p>
             <p><a href="/registry/policy-profiles">/registry/policy-profiles</a></p>
+            <p><a href="/registry/integrations">/registry/integrations</a></p>
             <p><a href="/registry/plugins">/registry/plugins</a></p>
           </div>
           <div class="card">

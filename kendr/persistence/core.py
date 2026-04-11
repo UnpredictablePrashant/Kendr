@@ -77,6 +77,7 @@ _CORE_TABLES = (
     "capability_health_runs",
     "capability_audit_events",
     "user_skills",
+    "assistants",
 )
 
 
@@ -117,13 +118,20 @@ def _candidate_legacy_db_paths(primary_db_path: str, extra_paths: Iterable[str] 
         for item in env_legacy.split(os.pathsep):
             _add(item)
 
-    # Common accidental split-brain location when process cwd differs.
-    _add(str(Path.cwd() / "output" / "agent_workflow.sqlite3"))
-    _add(str(_repo_root() / "output" / "agent_workflow.sqlite3"))
-
     working_dir = str(os.getenv("KENDR_WORKING_DIR", "")).strip()
+    implicit_targets = {
+        str((Path.cwd() / "output" / "agent_workflow.sqlite3").resolve()),
+        str((_repo_root() / "output" / "agent_workflow.sqlite3").resolve()),
+    }
     if working_dir:
-        _add(str(Path(working_dir).expanduser().resolve() / "output" / "agent_workflow.sqlite3"))
+        implicit_targets.add(str((Path(working_dir).expanduser().resolve() / "output" / "agent_workflow.sqlite3")))
+
+    # Only auto-scan the common workspace output locations when the target DB
+    # itself lives in one of those locations. Explicit/custom DB paths should
+    # not silently ingest unrelated workspace databases.
+    if primary in implicit_targets:
+        for candidate in implicit_targets:
+            _add(candidate)
 
     # Optional recursive search roots for one-time consolidation.
     recursive_enabled = _parse_bool_env("KENDR_DB_ENABLE_RECURSIVE_SEARCH", False)
@@ -749,6 +757,31 @@ def initialize_db(db_path: str = DB_PATH):
             );
             CREATE INDEX IF NOT EXISTS idx_user_skills_slug ON user_skills (slug);
             CREATE INDEX IF NOT EXISTS idx_user_skills_type_installed ON user_skills (skill_type, is_installed);
+
+            CREATE TABLE IF NOT EXISTS assistants (
+                assistant_id TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                owner_user_id TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                goal TEXT DEFAULT '',
+                system_prompt TEXT DEFAULT '',
+                model_provider TEXT DEFAULT '',
+                model_name TEXT DEFAULT '',
+                routing_policy TEXT DEFAULT 'balanced',
+                status TEXT DEFAULT 'draft',
+                attached_capabilities_json TEXT DEFAULT '[]',
+                memory_config_json TEXT DEFAULT '{}',
+                metadata_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_tested_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_assistants_workspace_status
+                ON assistants (workspace_id, status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_assistants_workspace_slug
+                ON assistants (workspace_id, slug);
             """
         )
         _ensure_column(conn, "runs", "workflow_id", "TEXT")

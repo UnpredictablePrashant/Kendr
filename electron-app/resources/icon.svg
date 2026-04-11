@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <!-- Unified gradient across the whole K shape -->
+    <linearGradient id="kGrad" x1="262" y1="182" x2="762" y2="842" gradientUnits="userSpaceOnUse">
+      <stop offset="0%"   stop-color="#a855f7"/>
+      <stop offset="50%"  stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <!-- Subtle background glow -->
+    <radialGradient id="bgGlow" cx="50%" cy="50%" r="50%" gradientUnits="objectBoundingBox">
+      <stop offset="0%"   stop-color="#4f46e5" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#0d0f14" stop-opacity="0"/>
+    </radialGradient>
+    <!-- Clip to only show K arms to the right of the vertical bar -->
+    <clipPath id="armClip">
+      <rect x="392" y="0" width="900" height="1024"/>
+    </clipPath>
+  </defs>
+
+  <!-- App icon background (dark, rounded square) -->
+  <rect width="1024" height="1024" rx="200" ry="200" fill="#0d0f14"/>
+  <!-- Subtle center glow -->
+  <rect width="1024" height="1024" rx="200" ry="200" fill="url(#bgGlow)"/>
+
+  <!-- ── K letter ────────────────────────────────────────────── -->
+  <!-- Vertical bar: x 262–392, y 182–842 -->
+  <rect x="262" y="182" width="130" height="660" fill="url(#kGrad)"/>
+
+  <!-- Upper arm: center (577, 347), length ≈ 495.8, width 130, angle −41.7° -->
+  <g clip-path="url(#armClip)">
+    <rect x="-247.9" y="-65" width="495.8" height="130"
+          transform="translate(577, 347) rotate(-41.7)"
+          fill="url(#kGrad)"/>
+  </g>
+
+  <!-- Lower arm: center (577, 677), length ≈ 495.8, width 130, angle +41.7° -->
+  <g clip-path="url(#armClip)">
+    <rect x="-247.9" y="-65" width="495.8" height="130"
+          transform="translate(577, 677) rotate(41.7)"
+          fill="url(#kGrad)"/>
+  </g>
+</svg>

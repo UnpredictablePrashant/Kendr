@@ -2349,6 +2349,14 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     plugin_list.add_argument("--limit", type=int, default=0, help="Limit number of listed plugins.")
     plugin_list.add_argument("--json", action="store_true")
 
+    integration_list = subparsers.add_parser("integrations", help="List configured and available service integrations.")
+    command_parsers["integrations"] = integration_list
+    integration_list.add_argument("action", choices=["list"], nargs="?", default="list")
+    integration_list.add_argument("--category", default="", help="Filter integrations by category.")
+    integration_list.add_argument("--contains", default="", help="Filter integration name/description by substring.")
+    integration_list.add_argument("--limit", type=int, default=0, help="Limit number of listed integrations.")
+    integration_list.add_argument("--json", action="store_true")
+
     gateway_parser = subparsers.add_parser("gateway", help="Run or control the HTTP gateway server.")
     command_parsers["gateway"] = gateway_parser
     gateway_parser.add_argument(
@@ -6561,6 +6569,61 @@ def _cmd_plugins(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_integrations(args: argparse.Namespace) -> int:
+    from kendr.integration_registry import list_integrations
+
+    style = _style_from_args(args)
+    payload = sorted(
+        [
+            {
+                "id": integration.id,
+                "name": integration.name,
+                "category": integration.category,
+                "description": integration.description,
+                "required_env_vars": list(integration.required_env_vars),
+                "missing_vars": integration.missing_vars,
+                "is_configured": integration.is_configured,
+                "docs_url": integration.docs_url,
+            }
+            for integration in list_integrations()
+        ],
+        key=lambda item: item["id"],
+    )
+    category_filter = str(getattr(args, "category", "") or "").strip().lower()
+    contains_filter = str(getattr(args, "contains", "") or "").strip().lower()
+    if category_filter:
+        payload = [item for item in payload if str(item["category"]).lower() == category_filter]
+    if contains_filter:
+        payload = [
+            item
+            for item in payload
+            if contains_filter in item["id"].lower()
+            or contains_filter in item["name"].lower()
+            or contains_filter in str(item["description"]).lower()
+        ]
+    if int(getattr(args, "limit", 0) or 0) > 0:
+        payload = payload[: int(args.limit)]
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        rows = [
+            [
+                item["id"],
+                str(item["category"]),
+                "yes" if item["is_configured"] else "no",
+                ", ".join(item["missing_vars"]) or "-",
+                _truncate(str(item["description"]), 72),
+            ]
+            for item in payload
+        ]
+        if not rows:
+            print(style.warn("No integrations matched the current filters."))
+            return 0
+        print(style.heading(f"Discovered integrations ({len(payload)}):"))
+        print(_render_table(["ID", "CATEGORY", "CONFIGURED", "MISSING", "DESCRIPTION"], rows))
+    return 0
+
+
 def _cmd_model(args: argparse.Namespace) -> int:
     """Handle `kendr model` sub-commands."""
     from kendr.llm_router import (
@@ -7369,6 +7432,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_agents(args)
         if args.command == "plugins":
             return _cmd_plugins(args)
+        if args.command == "integrations":
+            return _cmd_integrations(args)
         if args.command == "gateway":
             return _cmd_gateway(args)
         if args.command == "web":

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 
 from kendr.execution_trace import append_execution_event, now_iso
+from kendr.workflow_contract import build_approval_request
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.privileged_control import (
     append_privileged_audit_event,
@@ -260,6 +261,55 @@ def _publish_os_result(state: dict, report: str, call_number: int) -> dict:
         recipients=["orchestrator_agent", "worker_agent"],
     )
 
+def _set_shell_approval_request(
+    state: dict,
+    *,
+    scope: str,
+    command: str,
+    working_directory: str,
+    reason: str,
+    classification: dict | None = None,
+    step_label: str = "",
+) -> None:
+    redacted_command = redact_sensitive_text(command)
+    summary = "Shell command execution requires your approval before continuing."
+    if step_label:
+        summary = f"{step_label} requires your approval before continuing."
+    state["pending_user_question"] = (
+        f"{summary}\n\nCommand:\n{redacted_command}\n\nWorking directory:\n{working_directory}"
+    )
+    state["pending_user_input_kind"] = "shell_approval"
+    state["approval_pending_scope"] = scope
+    state["approval_request"] = build_approval_request(
+        scope=scope,
+        title="Shell Command Approval",
+        summary=summary,
+        sections=[
+            {"title": "Command", "items": [redacted_command]},
+            {"title": "Working Directory", "items": [working_directory]},
+            {"title": "Policy Block Reason", "items": [reason]},
+            {
+                "title": "Command Classification",
+                "items": [
+                    f"Mutating: {bool((classification or {}).get('mutating', False))}",
+                    f"Destructive: {bool((classification or {}).get('destructive', False))}",
+                    f"Root requested: {bool((classification or {}).get('root_requested', False))}",
+                    f"Networking: {bool((classification or {}).get('networking', False))}",
+                ],
+            },
+        ],
+        accept_label="Approve",
+        reject_label="Reject",
+        suggest_label="Suggestion",
+        help_text="Approve to run this command now. Reject cancels this shell action.",
+        metadata={
+            "command": redacted_command,
+            "working_directory": working_directory,
+            "approval_mode": str(state.get("privileged_approval_mode", "per_command") or "per_command"),
+            "reason": reason,
+        },
+    )
+
 
 def os_agent(state):
     active_task, task_content, _ = begin_agent_session(state, "os_agent")
@@ -314,6 +364,7 @@ def os_agent(state):
     try:
         ensure_command_allowed(command, resolved_working_directory, privileged_policy)
     except Exception as exc:
+        reason = str(exc)
         report = _format_execution_report(
             host_os,
             target_os,
@@ -323,7 +374,7 @@ def os_agent(state):
             timeout_seconds,
             thought=thought,
             classification=classification,
-            error_message=f"policy_blocked: {exc}",
+            error_message=f"policy_blocked: {reason}",
         )
         state["os_result"] = report
         state["os_success"] = False
@@ -337,9 +388,18 @@ def os_agent(state):
             detail={
                 "command": redact_sensitive_text(command),
                 "working_directory": resolved_working_directory,
-                "reason": str(exc),
+                "reason": reason,
             },
         )
+        if "approval_required" in reason:
+            _set_shell_approval_request(
+                state,
+                scope="shell_command",
+                command=command,
+                working_directory=resolved_working_directory,
+                reason=reason,
+                classification=classification,
+            )
         log_task_update("OS Agent", "Command blocked by privileged policy.", report)
         return _publish_os_result(state, report, state["os_agent_calls"])
 
@@ -653,6 +713,32 @@ def shell_plan_agent(state: dict) -> dict:
             ensure_command_allowed(command, working_directory, privileged_policy)
         except PermissionError as exc:
             reason = str(exc)
+            if "approval_required" in reason:
+                _set_shell_approval_request(
+                    state,
+                    scope="shell_plan_step",
+                    command=command,
+                    working_directory=working_directory,
+                    reason=reason,
+                    classification=classify_command(command),
+                    step_label=f"Step {idx}/{len(steps)}: {desc}",
+                )
+                blocked_msg = (
+                    f"Shell plan paused for approval at step {idx}/{len(steps)}.\n"
+                    f"Step: {desc}\n"
+                    f"Command: {redact_sensitive_text(command)}\n"
+                    f"Reason: {reason}"
+                )
+                state["shell_plan_result"] = blocked_msg
+                state["shell_plan_success"] = False
+                state["draft_response"] = blocked_msg
+                return publish_agent_output(
+                    state,
+                    "shell_plan_agent",
+                    blocked_msg,
+                    f"shell_plan_paused_{idx}",
+                    recipients=["orchestrator_agent", "worker_agent"],
+                )
             log_task_update("Shell Plan Agent", f"Step {idx} blocked by policy: {reason}")
             step_results.append({
                 "step": idx, "description": desc, "command": command,
@@ -697,6 +783,13 @@ def shell_plan_agent(state: dict) -> dict:
 
         if success:
             log_task_update("Shell Plan Agent", f"Step {idx}: OK (rc=0)", stdout[:300] if stdout else "")
+            if (
+                privileged_policy.get("approval_mode") == "per_command"
+                and privileged_policy.get("require_approvals", True)
+                and not privileged_policy.get("auto_approve", False)
+            ):
+                privileged_policy["approved"] = False
+                state["privileged_approved"] = False
         else:
             log_task_update("Shell Plan Agent", f"Step {idx}: FAILED (rc={rc})", stderr[:300] if stderr else "")
             if not optional:

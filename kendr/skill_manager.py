@@ -8,19 +8,27 @@ Skills are callable tools that agents discover and invoke. Three kinds:
 
 from __future__ import annotations
 
-import io
 import json
 import os
+import subprocess
 import sys
-import textwrap
 import traceback
-from contextlib import redirect_stderr, redirect_stdout
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 
+from kendr.extension_permissions import (
+    ensure_manifest_approval,
+    merge_permissions_into_metadata,
+    normalize_approval,
+    permission_manifest_from_metadata,
+    summarize_permission_manifest,
+)
 from kendr.persistence import (
     create_user_skill,
     delete_user_skill,
     get_user_skill,
+    insert_privileged_audit_event,
     list_user_skills,
     set_skill_installed,
     update_user_skill,
@@ -44,6 +52,12 @@ def get_marketplace(q: str = "", category: str = "") -> dict:
         installed_row = installed_rows.get(slug)
         item["is_installed"] = installed_row is not None
         item["skill_id"] = installed_row["skill_id"] if installed_row else None
+        item["permission_manifest"] = permission_manifest_from_metadata(
+            {},
+            skill_type="catalog",
+            catalog_id=slug,
+            cwd=_default_execution_cwd(),
+        )
 
     # Append custom (python/prompt) skills that are installed
     custom = [
@@ -69,11 +83,21 @@ def install_catalog_skill(catalog_id: str) -> dict:
     if not entry:
         raise ValueError(f"No catalog skill with id {catalog_id!r}")
 
+    metadata = merge_permissions_into_metadata(
+        {"requires_config": list(entry.requires_config)},
+        None,
+        skill_type="catalog",
+        catalog_id=entry.id,
+        cwd=_default_execution_cwd(),
+    )
+
     existing = get_user_skill(slug=catalog_id)
     if existing and existing["is_installed"]:
-        return existing
+        updated = update_user_skill(existing["skill_id"], metadata=metadata)
+        return updated or existing
 
     if existing:
+        update_user_skill(existing["skill_id"], metadata=metadata)
         set_skill_installed(existing["skill_id"], True)
         return get_user_skill(skill_id=existing["skill_id"])  # type: ignore[return-value]
 
@@ -89,7 +113,7 @@ def install_catalog_skill(catalog_id: str) -> dict:
         input_schema=dict(entry.input_schema),
         output_schema=dict(entry.output_schema),
         tags=list(entry.tags),
-        metadata={"requires_config": list(entry.requires_config)},
+        metadata=metadata,
         is_installed=True,
         status="active",
     )
@@ -139,6 +163,8 @@ def create_custom_skill(
     input_schema: dict | None = None,
     output_schema: dict | None = None,
     tags: list[str] | None = None,
+    metadata: dict | None = None,
+    permissions: dict | None = None,
 ) -> dict:
     if skill_type not in ("python", "prompt"):
         raise ValueError("skill_type must be 'python' or 'prompt'")
@@ -154,12 +180,28 @@ def create_custom_skill(
         input_schema=input_schema or {},
         output_schema=output_schema or {},
         tags=tags or [],
+        metadata=merge_permissions_into_metadata(
+            metadata,
+            permissions,
+            skill_type=skill_type,
+            cwd=_default_execution_cwd(),
+        ),
         is_installed=True,
         status="active",
     )
 
 
 def edit_custom_skill(skill_id: str, **kwargs) -> dict | None:
+    if "permissions" in kwargs:
+        current = get_user_skill(skill_id=skill_id)
+        if current:
+            kwargs["metadata"] = merge_permissions_into_metadata(
+                kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else current.get("metadata", {}),
+                kwargs.pop("permissions"),
+                skill_type=str(current.get("skill_type", "") or ""),
+                catalog_id=str(current.get("catalog_id", "") or ""),
+                cwd=_default_execution_cwd(),
+            )
     return update_user_skill(skill_id, **kwargs)
 
 
@@ -179,61 +221,145 @@ def remove_custom_skill(skill_id: str) -> bool:
 _EXEC_TIMEOUT = 10  # seconds
 
 
-def _run_python_skill(code: str, inputs: dict) -> dict:
-    """Execute a python skill code in a restricted scope. Returns {output, stdout, stderr, success, error}."""
-    stdout_buf = io.StringIO()
-    stderr_buf = io.StringIO()
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    # Inject inputs as 'input' variable; skill must set 'output' or return via print
-    local_ns: dict[str, Any] = {"input": inputs, "inputs": inputs, "output": None}
-    safe_globals = {
-        "__builtins__": {k: getattr(__builtins__, k, None) for k in (
-            "print", "len", "range", "enumerate", "zip", "map", "filter",
-            "sorted", "reversed", "list", "dict", "set", "tuple", "str",
-            "int", "float", "bool", "type", "isinstance", "hasattr",
-            "getattr", "min", "max", "sum", "abs", "round",
-            "repr", "format", "hex", "oct", "bin", "chr", "ord",
-            "any", "all", "next", "iter", "open", "Exception",
-            "ValueError", "TypeError", "KeyError", "IndexError", "RuntimeError",
-        )},
-        "json": json,
-        "os": os,
+
+def _default_execution_cwd() -> str:
+    preferred = str(os.getenv("KENDR_WORKING_DIR", "")).strip()
+    return preferred or os.getcwd()
+
+
+def _record_permission_event(skill_label: str, *, action: str, status: str, detail: dict) -> None:
+    payload = {
+        "event_id": f"skill-permission-{uuid.uuid4().hex}",
+        "run_id": "",
+        "timestamp": _utc_now(),
+        "actor": skill_label,
+        "action": action,
+        "status": status,
+        "detail": detail,
+        "prev_hash": "",
+        "event_hash": "",
+    }
+    try:
+        insert_privileged_audit_event(payload)
+    except Exception:
+        pass
+
+
+def _strip_execution_control(inputs: dict) -> tuple[dict, dict | None]:
+    payload = dict(inputs or {})
+    approval = payload.pop("_approval", None)
+    if approval is None:
+        approval = payload.pop("approval", None)
+    return payload, approval if isinstance(approval, dict) else None
+
+
+def _extension_host_env() -> dict[str, str]:
+    allowed = {
+        "PATH",
+        "HOME",
+        "USERPROFILE",
+        "SYSTEMROOT",
+        "WINDIR",
+        "COMSPEC",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "PYTHONIOENCODING",
+        "KENDR_HOME",
+        "KENDR_DB_PATH",
+    }
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key in allowed and str(value).strip()
     }
 
+
+def _run_extension_host(mode: str, payload: dict, *, timeout: int) -> dict:
     try:
-        import signal
+        completed = subprocess.run(
+            [sys.executable, "-m", "kendr.extension_host", mode],
+            input=json.dumps(payload, ensure_ascii=False),
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout) + 2,
+            env=_extension_host_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return {"output": None, "stdout": "", "stderr": "", "success": False, "error": f"Extension host timed out after {timeout}s"}
+    except Exception:
+        return {"output": None, "stdout": "", "stderr": "", "success": False, "error": traceback.format_exc()}
 
-        def _timeout_handler(signum, frame):
-            raise TimeoutError(f"Skill execution timed out after {_EXEC_TIMEOUT}s")
-
-        # Signal-based timeout only works on Unix; use a simple approach for Windows
-        if hasattr(signal, "SIGALRM"):
-            signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(_EXEC_TIMEOUT)
-
-        with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-            exec(textwrap.dedent(code), safe_globals, local_ns)  # noqa: S102
-
-        if hasattr(signal, "SIGALRM"):
-            signal.alarm(0)
-
+    raw_output = completed.stdout.strip()
+    if completed.returncode != 0:
         return {
-            "output": local_ns.get("output"),
-            "stdout": stdout_buf.getvalue(),
-            "stderr": stderr_buf.getvalue(),
-            "success": True,
-            "error": None,
+            "output": None,
+            "stdout": raw_output,
+            "stderr": completed.stderr,
+            "success": False,
+            "error": completed.stderr or f"Extension host exited with code {completed.returncode}",
         }
-    except TimeoutError as exc:
-        return {"output": None, "stdout": "", "stderr": "", "success": False, "error": str(exc)}
+    try:
+        payload_out = json.loads(raw_output or "{}")
     except Exception:
         return {
-            "output": local_ns.get("output"),
-            "stdout": stdout_buf.getvalue(),
-            "stderr": stderr_buf.getvalue(),
+            "output": None,
+            "stdout": raw_output,
+            "stderr": completed.stderr,
             "success": False,
-            "error": traceback.format_exc(),
+            "error": "Extension host returned invalid JSON",
         }
+    return payload_out if isinstance(payload_out, dict) else {
+        "output": None,
+        "stdout": raw_output,
+        "stderr": completed.stderr,
+        "success": False,
+        "error": "Extension host returned an invalid payload",
+    }
+
+
+def _run_python_skill(code: str, inputs: dict, *, permission_manifest: dict | None = None, approval: dict | None = None, skill_label: str = "skill.python") -> dict:
+    """Execute python skill code in an isolated extension-host subprocess."""
+    effective_manifest = permission_manifest if isinstance(permission_manifest, dict) else {"requires_approval": False}
+    result = _run_extension_host(
+        "python-skill",
+        {
+            "code": code,
+            "inputs": inputs,
+            "timeout": _EXEC_TIMEOUT,
+            "permissions": effective_manifest,
+            "approval": normalize_approval(approval),
+            "cwd": _default_execution_cwd(),
+        },
+        timeout=_EXEC_TIMEOUT,
+    )
+    if not result.get("success", False):
+        _record_permission_event(
+            skill_label,
+            action="python_skill_execution",
+            status="blocked" if "approval" in str(result.get("error", "")).lower() or "access denied" in str(result.get("error", "")).lower() else "error",
+            detail={
+                "error": str(result.get("error", "") or ""),
+                "permissions": summarize_permission_manifest(effective_manifest),
+            },
+        )
+    elif effective_manifest.get("requires_approval", False):
+        _record_permission_event(
+            skill_label,
+            action="python_skill_execution",
+            status="approved",
+            detail={
+                "approval": normalize_approval(approval),
+                "permissions": summarize_permission_manifest(effective_manifest),
+            },
+        )
+    return result
 
 
 def _run_prompt_skill(prompt_template: str, inputs: dict) -> dict:
@@ -268,7 +394,7 @@ def _run_prompt_skill(prompt_template: str, inputs: dict) -> dict:
         return {"output": None, "stdout": "", "stderr": "", "success": False, "error": traceback.format_exc()}
 
 
-def _run_catalog_skill(catalog_id: str, inputs: dict) -> dict:
+def _run_catalog_skill(catalog_id: str, inputs: dict, *, permission_manifest: dict | None = None, approval: dict | None = None) -> dict:
     """Dispatch a catalog skill to its built-in handler."""
     handlers = _catalog_handlers()
     handler = handlers.get(catalog_id)
@@ -281,14 +407,14 @@ def _run_catalog_skill(catalog_id: str, inputs: dict) -> dict:
             "error": f"No handler registered for catalog skill '{catalog_id}'",
         }
     try:
-        result = handler(inputs)
+        result = handler(inputs, permission_manifest=permission_manifest, approval=approval)
         output_str = json.dumps(result, ensure_ascii=False, indent=2) if not isinstance(result, str) else result
         return {"output": result, "stdout": output_str, "stderr": "", "success": True, "error": None}
     except Exception:
         return {"output": None, "stdout": "", "stderr": "", "success": False, "error": traceback.format_exc()}
 
 
-def test_skill(skill_id: str, inputs: dict) -> dict:
+def test_skill(skill_id: str, inputs: dict, *, approval: dict | None = None) -> dict:
     """Run a skill with the provided inputs and return the execution result."""
     row = get_user_skill(skill_id=skill_id)
     if not row:
@@ -296,25 +422,52 @@ def test_skill(skill_id: str, inputs: dict) -> dict:
 
     skill_type = row.get("skill_type", "")
     code = row.get("code", "")
+    safe_inputs, inline_approval = _strip_execution_control(inputs)
+    effective_approval = approval if isinstance(approval, dict) else inline_approval
+    permission_manifest = permission_manifest_from_metadata(
+        row.get("metadata", {}),
+        skill_type=str(skill_type or ""),
+        catalog_id=str(row.get("catalog_id", "") or ""),
+        cwd=_default_execution_cwd(),
+    )
+    skill_label = f"skill:{row.get('slug', row.get('skill_id', 'unknown'))}"
 
     if skill_type == "python":
-        return _run_python_skill(code, inputs)
+        return _run_python_skill(code, safe_inputs, permission_manifest=permission_manifest, approval=effective_approval, skill_label=skill_label)
     elif skill_type == "prompt":
-        return _run_prompt_skill(code, inputs)
+        try:
+            ensure_manifest_approval(permission_manifest, effective_approval, capability="Prompt skill")
+        except PermissionError as exc:
+            _record_permission_event(
+                skill_label,
+                action="prompt_skill_execution",
+                status="blocked",
+                detail={
+                    "error": str(exc),
+                    "permissions": summarize_permission_manifest(permission_manifest),
+                },
+            )
+            return {"output": None, "stdout": "", "stderr": "", "success": False, "error": str(exc)}
+        return _run_prompt_skill(code, safe_inputs)
     elif skill_type == "catalog":
-        return _run_catalog_skill(row.get("catalog_id", ""), inputs)
+        return _run_catalog_skill(
+            row.get("catalog_id", ""),
+            safe_inputs,
+            permission_manifest=permission_manifest,
+            approval=effective_approval,
+        )
     else:
         return {"success": False, "error": f"Unknown skill_type: {skill_type!r}"}
 
 
-def execute_skill_by_slug(slug: str, inputs: dict) -> dict:
+def execute_skill_by_slug(slug: str, inputs: dict, *, approval: dict | None = None) -> dict:
     """Public API for agents to call a skill by its slug."""
     row = get_user_skill(slug=slug)
     if not row:
         return {"success": False, "error": f"Skill '{slug}' not found or not installed."}
     if not row.get("is_installed"):
         return {"success": False, "error": f"Skill '{slug}' is not installed."}
-    return test_skill(row["skill_id"], inputs)
+    return test_skill(row["skill_id"], inputs, approval=approval)
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +485,7 @@ def _catalog_handlers() -> dict[str, Any]:
     }
 
 
-def _handle_web_search(inputs: dict) -> dict:
+def _handle_web_search(inputs: dict, **_kwargs) -> dict:
     query = str(inputs.get("query", "")).strip()
     num_results = int(inputs.get("num_results", 5))
     if not query:
@@ -355,14 +508,20 @@ def _handle_web_search(inputs: dict) -> dict:
         return {"query": query, "results": [], "error": "requests library not installed"}
 
 
-def _handle_code_executor(inputs: dict) -> dict:
+def _handle_code_executor(inputs: dict, *, permission_manifest: dict | None = None, approval: dict | None = None) -> dict:
     code = str(inputs.get("code", "")).strip()
     if not code:
         raise ValueError("'code' is required")
-    return _run_python_skill(code, {})
+    return _run_python_skill(
+        code,
+        {},
+        permission_manifest=permission_manifest,
+        approval=approval,
+        skill_label="catalog:code-executor",
+    )
 
 
-def _handle_pdf_reader(inputs: dict) -> dict:
+def _handle_pdf_reader(inputs: dict, **_kwargs) -> dict:
     file_path = str(inputs.get("file_path", "")).strip()
     if not file_path or not os.path.isfile(file_path):
         raise FileNotFoundError(f"File not found: {file_path!r}")
@@ -375,21 +534,53 @@ def _handle_pdf_reader(inputs: dict) -> dict:
         return {"text": "", "page_count": 0, "error": "pypdf not installed. Run: pip install pypdf"}
 
 
-def _handle_shell_command(inputs: dict) -> dict:
-    import subprocess
+def _handle_shell_command(inputs: dict, *, permission_manifest: dict | None = None, approval: dict | None = None) -> dict:
     command = str(inputs.get("command", "")).strip()
     cwd = str(inputs.get("cwd", "")).strip() or None
     timeout = int(inputs.get("timeout", 30))
     if not command:
         raise ValueError("'command' is required")
-    result = subprocess.run(
-        command, shell=True, capture_output=True, text=True,
-        cwd=cwd, timeout=timeout,
+    result = _run_extension_host(
+        "shell-command",
+        {
+            "command": command,
+            "cwd": cwd,
+            "timeout": timeout,
+            "permissions": permission_manifest or {},
+            "approval": normalize_approval(approval),
+        },
+        timeout=timeout,
     )
-    return {"stdout": result.stdout, "stderr": result.stderr, "returncode": result.returncode}
+    if not result.get("success"):
+        _record_permission_event(
+            "catalog:shell-command",
+            action="shell_command_execution",
+            status="blocked" if "approval" in str(result.get("error", "")).lower() or "disabled" in str(result.get("error", "")).lower() or "outside the allowed scope" in str(result.get("error", "")).lower() else "error",
+            detail={
+                "command": command,
+                "cwd": cwd or _default_execution_cwd(),
+                "error": str(result.get("error", "") or ""),
+                "permissions": summarize_permission_manifest(permission_manifest or {}),
+            },
+        )
+        raise RuntimeError(str(result.get("error", "Shell command execution failed")))
+    if permission_manifest and permission_manifest.get("requires_approval", False):
+        _record_permission_event(
+            "catalog:shell-command",
+            action="shell_command_execution",
+            status="approved",
+            detail={
+                "command": command,
+                "cwd": cwd or _default_execution_cwd(),
+                "approval": normalize_approval(approval),
+                "permissions": summarize_permission_manifest(permission_manifest),
+            },
+        )
+    output = result.get("output")
+    return output if isinstance(output, dict) else {"stdout": "", "stderr": "", "returncode": 1}
 
 
-def _handle_api_caller(inputs: dict) -> dict:
+def _handle_api_caller(inputs: dict, **_kwargs) -> dict:
     url = str(inputs.get("url", "")).strip()
     method = str(inputs.get("method", "GET")).upper()
     headers = dict(inputs.get("headers") or {})

@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
 from tasks.setup_config_store import apply_setup_env_defaults
 
 load_dotenv()
@@ -90,6 +89,26 @@ def model_for_agent(agent_name: str = "") -> str:
     return model_selection_for_agent(agent_name).get("model", _DEFAULT_GENERAL_MODEL)
 
 
+class _MissingLangchainOpenAIClient:
+    def __init__(self, model: str, exc: Exception) -> None:
+        self.model = model
+        self._exc = exc
+
+    def invoke(self, *args, **kwargs):
+        raise ModuleNotFoundError(
+            "langchain_openai is required to construct the fallback OpenAI client. "
+            "Install the dependency or configure a supported provider via kendr.llm_router."
+        ) from self._exc
+
+
+def _fallback_openai_client(model: str) -> object:
+    try:
+        from langchain_openai import ChatOpenAI
+    except ModuleNotFoundError as exc:
+        return _MissingLangchainOpenAIClient(model, exc)
+    return ChatOpenAI(model=model)
+
+
 def _client_for_model(model: str, role: str = "general") -> object:
     from kendr.llm_router import build_llm, get_active_provider
 
@@ -100,7 +119,7 @@ def _client_for_model(model: str, role: str = "general") -> object:
         try:
             client = build_llm(provider=provider, model=model, role=role)
         except Exception:
-            client = ChatOpenAI(model=model)
+            client = _fallback_openai_client(model)
         _LLM_CLIENTS[cache_key] = client
     return client
 

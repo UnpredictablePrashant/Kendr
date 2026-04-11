@@ -4,13 +4,37 @@ const AppContext = createContext(null)
 const MODEL_INVENTORY_TTL_MS = 60 * 1000
 const OLLAMA_MODELS_TTL_MS = 30 * 1000
 
+function normalizeView(view) {
+  switch (view) {
+    case 'chat':
+      return 'studio'
+    case 'files':
+    case 'git':
+    case 'project':
+      return 'developer'
+    case 'agents':
+      return 'build'
+    case 'mcp':
+      return 'integrations'
+    case 'skills':
+      return 'marketplace'
+    case 'models':
+    case 'docs':
+      return 'settings'
+    case 'orchestration':
+      return 'runs'
+    default:
+      return view || 'home'
+  }
+}
+
 const initialState = {
   // App mode
   appMode: (() => { try { return localStorage.getItem('kendr:appMode') || 'developer' } catch { return 'developer' } })(),
   selectedModel: (() => { try { return localStorage.getItem('kendr:selectedModel') || null } catch { return null } })(),
 
   // Views & panels
-  activeView: 'files',        // files | git | orchestration | settings
+  activeView: 'home',
   sidebarOpen: true,
   chatOpen: true,
   terminalOpen: false,
@@ -64,7 +88,7 @@ const initialState = {
 
 function reducer(state, action) {
   switch (action.type) {
-    case 'SET_VIEW': return { ...state, activeView: action.view }
+    case 'SET_VIEW': return { ...state, activeView: normalizeView(action.view) }
     case 'TOGGLE_SIDEBAR': return { ...state, sidebarOpen: !state.sidebarOpen }
     case 'SET_SIDEBAR': return { ...state, sidebarOpen: action.open }
     case 'TOGGLE_CHAT': return { ...state, chatOpen: !state.chatOpen }
@@ -226,11 +250,13 @@ export function AppProvider({ children }) {
     await Promise.all([refreshModelInventory(force), refreshOllamaModels(force)])
   }, [refreshModelInventory, refreshOllamaModels])
 
+  // Fetch model inventory once when the backend first becomes available — no polling.
+  const modelsFetchedRef = React.useRef(false)
   useEffect(() => {
     if (state.backendStatus !== 'running' && state.backendStatus !== 'connecting') return
+    if (modelsFetchedRef.current) return
+    modelsFetchedRef.current = true
     refreshModelData(false)
-    const timer = window.setInterval(() => { refreshModelData(false) }, 30 * 1000)
-    return () => window.clearInterval(timer)
   }, [refreshModelData, state.backendStatus])
 
   // Subscribe to real-time backend status pushed from the main process.
@@ -266,7 +292,7 @@ export function AppProvider({ children }) {
       }
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'J') {
         e.preventDefault()
-        dispatch({ type: 'SET_VIEW', view: 'project' })
+        dispatch({ type: 'SET_VIEW', view: 'developer' })
       }
       if (e.key === 'Escape') {
         dispatch({ type: 'SET_COMMAND_PALETTE', open: false })

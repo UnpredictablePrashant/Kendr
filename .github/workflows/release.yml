@@ -3,47 +3,165 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'          # v1.0.0, v1.2.3, …
   workflow_dispatch:
 
+permissions:
+  contents: write   # required to create GitHub Releases
+
 jobs:
-  build-dist:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  # ────────────────────────────────────────────────────────────────────────────
+  build-mac:
+    name: macOS (x64 + arm64)
+    runs-on: macos-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: "3.12"
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: electron-app/package-lock.json
 
-      - name: Build distribution artifacts
+      - name: Install dependencies
+        working-directory: electron-app
+        run: npm ci
+
+      - name: Rebuild native modules
+        working-directory: electron-app
+        run: npm run rebuild
+
+      - name: Build + package (macOS DMG)
+        working-directory: electron-app
+        env:
+          CSC_LINK:                    ${{ secrets.MAC_CERT_P12_BASE64 }}
+          CSC_KEY_PASSWORD:            ${{ secrets.MAC_CERT_PASSWORD }}
+          APPLE_ID:                    ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID:               ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run package:mac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kendr-mac
+          path: electron-app/dist/*.dmg
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: electron-app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: electron-app
+        run: npm ci
+
+      - name: Rebuild native modules
+        working-directory: electron-app
+        run: npm run rebuild
+
+      - name: Build + package (NSIS installer)
+        working-directory: electron-app
+        env:
+          CSC_LINK:         ${{ secrets.WIN_CERT_P12_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CERT_PASSWORD }}
+        run: npm run package:win
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kendr-windows
+          path: electron-app/dist/*.exe
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────────────────
+  build-linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: electron-app/package-lock.json
+
+      - name: Install system build dependencies
+        run: sudo apt-get install -y build-essential python3-dev
+
+      - name: Install dependencies
+        working-directory: electron-app
+        run: npm ci
+
+      - name: Rebuild native modules
+        working-directory: electron-app
+        run: npm run rebuild
+
+      - name: Build + package (AppImage + deb)
+        working-directory: electron-app
+        run: npm run package:linux
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kendr-linux
+          path: |
+            electron-app/dist/*.AppImage
+            electron-app/dist/*.deb
+          retention-days: 7
+
+  # ────────────────────────────────────────────────────────────────────────────
+  build-python-pkg:
+    name: Python wheel (PyPI-ready)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build wheel + sdist
         run: |
           python -m pip install --upgrade pip build
           python -m build
 
-      - name: Upload dist artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: kendr-python-pkg
           path: dist/*
+          retention-days: 7
 
-  github-release:
-    needs: build-dist
+  # ────────────────────────────────────────────────────────────────────────────
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-mac, build-windows, build-linux, build-python-pkg]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - name: Download dist artifacts
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          name: dist
-          path: dist
+          path: release-assets
 
-      - name: Publish GitHub release assets
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          draft: true
           generate_release_notes: true
+          files: |
+            release-assets/kendr-mac/*.dmg
+            release-assets/kendr-windows/*.exe
+            release-assets/kendr-linux/*.AppImage
+            release-assets/kendr-linux/*.deb
+            release-assets/kendr-python-pkg/*.whl
+            release-assets/kendr-python-pkg/*.tar.gz

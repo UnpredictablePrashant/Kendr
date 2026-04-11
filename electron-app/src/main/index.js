@@ -37,7 +37,8 @@ const store = new Store({
     modelDownloadDir: join(os.homedir(), '.kendr', 'models'),
     gpuLayers:       0,
     contextSize:     4096,
-    threads:         4
+    threads:         4,
+    chatHistoryRetentionDays: 14
   }
 })
 

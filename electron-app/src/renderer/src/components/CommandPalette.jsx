@@ -5,11 +5,13 @@ const COMMANDS = [
   { id: 'toggle-terminal',  label: 'Toggle Terminal',          keys: 'Ctrl+`' },
   { id: 'toggle-sidebar',   label: 'Toggle Sidebar',           keys: 'Ctrl+B' },
   { id: 'toggle-chat',      label: 'Toggle Chat Panel',        keys: '' },
-  { id: 'view-files',       label: 'View: Explorer',           keys: '' },
-  { id: 'view-git',         label: 'View: Source Control',     keys: '' },
-  { id: 'view-agents',      label: 'View: Agent Orchestration',keys: '' },
-  { id: 'view-models',      label: 'View: Model Manager',      keys: '' },
+  { id: 'view-home',        label: 'View: Home',               keys: '' },
+  { id: 'view-studio',      label: 'View: Studio',             keys: '' },
+  { id: 'view-build',       label: 'View: Build',              keys: '' },
+  { id: 'view-integrations',label: 'View: Integrations',       keys: '' },
+  { id: 'view-runs',        label: 'View: Runs',               keys: '' },
   { id: 'view-settings',    label: 'View: Settings',           keys: '' },
+  { id: 'view-developer',   label: 'View: Developer Workspace',keys: '' },
   { id: 'open-folder',      label: 'Open Folder…',             keys: '' },
   { id: 'start-backend',    label: 'Backend: Start',           keys: '' },
   { id: 'restart-backend',  label: 'Backend: Restart',         keys: '' },
@@ -39,17 +41,19 @@ export default function CommandPalette() {
       case 'toggle-terminal':  dispatch({ type: 'TOGGLE_TERMINAL' }); break
       case 'toggle-sidebar':   dispatch({ type: 'TOGGLE_SIDEBAR' }); break
       case 'toggle-chat':      dispatch({ type: 'TOGGLE_CHAT' }); break
-      case 'view-files':       dispatch({ type: 'SET_VIEW', view: 'files' }); break
-      case 'view-git':         dispatch({ type: 'SET_VIEW', view: 'git' }); break
-      case 'view-agents':      dispatch({ type: 'SET_VIEW', view: 'orchestration' }); break
-      case 'view-models':      dispatch({ type: 'SET_VIEW', view: 'models' }); break
+      case 'view-home':        dispatch({ type: 'SET_VIEW', view: 'home' }); break
+      case 'view-studio':      dispatch({ type: 'SET_VIEW', view: 'studio' }); break
+      case 'view-build':       dispatch({ type: 'SET_VIEW', view: 'build' }); break
+      case 'view-integrations':dispatch({ type: 'SET_VIEW', view: 'integrations' }); break
+      case 'view-runs':        dispatch({ type: 'SET_VIEW', view: 'runs' }); break
       case 'view-settings':    dispatch({ type: 'SET_VIEW', view: 'settings' }); break
+      case 'view-developer':   dispatch({ type: 'SET_VIEW', view: 'developer' }); break
       case 'open-folder': {
         const dir = await api?.dialog.openDirectory()
         if (dir) {
           dispatch({ type: 'SET_PROJECT_ROOT', root: dir })
           await api?.settings.set('projectRoot', dir)
-          dispatch({ type: 'SET_VIEW', view: 'files' })
+          dispatch({ type: 'SET_VIEW', view: 'developer' })
         }
         break
       }

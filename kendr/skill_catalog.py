@@ -1,6 +1,12 @@
 """Built-in skill catalog for Kendr.
 
 Each entry defines a system skill that users can install from the marketplace.
+A skill is a reusable, composed capability — it may use LLM reasoning, code, or
+multiple plugin actions to deliver a user-facing outcome.
+
+Raw integration actions (send Slack message, create GitHub issue, etc.) live in
+``kendr.plugin_manager``, not here.  A skill is higher-level than a plugin action.
+
 Catalog skills have a fixed slug, category, description, and a built-in handler
 that is invoked when agents call them.
 """
@@ -150,28 +156,9 @@ CATALOG: tuple[CatalogSkill, ...] = (
     ),
 
     # ── Development ───────────────────────────────────────────────────────────
-
-    CatalogSkill(
-        id="github-tools",
-        name="GitHub Tools",
-        description="Interact with GitHub: create issues, review PRs, read files from repos, and manage branches.",
-        category="Development",
-        icon="🐙",
-        tags=("github", "git", "code", "pr", "issues"),
-        requires_config=("GITHUB_TOKEN",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["list_issues", "create_issue", "get_file", "list_prs"], "description": "Action to perform"},
-                "repo": {"type": "string", "description": "owner/repo"},
-                "params": {"type": "object", "description": "Action-specific parameters"},
-            },
-            "required": ["action", "repo"],
-        },
-        output_schema={"type": "object"},
-        example_input={"action": "list_issues", "repo": "owner/repo"},
-        example_output='{"issues": [...]}',
-    ),
+    # Note: raw GitHub API actions (create_issue, list_prs, etc.) live in the
+    # GitHub plugin (kendr.plugin_manager). Skills here are higher-level
+    # capabilities that may compose plugin actions with LLM reasoning.
 
     CatalogSkill(
         id="shell-command",
@@ -287,66 +274,10 @@ CATALOG: tuple[CatalogSkill, ...] = (
         example_output='{"result": "...", "stats": {"mean": ..., "std": ...}}',
     ),
 
-    # ── Communication ─────────────────────────────────────────────────────────
-
-    CatalogSkill(
-        id="slack-messenger",
-        name="Slack Messenger",
-        description="Send messages, post to channels, and manage Slack notifications. Supports rich formatting and file attachments.",
-        category="Communication",
-        icon="💬",
-        tags=("slack", "messaging", "notification", "communication"),
-        requires_config=("SLACK_BOT_TOKEN",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "channel": {"type": "string", "description": "Channel name or ID (e.g. #general)"},
-                "text": {"type": "string", "description": "Message text"},
-                "blocks": {"type": "array", "description": "Slack Block Kit blocks for rich formatting"},
-            },
-            "required": ["channel", "text"],
-        },
-        output_schema={
-            "type": "object",
-            "properties": {
-                "ok": {"type": "boolean"},
-                "ts": {"type": "string"},
-            },
-        },
-        example_input={"channel": "#general", "text": "Hello from Kendr!"},
-        example_output='{"ok": true, "ts": "1234567890.000100"}',
-    ),
-
-    CatalogSkill(
-        id="email-composer",
-        name="Email Composer",
-        description="Compose and send emails with AI-assisted drafting. Supports HTML formatting, attachments, and templates.",
-        category="Communication",
-        icon="📧",
-        tags=("email", "smtp", "communication", "compose"),
-        requires_config=("SMTP_HOST", "SMTP_USER", "SMTP_PASSWORD"),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "to": {"type": "string"},
-                "subject": {"type": "string"},
-                "body": {"type": "string"},
-                "html": {"type": "boolean", "default": False},
-            },
-            "required": ["to", "subject", "body"],
-        },
-        output_schema={
-            "type": "object",
-            "properties": {
-                "sent": {"type": "boolean"},
-                "message_id": {"type": "string"},
-            },
-        },
-        example_input={"to": "user@example.com", "subject": "Hello", "body": "Hi there!"},
-        example_output='{"sent": true, "message_id": "<...>"}',
-    ),
-
     # ── Documents ─────────────────────────────────────────────────────────────
+    # Note: raw messaging actions (send Slack message, send email) live in the
+    # Slack / Gmail plugins (kendr.plugin_manager). Skills here are higher-level
+    # capabilities that compose plugin actions with LLM reasoning.
 
     CatalogSkill(
         id="doc-writer",

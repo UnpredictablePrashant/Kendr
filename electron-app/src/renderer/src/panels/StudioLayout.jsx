@@ -15,168 +15,191 @@ const CLOUD_MODELS = [
   { id: 'google/gemini-2.0-flash',      label: 'Gemini 2.0 Flash',   provider: 'google' },
   { id: 'google/gemini-2.5-pro',        label: 'Gemini 2.5 Pro',     provider: 'google' },
   { id: 'google/gemini-1.5-pro',        label: 'Gemini 1.5 Pro',     provider: 'google' },
-  { id: 'xai/grok-4',                               label: 'Grok 4',                     provider: 'xai' },
-  { id: 'xai/grok-4.20-beta-latest-non-reasoning', label: 'Grok 4.20',                  provider: 'xai' },
-  { id: 'xai/grok-4-1-fast-reasoning',              label: 'Grok 4.1 Fast Reasoning',   provider: 'xai' },
+  { id: 'xai/grok-4',                               label: 'Grok 4',                   provider: 'xai' },
+  { id: 'xai/grok-4.20-beta-latest-non-reasoning', label: 'Grok 4.20',                provider: 'xai' },
+  { id: 'xai/grok-4-1-fast-reasoning',              label: 'Grok 4.1 Fast Reasoning',  provider: 'xai' },
 ]
 
 const PROVIDER_META = {
   anthropic: { label: 'Anthropic', settingsKey: 'anthropicKey' },
-  openai:    { label: 'OpenAI', settingsKey: 'openaiKey' },
+  openai:    { label: 'OpenAI',    settingsKey: 'openaiKey' },
   google:    { label: 'Google AI', settingsKey: 'googleKey' },
   xai:       { label: 'xAI / Grok', settingsKey: 'xaiKey' },
+}
+
+// ─── Session helpers (operate directly on localStorage) ──────────────────────
+const SESSIONS_KEY     = 'kendr_sessions_v1'
+const CURRENT_HIST_KEY = 'kendr_chat_history_v1'
+
+function lsGet(key) {
+  try { return JSON.parse(localStorage.getItem(key)) } catch { return null }
+}
+function lsSet(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)) } catch {}
+}
+
+function readSessions(settings) {
+  const all = lsGet(SESSIONS_KEY) || []
+  const days = settings?.chatHistoryRetentionDays ?? 14
+  if (!days || days <= 0) return all.slice().reverse()
+  const cutoff = Date.now() - days * 24 * 60 * 60 * 1000
+  return all.filter(s => new Date(s.updatedAt || s.createdAt).getTime() >= cutoff).reverse()
+}
+
+function saveCurrentAsSession(chatId) {
+  const messages = lsGet(CURRENT_HIST_KEY) || []
+  if (!messages.length) return
+  const first = messages.find(m => m.role === 'user')
+  const title = String(first?.content || '').slice(0, 60) || 'New conversation'
+  const all = lsGet(SESSIONS_KEY) || []
+  const session = {
+    id: chatId,
+    title,
+    createdAt: String(messages[0]?.ts || new Date().toISOString()),
+    updatedAt: new Date().toISOString(),
+    messages,
+  }
+  lsSet(SESSIONS_KEY, [...all.filter(s => s.id !== chatId), session].slice(-100))
+}
+
+function sessionRelTime(dateStr) {
+  const diff = Date.now() - new Date(dateStr).getTime()
+  if (diff < 60000) return 'just now'
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`
+  const d = new Date(dateStr)
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
 // ─── StudioLayout ─────────────────────────────────────────────────────────────
 export default function StudioLayout() {
   const { state, dispatch, refreshOllamaModels } = useApp()
-  const [chatKey, setChatKey]       = useState(0)
-  const isOnline = state.backendStatus === 'running'
-  const ollamaModels = Array.isArray(state.ollamaModels) ? state.ollamaModels : []
-  const ollamaLoading = !!state.ollamaLoading
-  const ollamaError = !!state.ollamaError
-  const modelInventory = state.modelInventory
+  const [chatKey, setChatKey]           = useState(0)
+  const [chatId,  setChatId]            = useState(() => `chat-${Date.now()}`)
+  const [activeSession, setActiveSession] = useState(null)   // null = new/current
+  const [sessions, setSessions]         = useState(() => readSessions(state.settings))
+
+  const isOnline         = state.backendStatus === 'running'
+  const ollamaModels     = Array.isArray(state.ollamaModels) ? state.ollamaModels : []
+  const modelInventory   = state.modelInventory
   const modelInventoryLoading = !!state.modelInventoryLoading
-  const modelInventoryError = !!state.modelInventoryError
+  const modelInventoryError   = !!state.modelInventoryError
 
   const providerStatuses = Object.fromEntries(
     ((modelInventory && Array.isArray(modelInventory.providers)) ? modelInventory.providers : [])
-      .map(provider => [provider.provider, provider])
+      .map(p => [p.provider, p])
   )
 
   const getProviderUiState = useCallback((provider) => {
-    const meta = PROVIDER_META[provider]
+    const meta   = PROVIDER_META[provider]
     const status = providerStatuses[provider] || {}
     const hasSavedKey = !!String(state.settings?.[meta.settingsKey] || '').trim()
-    const hasModels = Array.isArray(status.selectable_models) && status.selectable_models.length > 0
+    const hasModels   = Array.isArray(status.selectable_models) && status.selectable_models.length > 0
     const hasFetchError = !!String(status.model_fetch_error || '').trim()
 
-    if (!hasSavedKey) {
-      return { kind: 'missing', label: '+ key', title: `Add ${meta.label} API key` }
-    }
+    if (!hasSavedKey) return { kind: 'missing', label: '+ key', title: `Add ${meta.label} API key` }
     if (modelInventoryLoading || state.backendStatus === 'starting' || state.backendStatus === 'connecting') {
       return { kind: 'checking', label: 'checking', title: `Checking ${meta.label} models…` }
     }
     if (modelInventoryError || hasFetchError || (!status.ready && !hasModels)) {
-      return {
-        kind: 'error',
-        label: 'error',
-        title: hasFetchError ? `${meta.label}: ${status.model_fetch_error}` : `${meta.label} could not be verified`,
-      }
+      return { kind: 'error', label: 'error', title: hasFetchError ? `${meta.label}: ${status.model_fetch_error}` : `${meta.label} could not be verified` }
     }
     return { kind: 'ok', label: '✓', title: `${meta.label} ready` }
   }, [modelInventoryError, modelInventoryLoading, providerStatuses, state.backendStatus, state.settings])
 
-  const selectModel = (id) => dispatch({ type: 'SET_MODEL', model: id })
-  const navigate    = (view) => dispatch({ type: 'SET_VIEW', view })
+  const navigate = (view) => dispatch({ type: 'SET_VIEW', view })
+
+  // Refresh session list when chatKey changes (new chat / session loaded)
+  useEffect(() => {
+    setSessions(readSessions(state.settings))
+  }, [chatKey, state.settings])
+
+  // ── Session management ───────────────────────────────────────────────────────
+  const handleNewChat = useCallback(() => {
+    saveCurrentAsSession(chatId)
+    lsSet(CURRENT_HIST_KEY, [])
+    const newId = `chat-${Date.now()}`
+    setChatId(newId)
+    setActiveSession(null)
+    setChatKey(k => k + 1)
+  }, [chatId])
+
+  const handleLoadSession = useCallback((session) => {
+    saveCurrentAsSession(chatId)
+    // Remove selected session from history (it becomes current)
+    const all = lsGet(SESSIONS_KEY) || []
+    lsSet(SESSIONS_KEY, all.filter(s => s.id !== session.id))
+    lsSet(CURRENT_HIST_KEY, session.messages)
+    setChatId(session.id)
+    setActiveSession(session)
+    setChatKey(k => k + 1)
+  }, [chatId])
+
+  const handleDeleteSession = useCallback((id) => {
+    const all = lsGet(SESSIONS_KEY) || []
+    lsSet(SESSIONS_KEY, all.filter(s => s.id !== id))
+    setSessions(prev => prev.filter(s => s.id !== id))
+  }, [])
 
   return (
     <div className="sl-root">
       {/* ── Left sidebar ── */}
       <div className="sl-sidebar">
-        <div className="sl-sidebar-top">
-          <button className="sl-new-chat" onClick={() => setChatKey(k => k + 1)}>
+        {/* Fixed top section */}
+        <div className="sl-sidebar-fixed">
+          <button className="sl-new-chat" onClick={handleNewChat}>
             <PlusIcon /> New chat
           </button>
 
-          <div className="sl-conv-label">Session</div>
+          <div className="sl-conv-label">ACTIVE ASSISTANT</div>
           <button className="sl-conv-item active">
-            <ChatDotIcon /> Current chat
+            <ChatDotIcon />
+            <span className="sl-conv-current-label">
+              {activeSession?.title || 'Current chat'}
+            </span>
           </button>
 
-          {/* ── Cloud provider status ── */}
-          <div className="sl-section-divider" />
-          <div className="sl-conv-label">CLOUD PROVIDERS</div>
-          <div className="sl-providers">
-            {PROVIDER_ORDER.map(p => {
-              const ui = getProviderUiState(p)
-              return (
-              <button
-                key={p}
-                className={`sl-provider-row ${ui.kind}`}
-                onClick={() => navigate('settings')}
-                title={ui.title}
-              >
-                <span className={`mp-provider-dot ${p}`} />
-                <span className="sl-provider-name">{PROVIDER_META[p].label}</span>
-                {ui.kind === 'checking' && <SpinnerIcon className="sl-provider-spinner" />}
-                {ui.kind === 'ok' && <span className="sl-provider-ok">✓</span>}
-                {ui.kind === 'missing' && <span className="sl-provider-add">+ key</span>}
-                {ui.kind === 'error' && <span className="sl-provider-error">!</span>}
-              </button>
-            )})}
-          </div>
+          {sessions.length > 0 && (
+            <div className="sl-conv-label sl-conv-label--recent">RECENT SESSIONS</div>
+          )}
+        </div>
 
-          {/* ── Local Ollama models ── */}
-          <div className="sl-section-divider" />
-          <div className="sl-ollama-header">
-            <span className="sl-conv-label" style={{ margin: 0 }}>LOCAL MODELS</span>
-            <button
-              className="sl-refresh-btn"
-              onClick={() => refreshOllamaModels(true)}
-              disabled={ollamaLoading}
-              title="Refresh Ollama models"
-            >
-              <RefreshIcon spinning={ollamaLoading} />
-            </button>
-          </div>
-
-          {ollamaLoading && (
-            <div className="sl-ollama-inline">
-              <span className="sl-ollama-dot checking" />
-              <span>Checking…</span>
-            </div>
+        {/* Scrollable sessions list */}
+        <div className="sl-sessions-scroll">
+          {sessions.length === 0 ? (
+            <div className="sl-sessions-empty">No past chats yet</div>
+          ) : (
+            sessions.map(s => (
+              <div key={s.id} className="sl-session-row">
+                <button className="sl-session-btn" onClick={() => handleLoadSession(s)}>
+                  <span className="sl-session-title">{s.title}</span>
+                  <span className="sl-session-time">{sessionRelTime(s.updatedAt || s.createdAt)}</span>
+                </button>
+                <button
+                  className="sl-session-del"
+                  title="Delete"
+                  onClick={e => { e.stopPropagation(); handleDeleteSession(s.id) }}
+                >×</button>
+              </div>
+            ))
           )}
-          {!ollamaLoading && ollamaError && (
-            <div className="sl-ollama-inline">
-              <span className="sl-ollama-dot offline" />
-              <span>Ollama offline</span>
-              <button className="sl-ollama-action" onClick={() => refreshOllamaModels(true)}>retry</button>
-            </div>
-          )}
-          {!ollamaLoading && !ollamaError && ollamaModels.length === 0 && (
-            <div className="sl-ollama-inline">
-              <span className="sl-ollama-dot empty" />
-              <span>No local models</span>
-              <button className="sl-ollama-action" onClick={() => navigate('models')}>pull →</button>
-            </div>
-          )}
-          {!ollamaLoading && ollamaModels.map(m => {
-            const id       = `ollama/${m.name || m}`
-            const name     = m.name || m
-            const isActive = state.selectedModel === id
-            const sizeGB   = m.size ? (m.size / 1e9).toFixed(1) : null
-            return (
-              <button
-                key={id}
-                className={`sl-model-btn ${isActive ? 'active' : ''}`}
-                onClick={() => selectModel(isActive ? null : id)}
-                title={`${name}${sizeGB ? ` — ${sizeGB} GB` : ''}`}
-              >
-                <span className="sl-model-dot" />
-                <span className="sl-model-name">{name}</span>
-                {sizeGB && <span className="sl-model-size">{sizeGB} GB</span>}
-                {isActive && <span className="sl-model-check">✓</span>}
-              </button>
-            )
-          })}
         </div>
 
         {/* Bottom nav */}
         <div className="sl-sidebar-bottom">
-          <button className="sl-nav-btn" onClick={() => navigate('runs')} title="Runs & Orchestration">
+          <button className="sl-nav-btn" onClick={() => navigate('home')} title="Home">
+            <HomeNavIcon /> Home
+          </button>
+          <button className="sl-nav-btn" onClick={() => navigate('build')} title="Build">
+            <AgentsNavIcon /> Build
+          </button>
+          <button className="sl-nav-btn" onClick={() => navigate('integrations')} title="Integrations">
+            <MCPNavIcon /> Tools
+          </button>
+          <button className="sl-nav-btn" onClick={() => navigate('runs')} title="Runs">
             <RunsNavIcon /> Runs
           </button>
-          <button className="sl-nav-btn" onClick={() => navigate('agents')} title="Agents & Capabilities">
-            <AgentsNavIcon /> Agents
-          </button>
-          <button className="sl-nav-btn" onClick={() => navigate('mcp')} title="MCP Servers">
-            <MCPNavIcon /> MCP
-          </button>
-          <button className="sl-nav-btn" onClick={() => navigate('models')} title="Model Manager">
-            <ModelsNavIcon /> Models
-          </button>
-          <button className="sl-nav-btn" onClick={() => navigate('settings')} title="Settings">
+          <button className="sl-nav-btn" onClick={() => navigate('settings')} title="AI Engines & Settings">
             <SettingsNavIcon /> Settings
           </button>
         </div>
@@ -223,26 +246,19 @@ function ModelPicker({ ollamaModels, onRefreshOllama, providerStatuses, getProvi
     setOpen(false)
   }
 
-  const selected = state.selectedModel
+  const selected     = state.selectedModel
   const selectedMeta = CLOUD_MODELS.find(m => m.id === selected)
-  const displayName = !selected
+  const displayName  = !selected
     ? 'Auto (backend default)'
     : selectedMeta?.label ?? selected.replace(/^ollama\//, '')
-  const selectedProvider = selected
-    ? (selectedMeta?.provider || 'ollama')
-    : null
+  const selectedProvider = selected ? (selectedMeta?.provider || 'ollama') : null
+  const selectedProviderLost = selected && selectedMeta && getProviderUiState(selectedMeta.provider).kind !== 'ok'
 
-  const isProviderConfigured = (provider) => {
-    return getProviderUiState(provider).kind === 'ok'
-  }
   const getModelBadges = (provider, modelId) => {
     const status = providerStatuses[provider] || {}
     const name = String(modelId || '').replace(new RegExp(`^${provider}/`), '')
     return Array.isArray(status.model_badges?.[name]) ? status.model_badges[name] : []
   }
-
-  // If selected model's provider lost its key, show warning in trigger
-  const selectedProviderLost = selected && selectedMeta && !isProviderConfigured(selectedMeta.provider)
 
   return (
     <div className="mp-root" ref={rootRef}>
@@ -265,10 +281,10 @@ function ModelPicker({ ollamaModels, onRefreshOllama, providerStatuses, getProvi
 
           {/* Cloud — grouped per provider */}
           {PROVIDER_ORDER.map(provider => {
-            const status = providerStatuses[provider] || {}
-            const ui = getProviderUiState(provider)
+            const status     = providerStatuses[provider] || {}
+            const ui         = getProviderUiState(provider)
             const isConfigured = ui.kind === 'ok'
-            const knownModels = CLOUD_MODELS.filter(m => m.provider === provider)
+            const knownModels  = CLOUD_MODELS.filter(m => m.provider === provider)
             const selectableModels = Array.isArray(status.selectable_models) ? status.selectable_models : []
             const models = selectableModels.length
               ? selectableModels.map(model => {
@@ -282,12 +298,10 @@ function ModelPicker({ ollamaModels, onRefreshOllama, providerStatuses, getProvi
                 <div className="mp-group-label">
                   <span className={`mp-provider-dot ${provider}`} />
                   {meta.label}
-                  {ui.kind === 'ok' && <span className="mp-key-badge ok">ready</span>}
-                  {ui.kind === 'missing' && <span className="mp-key-badge missing">no key</span>}
-                  {ui.kind === 'checking' && (
-                    <span className="mp-key-badge checking"><SpinnerIcon className="mp-inline-spinner" />checking</span>
-                  )}
-                  {ui.kind === 'error' && <span className="mp-key-badge error">error</span>}
+                  {ui.kind === 'ok'       && <span className="mp-key-badge ok">ready</span>}
+                  {ui.kind === 'missing'  && <span className="mp-key-badge missing">no key</span>}
+                  {ui.kind === 'checking' && <span className="mp-key-badge checking"><SpinnerIcon className="mp-inline-spinner" />checking</span>}
+                  {ui.kind === 'error'    && <span className="mp-key-badge error">error</span>}
                 </div>
                 {models.map(m => (
                   <button
@@ -358,29 +372,16 @@ function ModelPicker({ ollamaModels, onRefreshOllama, providerStatuses, getProvi
 
 function SpinnerIcon({ className = '' }) {
   return (
-    <svg
-      className={className}
-      width="10"
-      height="10"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.2"
-      strokeLinecap="round"
-    >
+    <svg className={className} width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
       <path d="M21 12a9 9 0 1 1-3.2-6.9" />
     </svg>
   )
 }
 
-// ─── Refresh icon (optionally animates) ───────────────────────────────────────
 function RefreshIcon({ spinning = false }) {
   return (
-    <svg
-      width="12" height="12" viewBox="0 0 24 24" fill="none"
-      stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"
-      style={spinning ? { animation: 'sl-spin .7s linear infinite' } : {}}
-    >
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round"
+      style={spinning ? { animation: 'sl-spin .7s linear infinite' } : {}}>
       <polyline points="23 4 23 10 17 10"/>
       <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
     </svg>
@@ -393,6 +394,9 @@ function PlusIcon() {
 }
 function ChatDotIcon() {
   return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+}
+function HomeNavIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/></svg>
 }
 function RunsNavIcon() {
   return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>

@@ -2,6 +2,65 @@ import React, { useState, useRef, useEffect, useCallback, useReducer } from 'rea
 import { useApp } from '../contexts/AppContext'
 import { basename, resolveSelectedModel } from '../lib/modelSelection'
 
+// ─── Chat history persistence ────────────────────────────────────────────────
+const CHAT_HISTORY_KEY = 'kendr_chat_history_v1'
+const SESSIONS_KEY     = 'kendr_sessions_v1'
+const MAX_STORED_MESSAGES = 200
+const MAX_SESSIONS = 100
+
+function loadHistory() {
+  try {
+    const raw = localStorage.getItem(CHAT_HISTORY_KEY)
+    if (!raw) return []
+    const msgs = JSON.parse(raw)
+    return Array.isArray(msgs) ? msgs.map(m => ({ ...m, ts: new Date(m.ts) })) : []
+  } catch { return [] }
+}
+
+function saveHistory(messages) {
+  try {
+    const toSave = messages
+      .filter(m => m.status === 'done' || m.status === 'error' || m.role === 'user')
+      .slice(-MAX_STORED_MESSAGES)
+    localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(toSave))
+  } catch (_) {}
+}
+
+function loadSessions() {
+  try {
+    const raw = localStorage.getItem(SESSIONS_KEY)
+    if (!raw) return []
+    return JSON.parse(raw) || []
+  } catch { return [] }
+}
+
+function saveSessions(sessions) {
+  try {
+    localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions.slice(-MAX_SESSIONS)))
+  } catch {}
+}
+
+function pruneOldSessions(sessions, retentionDays) {
+  if (!retentionDays || retentionDays <= 0) return sessions
+  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+  return sessions.filter(s => new Date(s.updatedAt || s.createdAt).getTime() >= cutoff)
+}
+
+function makeSessionTitle(messages) {
+  const first = messages.find(m => m.role === 'user')
+  return String(first?.content || '').slice(0, 60) || 'New conversation'
+}
+
+function formatRelTime(dateStr) {
+  const d = new Date(dateStr)
+  const now = Date.now()
+  const diff = now - d.getTime()
+  if (diff < 60000) return 'just now'
+  if (diff < 3600000) return `${Math.floor(diff / 60000)}m ago`
+  if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
 // ─── Chat-local state ────────────────────────────────────────────────────────
 const initChat = {
   messages: [],          // [{id,role,content,steps,status,runId,artifacts,ts}]
@@ -17,7 +76,7 @@ function chatReducer(s, a) {
     case 'UPD_MSG':     return { ...s, messages: s.messages.map(m => m.id === a.id ? { ...m, ...a.patch } : m) }
     case 'ADD_STEP': {
       const msgs = s.messages.map(m => {
-        if (m.runId !== a.runId) return m
+        if (m.id !== a.msgId) return m
         const steps = [...(m.steps || [])]
         const idx = steps.findIndex(st => st.stepId === a.step.stepId)
         if (idx >= 0) { steps[idx] = { ...steps[idx], ...a.step } }
@@ -32,6 +91,7 @@ function chatReducer(s, a) {
     case 'SET_AWAITING':   return { ...s, awaitingContext: a.ctx }
     case 'CLEAR_AWAITING': return { ...s, awaitingContext: null }
     case 'CLEAR':          return { ...initChat, mode: s.mode }
+    case 'LOAD_MSGS':      return { ...initChat, mode: s.mode, messages: a.messages }
     default: return s
   }
 }
@@ -102,6 +162,22 @@ function buildPayload(text, chatId, runId, projectRoot, mode, dr, attachments = 
   return payload
 }
 
+function modeLabel(mode) {
+  if (mode === 'agent') return 'Agent'
+  if (mode === 'research') return 'Deep Research'
+  return 'Chat'
+}
+
+function formatDuration(totalSeconds) {
+  const s = Math.max(0, Number(totalSeconds) || 0)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  if (h > 0) return `${h}h ${m}m ${sec}s`
+  if (m > 0) return `${m}m ${sec}s`
+  return `${sec}s`
+}
+
 function readBlobAsDataUrl(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
@@ -130,14 +206,17 @@ const DR_DEFAULTS = {
 // ─── Component ───────────────────────────────────────────────────────────────
 export default function ChatPanel({ fullWidth = false, hideHeader = false, studioMode = false }) {
   const { state: appState, dispatch: appDispatch, refreshModelInventory } = useApp()
-  const [chat, dispatch] = useReducer(chatReducer, initChat)
+  const [chat, dispatch] = useReducer(chatReducer, undefined, () => ({ ...initChat, messages: loadHistory() }))
   const [input, setInput] = useState('')
   const [resumeInput, setResumeInput] = useState('')
-  const [chatId] = useState(() => `chat-${Date.now()}`)
+  const [chatId, setChatId] = useState(() => `chat-${Date.now()}`)
   const [dr, setDr] = useState(DR_DEFAULTS)
   const [attachments, setAttachments] = useState([])
   const [mcpEnabled, setMcpEnabled] = useState(false)
   const [mcpServerCount, setMcpServerCount] = useState(0)
+  const [mcpUndiscovered, setMcpUndiscovered] = useState(0)
+  const [showHistory, setShowHistory] = useState(false)
+  const [sessions, setSessions] = useState(() => loadSessions())
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
   const esRef = useRef(null)
@@ -146,34 +225,147 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   const selectedModelMeta = resolveSelectedModel(appState.selectedModel)
   const isSimpleStudioChat = studioMode && chat.mode === 'chat'
   const modelInventory = appState.modelInventory
+  const contextLimit = Number(modelInventory?.active_context_window || modelInventory?.context_window || 128000) || 128000
+  const estimatedContextTokens = Math.max(
+    0,
+    Math.round(
+      (
+        chat.messages.reduce((sum, m) => sum + String(m?.content || '').length, 0)
+        + String(input || '').length
+      ) / 4
+    ),
+  )
+  const contextPct = Math.min(100, Math.round((estimatedContextTokens / Math.max(contextLimit, 1)) * 100))
+
+  // Close the SSE stream when the panel unmounts (e.g. explicit new-chat remount)
+  useEffect(() => {
+    return () => { esRef.current?.close() }
+  }, [])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chat.messages])
 
+  // Persist chat history whenever messages settle
+  useEffect(() => {
+    if (!chat.streaming) saveHistory(chat.messages)
+  }, [chat.messages, chat.streaming])
+
   useEffect(() => {
     refreshModelInventory(false)
   }, [refreshModelInventory])
+
+  // Prune sessions whenever retention setting changes
+  useEffect(() => {
+    const days = appState.settings?.chatHistoryRetentionDays ?? 14
+    setSessions(prev => {
+      const pruned = pruneOldSessions(prev, days)
+      if (pruned.length !== prev.length) saveSessions(pruned)
+      return pruned
+    })
+  }, [appState.settings?.chatHistoryRetentionDays])
+
+  // ── Session helpers ──────────────────────────────────────────────────────────
+  const saveCurrentSession = useCallback(() => {
+    if (chat.messages.length === 0) return
+    const session = {
+      id: chatId,
+      title: makeSessionTitle(chat.messages),
+      createdAt: String(chat.messages[0]?.ts || new Date().toISOString()),
+      updatedAt: new Date().toISOString(),
+      messages: chat.messages,
+    }
+    const days = appState.settings?.chatHistoryRetentionDays ?? 14
+    setSessions(prev => {
+      const updated = pruneOldSessions([...prev.filter(s => s.id !== chatId), session], days)
+      saveSessions(updated)
+      return updated
+    })
+  }, [chat.messages, chatId, appState.settings?.chatHistoryRetentionDays])
+
+  const newChat = useCallback(() => {
+    saveCurrentSession()
+    dispatch({ type: 'CLEAR' })
+    saveHistory([])
+    setShowHistory(false)
+    setAttachments([])
+    setResumeInput('')
+    setChatId(`chat-${Date.now()}`)
+  }, [saveCurrentSession])
+
+  const compactContext = useCallback(() => {
+    if (!chat.messages.length) return
+    saveCurrentSession()
+    const preserve = chat.messages.slice(-6)
+    const older = chat.messages.slice(0, -6).filter(m => String(m?.content || '').trim())
+    const compactedAt = new Date()
+    const summaryLines = older.slice(-24).map((m) => {
+      const who = m.role === 'user' ? 'User' : 'Assistant'
+      const snippet = String(m.content || '').replace(/\s+/g, ' ').trim().slice(0, 180)
+      return `- ${who}: ${snippet}${snippet.length >= 180 ? '…' : ''}`
+    })
+    const summary = [
+      `Context compacted at ${compactedAt.toLocaleString()}.`,
+      `Summarized ${older.length} earlier message(s) and kept the latest ${preserve.length}.`,
+      '',
+      'Compressed summary:',
+      ...(summaryLines.length ? summaryLines : ['- No prior content to summarize.']),
+    ].join('\n')
+    const summaryMsg = {
+      id: `c-${Date.now()}`,
+      role: 'assistant',
+      content: summary,
+      status: 'done',
+      mode: 'chat',
+      modeLabel: 'Compacted',
+      ts: compactedAt,
+    }
+    dispatch({ type: 'LOAD_MSGS', messages: [summaryMsg, ...preserve] })
+    saveHistory([summaryMsg, ...preserve])
+    setChatId(`chat-${Date.now()}`)
+    setShowHistory(false)
+  }, [chat.messages, saveCurrentSession])
+
+  const loadSession = useCallback((session) => {
+    esRef.current?.close()
+    saveCurrentSession()
+    const msgs = session.messages.map(m => ({ ...m, ts: new Date(m.ts) }))
+    dispatch({ type: 'LOAD_MSGS', messages: msgs })
+    dispatch({ type: 'SET_STREAMING', val: false })
+    appDispatch({ type: 'SET_STREAMING', streaming: false })
+    saveHistory(msgs)
+    setShowHistory(false)
+  }, [saveCurrentSession, appDispatch])
+
+  const deleteSession = useCallback((id) => {
+    setSessions(prev => {
+      const updated = prev.filter(s => s.id !== id)
+      saveSessions(updated)
+      return updated
+    })
+  }, [])
 
   // Auto-enable MCP when switching to agent mode; keep state when switching away
   useEffect(() => {
     if (chat.mode === 'agent') setMcpEnabled(true)
   }, [chat.mode])
 
-  // Fetch enabled MCP server count for display
+  // Fetch enabled MCP server count and check for undiscovered servers
   useEffect(() => {
     fetch(`${apiBase}/api/mcp/servers`)
       .then(r => r.ok ? r.json() : [])
       .then(data => {
         const servers = Array.isArray(data) ? data : (data.servers || [])
-        setMcpServerCount(servers.filter(s => s.enabled !== false).length)
+        const enabled = servers.filter(s => s.enabled !== false)
+        setMcpServerCount(enabled.length)
+        setMcpUndiscovered(enabled.filter(s => !s.tool_count || s.tool_count === 0).length)
       })
       .catch(() => {})
-  }, [apiBase])
+  }, [apiBase, mcpEnabled])
 
   // ── Send message ────────────────────────────────────────────────────────────
   const send = useCallback(async (text, isResume = false) => {
-    const msg = text?.trim() || input.trim()
+    const msg = (typeof text === 'string' ? text.trim() : '') || input.trim()
     if (!msg || chat.streaming) return
     setInput('')
     setResumeInput('')
@@ -182,14 +374,17 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     const userMsgId = `u-${runId}`
     const asstMsgId = `a-${runId}`
 
-    dispatch({ type: 'ADD_MSG', msg: { id: userMsgId, role: 'user', content: msg, ts: new Date() } })
+    const currentMode = chat.mode
+    const currentModeLabel = modeLabel(currentMode)
+
+    dispatch({ type: 'ADD_MSG', msg: { id: userMsgId, role: 'user', content: msg, mode: currentMode, modeLabel: currentModeLabel, ts: new Date() } })
     dispatch({ type: 'SET_STREAMING', val: true })
     dispatch({ type: 'SET_RUN', id: runId })
     dispatch({ type: 'CLEAR_AWAITING' })
 
     dispatch({
       type: 'ADD_MSG',
-      msg: { id: asstMsgId, role: 'assistant', content: '', steps: [], status: 'thinking', runId: isSimpleStudioChat ? null : runId, ts: new Date() }
+      msg: { id: asstMsgId, role: 'assistant', content: '', steps: [], status: 'thinking', runId: isSimpleStudioChat ? null : runId, mode: currentMode, modeLabel: currentModeLabel, ts: new Date() }
     })
 
     appDispatch({ type: 'SET_STREAMING', streaming: true })
@@ -205,7 +400,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         ? {
             run_id:      chat.awaitingContext.runId,
             workflow_id: chat.awaitingContext.workflowId,
-            reply:       msg,
+            text:        msg,
             channel:     'webchat',
           }
         : buildPayload(msg, chatId, runId, appState.projectRoot, chat.mode, dr, attachments, studioMode, mcpEnabled)
@@ -251,7 +446,6 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       const { run_id: srvRunId } = await resp.json().catch(() => ({}))
       const effectiveRunId = srvRunId || runId
 
-      // Update the assistant message with the real run_id
       dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { runId: effectiveRunId, status: 'thinking' } })
       dispatch({ type: 'SET_RUN', id: effectiveRunId })
 
@@ -271,6 +465,8 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     esRef.current = es
 
     let stepCounter = 0
+    let closed = false
+    const closeClean = () => { closed = true; es.close() }
 
     es.addEventListener('status', e => {
       try {
@@ -287,7 +483,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         const stepId = step.step_id || step.id || `step-${++stepCounter}`
         dispatch({
           type: 'ADD_STEP',
-          runId,
+          msgId: asstMsgId,
           step: {
             stepId,
             agent:         step.agent || step.name || 'agent',
@@ -338,7 +534,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           dispatch({ type: 'CLEAR_AWAITING' })
         }
       } catch (_) {}
-      es.close()
+      closeClean()
       dispatch({ type: 'SET_STREAMING', val: false })
       appDispatch({ type: 'SET_STREAMING', streaming: false })
     })
@@ -351,15 +547,16 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: 'error' } })
       }
       refreshModelInventory(true)
-      es.close()
+      closeClean()
       dispatch({ type: 'SET_STREAMING', val: false })
       appDispatch({ type: 'SET_STREAMING', streaming: false })
     })
 
     es.onerror = () => {
+      if (closed) return
       refreshModelInventory(true)
-      dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: chat.messages.find(m => m.id === asstMsgId)?.content ? 'done' : 'error' } })
-      es.close()
+      dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: 'error' } })
+      closeClean()
       dispatch({ type: 'SET_STREAMING', val: false })
       appDispatch({ type: 'SET_STREAMING', streaming: false })
     }
@@ -368,6 +565,12 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   // ── Stop run ────────────────────────────────────────────────────────────────
   const stopRun = useCallback(async () => {
     esRef.current?.close()
+    // Mark the in-progress bubble as done so it doesn't stay stuck in "Running"
+    const activeMsg = chat.messages.find(m => m.status === 'streaming' || m.status === 'thinking')
+    if (activeMsg) {
+      dispatch({ type: 'UPD_MSG', id: activeMsg.id, patch: { status: 'done' } })
+    }
+    dispatch({ type: 'CLEAR_AWAITING' })
     if (chat.activeRunId) {
       await fetch(`${apiBase}/api/runs/stop`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -376,7 +579,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     }
     dispatch({ type: 'SET_STREAMING', val: false })
     appDispatch({ type: 'SET_STREAMING', streaming: false })
-  }, [chat.activeRunId, apiBase])
+  }, [chat.activeRunId, chat.messages, apiBase, appDispatch])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send() }
@@ -455,7 +658,6 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     { id: 'chat',     label: '💬 Chat' },
     { id: 'agent',    label: '✨ Agent' },
     { id: 'research', label: '🔬 Deep Research' },
-    { id: 'security', label: '🛡 Security' },
   ]
 
   return (
@@ -473,7 +675,10 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           <span className="kc-header-status-text">{isOnline ? 'connected' : appState.backendStatus}</span>
         </div>
         <div className="kc-header-actions">
-          <button className="kc-icon-btn" title="Clear chat" onClick={() => dispatch({ type: 'CLEAR' })}>
+          <button className="kc-icon-btn" title="Chat history" onClick={() => setShowHistory(v => !v)}>
+            <HistoryIcon />
+          </button>
+          <button className="kc-icon-btn" title="New chat" onClick={newChat}>
             <ClearIcon />
           </button>
           {!fullWidth && (
@@ -510,22 +715,36 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         <div ref={messagesEndRef} />
       </div>
 
-      {/* ── Awaiting input banner ── */}
+      {/* ── Agent approval modal ── */}
       {chat.awaitingContext && (
-        <div className="kc-awaiting">
-          <div className="kc-awaiting-label">⏳ {chat.awaitingContext.prompt?.slice(0, 120)}</div>
-          <div className="kc-awaiting-row">
-            <textarea
-              className="kc-awaiting-input"
-              placeholder="Your reply…"
-              value={resumeInput}
-              onChange={e => setResumeInput(e.target.value)}
-              onKeyDown={e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) send(resumeInput, true) }}
-              rows={2}
-            />
-            <button className="kc-send-btn" onClick={() => send(resumeInput, true)}>
-              <SendIcon />
-            </button>
+        <AgentApprovalModal
+          ctx={chat.awaitingContext}
+          value={resumeInput}
+          onChange={setResumeInput}
+          onSend={() => send(resumeInput, true)}
+          onQuickReply={r => send(r, true)}
+          onDismiss={() => { dispatch({ type: 'CLEAR_AWAITING' }); setResumeInput('') }}
+        />
+      )}
+
+      {/* ── History drawer ── */}
+      {showHistory && (
+        <div className="kc-history-overlay" onClick={e => e.target === e.currentTarget && setShowHistory(false)}>
+          <div className="kc-history-drawer">
+            <div className="kc-history-hdr">
+              <span>Chat History</span>
+              <button className="kc-icon-btn" onClick={() => setShowHistory(false)}>✕</button>
+            </div>
+            <button className="kc-history-new-btn" onClick={newChat}>+ New Chat</button>
+            <div className="kc-history-list">
+              <HistoryList sessions={sessions} onLoad={loadSession} onDelete={deleteSession} />
+            </div>
+            <div className="kc-history-footer">
+              <ClockIcon size={12} />
+              {(appState.settings?.chatHistoryRetentionDays ?? 14) > 0
+                ? `Auto-deleted after ${appState.settings?.chatHistoryRetentionDays ?? 14} days · configure in Settings`
+                : 'History kept forever · configure in Settings'}
+            </div>
           </div>
         </div>
       )}
@@ -537,16 +756,25 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             <button className="kc-attach-btn" onClick={attachFiles}>+ Files</button>
             {studioMode && <button className="kc-attach-btn" onClick={attachFolder}>+ Folder</button>}
             {chat.mode === 'agent' ? (
-              <span className="kc-mcp-indicator" title={`${mcpServerCount} MCP server${mcpServerCount !== 1 ? 's' : ''} active`}>
-                🔌 MCP {mcpServerCount > 0 ? `· ${mcpServerCount}` : ''}
+              <span
+                className={`kc-mcp-indicator${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-indicator--warn' : ''}`}
+                title={mcpUndiscovered > 0
+                  ? `${mcpUndiscovered} server${mcpUndiscovered !== 1 ? 's have' : ' has'} no tools discovered yet — open MCP Settings to run discovery`
+                  : `${mcpServerCount} MCP server${mcpServerCount !== 1 ? 's' : ''} active`}
+              >
+                🔌 MCP {mcpServerCount > 0 ? `· ${mcpServerCount}` : ''}{mcpUndiscovered > 0 ? ' ⚠' : ''}
               </span>
             ) : (
               <button
-                className={`kc-attach-btn kc-mcp-toggle${mcpEnabled ? ' kc-mcp-toggle--on' : ''}`}
+                className={`kc-attach-btn kc-mcp-toggle${mcpEnabled ? ' kc-mcp-toggle--on' : ''}${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-toggle--warn' : ''}`}
                 onClick={() => setMcpEnabled(v => !v)}
-                title={mcpEnabled ? 'Disable MCP tools for this chat' : `Enable MCP tools (${mcpServerCount} server${mcpServerCount !== 1 ? 's' : ''} available)`}
+                title={
+                  mcpEnabled && mcpUndiscovered > 0
+                    ? `${mcpUndiscovered} server${mcpUndiscovered !== 1 ? 's have' : ' has'} no tools discovered — open MCP Settings to run discovery`
+                    : mcpEnabled ? 'Disable MCP tools for this chat' : `Enable MCP tools (${mcpServerCount} server${mcpServerCount !== 1 ? 's' : ''} available)`
+                }
               >
-                🔌 MCP {mcpEnabled ? 'ON' : 'OFF'}
+                🔌 MCP {mcpEnabled ? 'ON' : 'OFF'}{mcpEnabled && mcpUndiscovered > 0 ? ' ⚠' : ''}
               </button>
             )}
           </div>
@@ -568,6 +796,21 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             <span>📁 {appState.projectRoot.split(/[\\/]/).pop()}</span>
           </div>
         )}
+        <div className="kc-context-row">
+          <div className="kc-context-badge" title={`Estimated context usage: ${estimatedContextTokens} / ${contextLimit} tokens (${contextPct}%)`}>
+            <span className="kc-context-icon">🧠</span>
+            <span className="kc-context-text">{estimatedContextTokens.toLocaleString()} / {contextLimit.toLocaleString()} ctx</span>
+            <div className="kc-context-bar">
+              <div
+                className={`kc-context-fill${contextPct >= 90 ? ' full' : contextPct >= 75 ? ' warn' : ''}`}
+                style={{ width: `${contextPct}%` }}
+              />
+            </div>
+          </div>
+          <button className="kc-attach-btn" onClick={compactContext} title="Compact context and continue in a fresh backend session">
+            Compact
+          </button>
+        </div>
         <div className="kc-input-row">
           <textarea
             ref={inputRef}
@@ -587,7 +830,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           />
           <button
             className={`kc-send-btn ${chat.streaming ? 'kc-send-btn--stop' : ''}`}
-            onClick={chat.streaming ? stopRun : send}
+            onClick={chat.streaming ? () => stopRun() : () => send()}
             disabled={!chat.streaming && !input.trim()}
             title={chat.streaming ? 'Stop (sends cancellation)' : 'Send (Ctrl+Enter)'}
           >
@@ -791,6 +1034,11 @@ function UserMessage({ msg }) {
   return (
     <div className="kc-row kc-row--user">
       <div className="kc-bubble kc-bubble--user">
+        {msg.modeLabel && (
+          <div className="kc-mode-stamp">
+            <span className={`kc-mode-stamp-chip kc-mode-stamp-chip--${String(msg.mode || 'chat')}`}>{msg.modeLabel}</span>
+          </div>
+        )}
         <div className="kc-bubble-text">{msg.content}</div>
         <div className="kc-bubble-ts">{formatTs(msg.ts)}</div>
       </div>
@@ -802,7 +1050,15 @@ function UserMessage({ msg }) {
 // ─── Assistant message ────────────────────────────────────────────────────────
 function AssistantMessage({ msg }) {
   const [copied, setCopied] = useState(false)
+  const [nowMs, setNowMs] = useState(Date.now())
   const copy = () => { navigator.clipboard.writeText(msg.content); setCopied(true); setTimeout(() => setCopied(false), 1500) }
+  useEffect(() => {
+    if (!msg?.runId) return
+    if (!['thinking', 'streaming', 'awaiting'].includes(String(msg?.status || ''))) return
+    const timer = setInterval(() => setNowMs(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [msg?.runId, msg?.status])
+  const elapsedSeconds = msg?.runId ? Math.max(0, Math.floor((nowMs - new Date(msg.ts || Date.now()).getTime()) / 1000)) : 0
 
   return (
     <div className="kc-row kc-row--assistant">
@@ -814,8 +1070,12 @@ function AssistantMessage({ msg }) {
           <div className="kc-run-hero">
             <div className="kc-run-eyebrow">Run</div>
             <div className="kc-run-id">{msg.runId}</div>
+            {msg.modeLabel && (
+              <div className={`kc-run-mode kc-run-mode--${String(msg.mode || 'chat')}`}>{msg.modeLabel}</div>
+            )}
+            {msg.runId && <div className="kc-run-elapsed">⏱ {formatDuration(elapsedSeconds)}</div>}
             <div className={`kc-run-badge kc-run-badge--${msg.status || 'thinking'}`}>
-              {msg.status || 'thinking'}
+              {{ thinking: 'Thinking', streaming: 'Running', awaiting: 'Awaiting Input', done: 'Done', error: 'Error' }[msg.status] || 'Thinking'}
             </div>
           </div>
         )}
@@ -838,12 +1098,10 @@ function AssistantMessage({ msg }) {
         )}
 
         {/* Final content */}
-        {msg.content && (
+        {msg.content && msg.status !== 'error' && (
           <div className="kc-content">
             <MarkdownRenderer content={msg.content} />
-            {msg.status !== 'error' && (
-              <button className="kc-copy-btn" onClick={copy}>{copied ? '✓' : '⧉'}</button>
-            )}
+            <button className="kc-copy-btn" onClick={copy}>{copied ? '✓' : '⧉'}</button>
           </div>
         )}
 
@@ -953,6 +1211,64 @@ function formatTs(ts) {
   catch (_) { return '' }
 }
 
+// ─── Agent Approval Modal ─────────────────────────────────────────────────────
+function AgentApprovalModal({ ctx, value, onChange, onSend, onQuickReply, onDismiss }) {
+  const inputRef = useRef(null)
+  const [showSuggest, setShowSuggest] = useState(false)
+
+  useEffect(() => {
+    if (showSuggest) inputRef.current?.focus()
+  }, [showSuggest])
+
+  const handleKey = (e) => {
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); onSend() }
+    if (e.key === 'Escape') onDismiss()
+  }
+
+  return (
+    <div className="kc-modal-overlay" onClick={e => e.target === e.currentTarget && onDismiss()}>
+      <div className="kc-modal">
+        <div className="kc-modal-header">
+          <span className="kc-modal-icon">⏳</span>
+          <span className="kc-modal-title">Agent is waiting for your input</span>
+          <button className="kc-modal-close" onClick={onDismiss}>✕</button>
+        </div>
+        <div className="kc-modal-prompt">
+          <MarkdownRenderer content={ctx.prompt} />
+        </div>
+        <div className="kc-modal-quick">
+          <button className="kc-modal-quick-btn kc-modal-quick-btn--approve" onClick={() => onQuickReply('approve')}>Approve</button>
+          <button
+            className={`kc-modal-quick-btn kc-modal-quick-btn--suggest${showSuggest ? ' kc-modal-quick-btn--active' : ''}`}
+            onClick={() => { setShowSuggest(v => !v); onChange('') }}
+          >Suggest</button>
+          <button className="kc-modal-quick-btn kc-modal-quick-btn--reject" onClick={() => onQuickReply('cancel')}>Reject</button>
+        </div>
+        {showSuggest && (
+          <div className="kc-modal-input-row">
+            <textarea
+              ref={inputRef}
+              className="kc-modal-input"
+              placeholder="Type your suggestion… (Ctrl+Enter to send)"
+              value={value}
+              onChange={e => onChange(e.target.value)}
+              onKeyDown={handleKey}
+              rows={3}
+            />
+            <button
+              className="kc-modal-send"
+              onClick={onSend}
+              disabled={!value.trim()}
+            >
+              <SendIcon />
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
 function SendIcon() {
   return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
 }
@@ -961,4 +1277,52 @@ function StopIcon() {
 }
 function ClearIcon() {
   return <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+}
+function HistoryIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+}
+function ClockIcon({ size = 14 }) {
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+}
+
+// ─── History List ─────────────────────────────────────────────────────────────
+function HistoryList({ sessions, onLoad, onDelete }) {
+  if (sessions.length === 0) {
+    return <div className="kc-history-empty">No past conversations yet.<br/>Start a new chat and it will appear here.</div>
+  }
+
+  const now = Date.now()
+  const todayStart     = new Date(new Date().setHours(0, 0, 0, 0)).getTime()
+  const yesterdayStart = todayStart - 86400000
+  const weekStart      = todayStart - 6 * 86400000
+
+  const groups = { Today: [], Yesterday: [], 'Last 7 days': [], Older: [] }
+  sessions.slice().reverse().forEach(s => {
+    const ts = new Date(s.updatedAt || s.createdAt).getTime()
+    if (ts >= todayStart)     groups['Today'].push(s)
+    else if (ts >= yesterdayStart) groups['Yesterday'].push(s)
+    else if (ts >= weekStart) groups['Last 7 days'].push(s)
+    else                      groups['Older'].push(s)
+  })
+
+  return (
+    <>
+      {['Today', 'Yesterday', 'Last 7 days', 'Older'].map(label =>
+        groups[label].length === 0 ? null : (
+          <div key={label}>
+            <div className="kc-history-group-label">{label}</div>
+            {groups[label].map(s => (
+              <div key={s.id} className="kc-history-item">
+                <button className="kc-history-item-btn" onClick={() => onLoad(s)}>
+                  <span className="kc-history-item-title">{s.title}</span>
+                  <span className="kc-history-item-time">{formatRelTime(s.updatedAt || s.createdAt)}</span>
+                </button>
+                <button className="kc-history-item-del" title="Delete" onClick={e => { e.stopPropagation(); onDelete(s.id) }}>×</button>
+              </div>
+            ))}
+          </div>
+        )
+      )}
+    </>
+  )
 }

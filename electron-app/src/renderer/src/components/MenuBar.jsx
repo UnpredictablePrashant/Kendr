@@ -56,13 +56,13 @@ function useMenuDefs() {
     {
       label: 'View',
       items: [
-        { label: 'Project Mode',     shortcut: 'Ctrl+Shift+J', action: () => dispatch({ type: 'SET_VIEW', view: 'project' }) },
+        { label: 'Developer Workspace', shortcut: 'Ctrl+Shift+J', action: () => dispatch({ type: 'SET_VIEW', view: 'developer' }) },
         { sep: true },
-        { label: 'Explorer',         shortcut: 'Ctrl+Shift+E', action: () => { dispatch({ type: 'SET_VIEW', view: 'files' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
-        { label: 'Source Control',   shortcut: 'Ctrl+Shift+G', action: () => { dispatch({ type: 'SET_VIEW', view: 'git' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
-        { label: 'Orchestration',                              action: () => { dispatch({ type: 'SET_VIEW', view: 'orchestration' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
-        { label: 'Model Manager',                              action: () => { dispatch({ type: 'SET_VIEW', view: 'models' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
-        { label: 'Model Docs',                                 action: () => { dispatch({ type: 'SET_VIEW', view: 'docs' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Home',                                         action: () => { dispatch({ type: 'SET_VIEW', view: 'home' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Studio',                                       action: () => { dispatch({ type: 'SET_VIEW', view: 'studio' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Build',                                        action: () => { dispatch({ type: 'SET_VIEW', view: 'build' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Integrations',                                 action: () => { dispatch({ type: 'SET_VIEW', view: 'integrations' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Runs',                                         action: () => { dispatch({ type: 'SET_VIEW', view: 'runs' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
         { sep: true },
         { label: state.chatOpen ? 'Hide Chat' : 'Show Chat',  shortcut: 'Ctrl+Shift+C', action: () => dispatch({ type: 'TOGGLE_CHAT' }) },
         { label: 'Toggle Sidebar',   shortcut: 'Ctrl+B',       action: () => dispatch({ type: 'TOGGLE_SIDEBAR' }) },
@@ -101,21 +101,21 @@ function useMenuDefs() {
     {
       label: 'Extensions',
       items: [
-        { label: 'Agents & Capabilities',                      action: () => dispatch({ type: 'SET_VIEW', view: 'agents' }) },
-        { label: 'MCP Servers',                                action: () => dispatch({ type: 'SET_VIEW', view: 'mcp' }) },
-        { label: 'Skills',                                     action: () => dispatch({ type: 'SET_VIEW', view: 'skills' }) },
+        { label: 'Build',                                      action: () => dispatch({ type: 'SET_VIEW', view: 'build' }) },
+        { label: 'Integrations',                               action: () => dispatch({ type: 'SET_VIEW', view: 'integrations' }) },
+        { label: 'Marketplace',                                action: () => dispatch({ type: 'SET_VIEW', view: 'marketplace' }) },
         { sep: true },
         { label: 'Add MCP Server',                             action: () => {
-          dispatch({ type: 'SET_VIEW', view: 'mcp' })
+          dispatch({ type: 'SET_VIEW', view: 'integrations' })
           // small delay so the panel mounts before the event fires
           setTimeout(() => window.dispatchEvent(new CustomEvent('kendr:mcp-add')), 150)
         }},
         { label: 'Discover MCP Tools',                         action: () => {
-          dispatch({ type: 'SET_VIEW', view: 'mcp' })
+          dispatch({ type: 'SET_VIEW', view: 'integrations' })
           setTimeout(() => window.dispatchEvent(new CustomEvent('kendr:mcp-discover-all')), 150)
         }},
         { sep: true },
-        { label: 'Browse Skill Intents',                       action: () => dispatch({ type: 'SET_VIEW', view: 'skills' }) },
+        { label: 'Browse Skill Intents',                       action: () => dispatch({ type: 'SET_VIEW', view: 'marketplace' }) },
         { label: 'Reload Capabilities',                        action: async () => {
           try {
             const base = state.backendUrl || 'http://127.0.0.1:2151'
@@ -128,7 +128,7 @@ function useMenuDefs() {
       label: 'Help',
       items: [
         { label: 'Keyboard Shortcuts', shortcut: 'Ctrl+Shift+P', action: () => dispatch({ type: 'TOGGLE_COMMAND_PALETTE' }) },
-        { label: 'Model Docs',                                  action: () => dispatch({ type: 'SET_VIEW', view: 'docs' }) },
+        { label: 'Model Docs',                                  action: () => dispatch({ type: 'SET_VIEW', view: 'settings' }) },
         { sep: true },
         { label: 'About Kendr',                                action: () => window.dispatchEvent(new CustomEvent('kendr:about')) },
       ]

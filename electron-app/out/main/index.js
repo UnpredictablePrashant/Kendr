@@ -57,6 +57,14 @@ class Store {
 }
 const UI_PORT = 2151;
 const GATEWAY_PORT = 8790;
+const BACKEND_VERSION = (() => {
+  try {
+    const pkgPath = new URL(require("url").pathToFileURL(__filename).href).pathname.replace(/^\/([A-Z]:)/, "$1").replace(/[\\/]out[\\/]main[\\/]backend\.js$/, "/package.json");
+    return JSON.parse(fs.readFileSync(pkgPath, "utf-8")).version;
+  } catch {
+    return "0.0.0";
+  }
+})();
 class BackendManager {
   constructor(store2) {
     this.store = store2;
@@ -68,17 +76,17 @@ class BackendManager {
       ui: "stopped",
       pid: null,
       kendrRoot: null,
-      error: null
+      error: null,
+      setup: null
+      // null | { phase, pct, message }
     };
     this._listeners = [];
     this._healthTimer = null;
   }
-  // ── Public API ─────────────────────────────────────────────────────────────
-  /** Current status snapshot (safe to serialise and send over IPC). */
+  // ── Public API ──────────────────────────────────────────────────────────────
   status() {
     return { ...this._status, logs: [...this._logs] };
   }
-  /** Register a callback that fires on every status change. */
   onChange(fn) {
     this._listeners.push(fn);
   }
@@ -93,7 +101,10 @@ class BackendManager {
       return { ok: true, already: true };
     }
     if (uiOk || gwOk) {
-      this._set({ gateway: gwOk ? "running" : "starting", ui: uiOk ? "running" : "starting" });
+      this._set({
+        gateway: gwOk ? "running" : "starting",
+        ui: uiOk ? "running" : "starting"
+      });
       this._startHealthWatch();
     }
     return this.start();
@@ -104,14 +115,24 @@ class BackendManager {
     }
     const kendrRoot = this._findKendrRoot();
     if (!kendrRoot) {
-      this._set({ gateway: "error", ui: "error", error: "Cannot locate gateway_server.py. Set kendrRoot in settings." });
+      this._set({
+        gateway: "error",
+        ui: "error",
+        error: "Cannot locate gateway_server.py. Set kendrRoot in Settings."
+      });
       return { error: this._status.error };
     }
+    let python;
+    try {
+      python = await this._resolvePython(kendrRoot);
+    } catch (err) {
+      this._set({ gateway: "error", ui: "error", error: err.message });
+      return { error: err.message };
+    }
     const gatewayScript = path.join(kendrRoot, "gateway_server.py");
-    const python = this.store.get("pythonPath") || "python";
-    const providerEnv = this._providerEnv();
-    this._log(`[backend] Starting: ${python} ${gatewayScript}`);
-    this._set({ gateway: "starting", ui: "starting", error: null, kendrRoot });
+    this._log(`[backend] python: ${python}`);
+    this._log(`[backend] script: ${gatewayScript}`);
+    this._set({ gateway: "starting", ui: "starting", error: null, kendrRoot, setup: null });
     return new Promise((resolve) => {
       try {
         this._proc = child_process.spawn(python, [gatewayScript], {
@@ -122,7 +143,9 @@ class BackendManager {
             GATEWAY_PORT: String(GATEWAY_PORT),
             KENDR_UI_PORT: String(UI_PORT),
             PYTHONUNBUFFERED: "1",
-            ...providerEnv
+            // Ensure the bundled source is importable when running from venv
+            PYTHONPATH: kendrRoot,
+            ...this._providerEnv()
           },
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true
@@ -172,7 +195,11 @@ class BackendManager {
           this._proc = null;
           this._status.pid = null;
           if (this._status.gateway !== "stopped") {
-            this._set({ gateway: code === 0 ? "stopped" : "error", ui: "stopped", error: code ? `Exited ${code}` : null });
+            this._set({
+              gateway: code === 0 ? "stopped" : "error",
+              ui: "stopped",
+              error: code ? `Exited ${code}` : null
+            });
           }
           this._stopHealthWatch();
         });
@@ -184,11 +211,11 @@ class BackendManager {
             resolved = true;
             if (uiOk || gwOk) resolve({ ok: true });
             else {
-              this._set({ ui: "error", gateway: "error", error: "Did not respond within 8 s" });
-              resolve({ error: "Did not respond within 8 s" });
+              this._set({ ui: "error", gateway: "error", error: "Did not respond within 12 s" });
+              resolve({ error: "Did not respond within 12 s" });
             }
           }
-        }, 8e3);
+        }, 12e3);
         this._startHealthWatch();
       } catch (err) {
         this._set({ gateway: "error", ui: "error", error: err.message, pid: null });
@@ -216,19 +243,123 @@ class BackendManager {
   getLogs() {
     return [...this._logs];
   }
-  // ── Internals ──────────────────────────────────────────────────────────────
+  // ── Python / venv resolution ────────────────────────────────────────────────
+  /**
+   * Returns the python executable to use.
+   * - Packaged app: creates/reuses a venv at ~/.kendr/venv
+   * - Dev mode:     uses store.pythonPath or falls back to python/python3
+   */
+  async _resolvePython(kendrRoot) {
+    if (!electron.app.isPackaged) {
+      return this.store.get("pythonPath") || "python";
+    }
+    return this._ensureVenv(kendrRoot);
+  }
+  /**
+   * Creates (or reuses) a venv at ~/.kendr/venv.
+   * Installs the bundled kendr package the first time or after a version bump.
+   * Pushes setup progress events so the renderer can show a setup screen.
+   */
+  async _ensureVenv(kendrRoot) {
+    const kendrDir = path.join(os.homedir(), ".kendr");
+    const venvDir = path.join(kendrDir, "venv");
+    const venvMark = path.join(kendrDir, "venv-version");
+    const isWin = process.platform === "win32";
+    const venvPy = isWin ? path.join(venvDir, "Scripts", "python.exe") : path.join(venvDir, "bin", "python");
+    const venvPip = isWin ? path.join(venvDir, "Scripts", "pip.exe") : path.join(venvDir, "bin", "pip");
+    fs.mkdirSync(kendrDir, { recursive: true });
+    const installedVersion = fs.existsSync(venvMark) ? fs.readFileSync(venvMark, "utf-8").trim() : "";
+    const needsSetup = !fs.existsSync(venvPy) || installedVersion !== BACKEND_VERSION;
+    if (!needsSetup) {
+      this._log(`[venv] Using existing venv (v${installedVersion})`);
+      return venvPy;
+    }
+    this._log(`[venv] Setting up venv at ${venvDir} (was: "${installedVersion}", need: "${BACKEND_VERSION}")`);
+    this._set({ gateway: "starting", ui: "starting", setup: { phase: "setup", pct: 0, message: "Preparing Python environment…" } });
+    const sysPython = await this._findSystemPython();
+    if (!sysPython) {
+      throw new Error(
+        "Python 3.10+ is required but was not found.\nInstall from https://python.org/downloads and relaunch Kendr."
+      );
+    }
+    this._log(`[venv] System python: ${sysPython}`);
+    this._set({ setup: { phase: "venv", pct: 10, message: "Creating virtual environment…" } });
+    await this._run(sysPython, ["-m", "venv", venvDir]);
+    this._log(`[venv] venv created`);
+    this._set({ setup: { phase: "pip", pct: 20, message: "Upgrading pip…" } });
+    await this._run(venvPy, ["-m", "pip", "install", "--upgrade", "pip", "--quiet"]);
+    this._set({ setup: { phase: "install", pct: 30, message: "Installing Kendr backend (this takes a few minutes on first run)…" } });
+    this._log(`[venv] Installing from ${kendrRoot}`);
+    await this._runStreaming(
+      venvPip,
+      ["install", kendrRoot, "--quiet", "--progress-bar", "off"],
+      (line) => {
+        this._log(`[pip] ${line}`);
+        const cur = this._status.setup?.pct ?? 30;
+        if (cur < 90) this._set({ setup: { ...this._status.setup, pct: cur + 1 } });
+      }
+    );
+    fs.writeFileSync(venvMark, BACKEND_VERSION, "utf-8");
+    this._set({ setup: { phase: "done", pct: 100, message: "Setup complete." } });
+    this._log(`[venv] Setup complete — v${BACKEND_VERSION}`);
+    return venvPy;
+  }
+  /** Find the first system python that is ≥ 3.10 */
+  async _findSystemPython() {
+    const candidates = process.platform === "win32" ? ["python", "python3", "py"] : ["python3", "python", "python3.12", "python3.11", "python3.10"];
+    for (const cmd of candidates) {
+      try {
+        const ver = await this._runOutput(cmd, ["--version"]);
+        const m = ver.match(/Python (\d+)\.(\d+)/);
+        if (m && (parseInt(m[1]) > 3 || parseInt(m[1]) === 3 && parseInt(m[2]) >= 10)) {
+          return cmd;
+        }
+      } catch {
+      }
+    }
+    return null;
+  }
+  // ── Root discovery ──────────────────────────────────────────────────────────
+  _findKendrRoot() {
+    const saved = this.store.get("kendrRoot");
+    if (saved && fs.existsSync(path.join(saved, "gateway_server.py"))) return saved;
+    if (electron.app.isPackaged) {
+      const bundled = path.join(process.resourcesPath, "kendr-backend");
+      if (fs.existsSync(path.join(bundled, "gateway_server.py"))) {
+        this.store.set("kendrRoot", bundled);
+        return bundled;
+      }
+    }
+    const anchors = [
+      electron.app.getAppPath(),
+      process.cwd(),
+      new URL(require("url").pathToFileURL(__filename).href).pathname.replace(/^\/([A-Z]:)/, "$1").replace(/[\\/]out[\\/]main[\\/]backend\.js$/, "")
+    ];
+    for (const anchor of anchors) {
+      for (let up = 0; up <= 4; up++) {
+        let candidate = anchor;
+        for (let i = 0; i < up; i++) candidate = path.join(candidate, "..");
+        if (fs.existsSync(path.join(candidate, "gateway_server.py"))) {
+          this.store.set("kendrRoot", candidate);
+          return candidate;
+        }
+      }
+    }
+    return null;
+  }
+  // ── Internals ───────────────────────────────────────────────────────────────
   _set(patch) {
     Object.assign(this._status, patch);
-    const snapshot = this.status();
+    const snap = this.status();
     this._listeners.forEach((fn) => {
       try {
-        fn(snapshot);
+        fn(snap);
       } catch (_) {
       }
     });
   }
   _log(line) {
-    if (!line.trim()) return;
+    if (!line?.trim()) return;
     this._logs.push(line);
     if (this._logs.length > 200) this._logs.shift();
   }
@@ -274,46 +405,59 @@ class BackendManager {
       this._healthTimer = null;
     }
   }
-  /**
-   * Walk up from various anchor points looking for gateway_server.py.
-   * Tries saved setting first, then relative paths from __dirname / cwd.
-   */
-  _findKendrRoot() {
-    const saved = this.store.get("kendrRoot");
-    if (saved && fs.existsSync(path.join(saved, "gateway_server.py"))) return saved;
-    const anchors = [
-      electron.app.getAppPath(),
-      process.cwd(),
-      // In electron-vite dev, out/main/ → electron-app/ → kendr root
-      path.join(new URL(require("url").pathToFileURL(__filename).href).pathname.replace(/^\/([A-Z]:)/, "$1"), "../../..")
-    ];
-    for (const anchor of anchors) {
-      for (let up = 0; up <= 4; up++) {
-        let candidate = anchor;
-        for (let i = 0; i < up; i++) candidate = path.join(candidate, "..");
-        if (fs.existsSync(path.join(candidate, "gateway_server.py"))) {
-          this.store.set("kendrRoot", candidate);
-          return candidate;
-        }
-      }
-    }
-    return null;
-  }
   _providerEnv() {
-    const mappings = [
-      ["anthropicKey", "ANTHROPIC_API_KEY"],
-      ["openaiKey", "OPENAI_API_KEY"],
-      ["openaiOrgId", "OPENAI_ORG_ID"],
-      ["googleKey", "GOOGLE_API_KEY"],
-      ["xaiKey", "XAI_API_KEY"],
-      ["hfToken", "HUGGINGFACEHUB_API_TOKEN"],
-      ["tavilyKey", "TAVILY_API_KEY"],
-      ["braveKey", "BRAVE_API_KEY"],
-      ["serperKey", "SERPER_API_KEY"]
-    ];
     return Object.fromEntries(
-      mappings.map(([storeKey, envKey]) => [envKey, String(this.store.get(storeKey) || "").trim()]).filter(([, value]) => value)
+      [
+        ["anthropicKey", "ANTHROPIC_API_KEY"],
+        ["openaiKey", "OPENAI_API_KEY"],
+        ["openaiOrgId", "OPENAI_ORG_ID"],
+        ["googleKey", "GOOGLE_API_KEY"],
+        ["xaiKey", "XAI_API_KEY"],
+        ["hfToken", "HUGGINGFACEHUB_API_TOKEN"],
+        ["tavilyKey", "TAVILY_API_KEY"],
+        ["braveKey", "BRAVE_API_KEY"],
+        ["serperKey", "SERPER_API_KEY"]
+      ].map(([k, env]) => [env, String(this.store.get(k) || "").trim()]).filter(([, v]) => v)
     );
+  }
+  /** Run a command, resolve when it exits 0, reject otherwise. */
+  _run(cmd, args) {
+    return new Promise((resolve, reject) => {
+      const child = child_process.spawn(cmd, args, { stdio: "ignore", windowsHide: true });
+      child.on("error", reject);
+      child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`)));
+    });
+  }
+  /** Run a command and return its combined stdout+stderr as a string. */
+  _runOutput(cmd, args) {
+    return new Promise((resolve, reject) => {
+      child_process.execFile(cmd, args, (err, stdout, stderr) => {
+        if (err && !stdout && !stderr) return reject(err);
+        resolve((stdout + stderr).trim());
+      });
+    });
+  }
+  /** Run a command and stream each output line to onLine(). */
+  _runStreaming(cmd, args, onLine) {
+    return new Promise((resolve, reject) => {
+      const child = child_process.spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+      let buf = "";
+      const handle = (chunk) => {
+        buf += chunk.toString();
+        const lines = buf.split("\n");
+        buf = lines.pop();
+        lines.forEach((l) => {
+          try {
+            onLine(l);
+          } catch (_) {
+          }
+        });
+      };
+      child.stdout?.on("data", handle);
+      child.stderr?.on("data", handle);
+      child.on("error", reject);
+      child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`${cmd} exited ${code}`)));
+    });
   }
 }
 let pty;
@@ -345,7 +489,8 @@ const store = new Store({
     modelDownloadDir: path.join(os.homedir(), ".kendr", "models"),
     gpuLayers: 0,
     contextSize: 4096,
-    threads: 4
+    threads: 4,
+    chatHistoryRetentionDays: 14
   }
 });
 const backend = new BackendManager(store);

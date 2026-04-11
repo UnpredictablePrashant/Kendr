@@ -5,13 +5,20 @@ import importlib.util
 import inspect
 import os
 import pkgutil
+from dataclasses import dataclass
 from pathlib import Path
 
 import tasks
 
 from .setup.catalog import channel_catalog, provider_catalog
 from .registry import Registry
-from .definitions import AgentDefinition, ChannelDefinition, PluginDefinition, PluginManifest, ProviderDefinition
+from .definitions import (
+    AgentDefinition,
+    ChannelDefinition,
+    PluginDefinition,
+    PluginManifest,
+    ProviderDefinition,
+)
 
 
 IGNORE_TASK_MODULES = {
@@ -24,6 +31,41 @@ IGNORE_TASK_MODULES = {
     "sqlite_store",
     "utils",
 }
+
+
+@dataclass(slots=True)
+class DiscoveryOptions:
+    discover_builtin_task_agents: bool = True
+    discover_external_plugins: bool = True
+    discover_mcp_tools: bool = True
+    discover_skill_agents: bool = True
+    strict: bool = False
+
+
+class RegistryDiscoveryError(RuntimeError):
+    def __init__(self, *, source: str, target: str, exc: Exception) -> None:
+        message = f"Registry discovery failed for {source}:{target}: {type(exc).__name__}: {exc}"
+        super().__init__(message)
+        self.source = source
+        self.target = target
+        self.original_exception = exc
+
+
+def _handle_discovery_error(
+    registry: Registry,
+    *,
+    source: str,
+    target: str,
+    exc: Exception,
+    strict: bool,
+) -> None:
+    if strict:
+        raise RegistryDiscoveryError(source=source, target=target, exc=exc) from exc
+    registry.record_discovery_issue(
+        source=source,
+        target=target,
+        error=f"{type(exc).__name__}: {exc}",
+    )
 
 
 def _titleize(name: str) -> str:
@@ -86,7 +128,8 @@ def _register_task_module_agents(registry: Registry, module_name: str) -> None:
             continue
         if not name.endswith("_agent") or name.startswith("_"):
             continue
-        metadata = module_metadata.get(name, {}) if isinstance(module_metadata, dict) else {}
+        metadata = dict(module_metadata.get(name, {}) if isinstance(module_metadata, dict) else {})
+        metadata.setdefault("connector_type", "task_agent")
         description = metadata.get("description") or inspect.getdoc(fn) or _default_description(name)
         registry.register_agent(
             AgentDefinition(
@@ -103,12 +146,22 @@ def _register_task_module_agents(registry: Registry, module_name: str) -> None:
         )
 
 
-def _discover_builtin_task_agents(registry: Registry) -> None:
+def _discover_builtin_task_agents(registry: Registry, *, strict: bool = False) -> None:
     for module_info in pkgutil.iter_modules(tasks.__path__):
         name = module_info.name
         if name in IGNORE_TASK_MODULES or name.startswith("__"):
             continue
-        _register_task_module_agents(registry, f"tasks.{name}")
+        module_name = f"tasks.{name}"
+        try:
+            _register_task_module_agents(registry, module_name)
+        except Exception as exc:
+            _handle_discovery_error(
+                registry,
+                source="builtin_task_module",
+                target=module_name,
+                exc=exc,
+                strict=strict,
+            )
 
 
 def _plugin_manifest_from_module(module, plugin_path: Path) -> PluginManifest:
@@ -158,15 +211,24 @@ def _plugin_search_paths() -> list[Path]:
     return unique
 
 
-def _discover_external_plugins(registry: Registry) -> None:
+def _discover_external_plugins(registry: Registry, *, strict: bool = False) -> None:
     for base in _plugin_search_paths():
         if not base.exists():
             continue
         for plugin_path in sorted(base.glob("*.py")):
-            _load_external_plugin(registry, plugin_path)
+            try:
+                _load_external_plugin(registry, plugin_path)
+            except Exception as exc:
+                _handle_discovery_error(
+                    registry,
+                    source="external_plugin",
+                    target=str(plugin_path),
+                    exc=exc,
+                    strict=strict,
+                )
 
 
-def _register_mcp_tools(registry: Registry) -> None:
+def _register_mcp_tools(registry: Registry, *, strict: bool = False) -> None:
     """Register tools from enabled MCP servers as synthetic agents.
 
     Each MCP tool becomes an ``AgentDefinition`` with a generated handler that
@@ -179,17 +241,37 @@ def _register_mcp_tools(registry: Registry) -> None:
     try:
         from kendr.capability_sync import sync_mcp_capabilities
         sync_mcp_capabilities(workspace_id="default", actor_user_id="system:discovery")
-    except Exception:
-        pass
+    except Exception as exc:
+        _handle_discovery_error(
+            registry,
+            source="mcp_capability_sync",
+            target="kendr.capability_sync.sync_mcp_capabilities",
+            exc=exc,
+            strict=strict,
+        )
 
     try:
         from kendr.mcp_manager import list_servers as _mcp_list_servers
-    except Exception:
+    except Exception as exc:
+        _handle_discovery_error(
+            registry,
+            source="mcp_registry",
+            target="kendr.mcp_manager.list_servers",
+            exc=exc,
+            strict=strict,
+        )
         return
 
     try:
         servers = _mcp_list_servers()
-    except Exception:
+    except Exception as exc:
+        _handle_discovery_error(
+            registry,
+            source="mcp_registry",
+            target="kendr.mcp_manager.list_servers()",
+            exc=exc,
+            strict=strict,
+        )
         return
 
     plugin_name = "builtin.mcp"
@@ -338,6 +420,7 @@ def _register_mcp_tools(registry: Registry) -> None:
                     plugin_name=plugin_name,
                     requirements=[],
                     metadata={
+                        "connector_type": "mcp_tool",
                         "mcp_tool": True,
                         "mcp_server_id": server_id,
                         "mcp_server_name": server_name,
@@ -348,10 +431,142 @@ def _register_mcp_tools(registry: Registry) -> None:
             )
 
 
-def build_registry() -> Registry:
+def _register_skill_agents(registry: Registry, *, strict: bool = False) -> None:
+    """Register installed user skills as synthetic ``skill_*_agent`` nodes.
+
+    Each installed skill becomes an ``AgentDefinition`` whose handler calls
+    ``execute_skill_by_slug(slug, inputs)``.  This mirrors the MCP tool pattern
+    so the orchestrator can route to skills the same way it routes to any agent.
+
+    The function is silent on errors — skills are best-effort at registry time.
+    """
+    try:
+        from kendr.persistence import list_user_skills as _list_skills
+    except Exception as exc:
+        _handle_discovery_error(
+            registry,
+            source="skill_registry",
+            target="kendr.persistence.list_user_skills",
+            exc=exc,
+            strict=strict,
+        )
+        return
+
+    try:
+        skills = _list_skills(is_installed=True)
+    except Exception as exc:
+        _handle_discovery_error(
+            registry,
+            source="skill_registry",
+            target="kendr.persistence.list_user_skills()",
+            exc=exc,
+            strict=strict,
+        )
+        return
+
+    if not skills:
+        return
+
+    plugin_name = "builtin.skills"
+    registry.register_plugin(
+        PluginDefinition(
+            name=plugin_name,
+            source="skills",
+            description="Synthetic agents for each installed user skill.",
+        )
+    )
+
+    for skill in skills:
+        slug = str(skill.get("slug", "")).strip()
+        if not slug:
+            continue
+
+        safe_slug = "".join(c if c.isalnum() else "_" for c in slug.lower()).strip("_")
+        agent_name = f"skill_{safe_slug}_agent"
+        display_name = str(skill.get("name", slug))
+        description = (str(skill.get("description", "") or "")).strip() or f"Skill: {display_name}"
+        category = str(skill.get("category", "Custom"))
+        skill_type = str(skill.get("skill_type", ""))
+        icon = str(skill.get("icon", "⚡"))
+
+        _slug_captured = slug
+
+        def _make_skill_handler(slug_: str, name_: str):
+            def _skill_agent_handler(state: dict) -> dict:
+                import json as _json
+                try:
+                    from kendr.skill_manager import execute_skill_by_slug as _exec
+                except ImportError:
+                    state["skill_error"] = "kendr.skill_manager not available"
+                    return state
+
+                # Accept inputs from specific key, generic key, or task_content
+                raw = (
+                    state.get(f"skill_inputs_{slug_}")
+                    or state.get("skill_inputs")
+                    or {}
+                )
+                if isinstance(raw, str):
+                    try:
+                        raw = _json.loads(raw)
+                    except Exception:
+                        raw = {"input": raw}
+                if not isinstance(raw, dict):
+                    raw = {}
+
+                result = _exec(slug_, raw)
+                state["skill_result"] = result
+                state["skill_slug"] = slug_
+                state[f"skill_result_{slug_}"] = result
+
+                if result.get("success"):
+                    output = result.get("output") or result.get("stdout", "")
+                    if not isinstance(output, str):
+                        output = _json.dumps(output, ensure_ascii=False, indent=2)
+                    state["skill_output"] = output
+                else:
+                    state["skill_output"] = f"Skill '{slug_}' error: {result.get('error', 'Unknown error')}"
+
+                return state
+
+            _skill_agent_handler.__name__ = f"skill_{slug_}_handler"
+            return _skill_agent_handler
+
+        handler = _make_skill_handler(_slug_captured, display_name)
+
+        registry.register_agent(
+            AgentDefinition(
+                name=agent_name,
+                handler=handler,
+                description=f"{icon} {description} (type={skill_type}, category={category})",
+                skills=[safe_slug, "skill", skill_type, category.lower()],
+                input_keys=[f"skill_inputs_{slug}", "skill_inputs"],
+                output_keys=["skill_result", "skill_output", f"skill_result_{slug}"],
+                plugin_name=plugin_name,
+                requirements=[],
+                metadata={
+                    "connector_type": "skill",
+                    "skill_agent": True,
+                    "skill_slug": slug,
+                    "skill_type": skill_type,
+                    "skill_category": category,
+                    "skill_icon": icon,
+                },
+            )
+        )
+
+
+def build_registry(options: DiscoveryOptions | None = None, *, strict: bool | None = None) -> Registry:
+    options = options or DiscoveryOptions()
+    strict_mode = options.strict if strict is None else strict
     registry = Registry()
     _register_builtin_capabilities(registry)
-    _discover_builtin_task_agents(registry)
-    _discover_external_plugins(registry)
-    _register_mcp_tools(registry)
+    if options.discover_builtin_task_agents:
+        _discover_builtin_task_agents(registry, strict=strict_mode)
+    if options.discover_external_plugins:
+        _discover_external_plugins(registry, strict=strict_mode)
+    if options.discover_mcp_tools:
+        _register_mcp_tools(registry, strict=strict_mode)
+    if options.discover_skill_agents:
+        _register_skill_agents(registry, strict=strict_mode)
     return registry

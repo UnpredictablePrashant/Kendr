@@ -865,6 +865,107 @@ class RuntimeRoutingTests(unittest.TestCase):
 
         self.assertFalse(result.get("review_pending", True))
 
+    def test_adaptive_planner_policy_skips_simple_single_step_task(self):
+        runtime = AgentRuntime(build_registry())
+        state = {
+            "user_query": "Rename variable foo to bar in the script.",
+            "current_objective": "Rename variable foo to bar in the script.",
+            "plan_steps": [],
+            "plan_ready": False,
+            "adaptive_agent_selection": True,
+            "planner_policy_mode": "adaptive",
+            "setup_actions": [],
+        }
+
+        should_plan, reason, signals = runtime._should_run_planner(state)
+
+        self.assertFalse(should_plan)
+        self.assertIn("adaptive", reason.lower())
+        self.assertLess(signals.get("score", 999), signals.get("threshold", -999))
+
+    def test_adaptive_planner_policy_requires_plan_for_superrag(self):
+        runtime = AgentRuntime(build_registry())
+        state = {
+            "user_query": "Build a superRAG session from these URLs.",
+            "current_objective": "Build a superRAG session from these URLs.",
+            "superrag_urls": ["https://example.com"],
+            "plan_steps": [],
+            "plan_ready": False,
+            "adaptive_agent_selection": True,
+            "planner_policy_mode": "adaptive",
+        }
+
+        should_plan, reason, _ = runtime._should_run_planner(state)
+
+        self.assertTrue(should_plan)
+        self.assertIn("superrag", reason.lower())
+
+    def test_adaptive_reviewer_policy_skips_low_risk_short_output(self):
+        runtime = AgentRuntime(build_registry())
+        state = {
+            "user_query": "Rename variable foo to bar.",
+            "current_objective": "Rename variable foo to bar.",
+            "adaptive_agent_selection": True,
+            "reviewer_policy_mode": "adaptive",
+            "skip_reviews": False,
+            "review_revision_counts": {},
+            "enforce_quality_gate": True,
+        }
+
+        needs_review, reason, _ = runtime._should_request_review(
+            state,
+            agent_name="worker_agent",
+            output_text="Variable renamed successfully.",
+            skip_review_once=False,
+        )
+
+        self.assertFalse(needs_review)
+        self.assertIn("skipped review", reason.lower())
+
+    def test_adaptive_reviewer_policy_enforces_quality_gate_for_project_build(self):
+        runtime = AgentRuntime(build_registry())
+        state = {
+            "user_query": "Build a production-ready API platform.",
+            "current_objective": "Build a production-ready API platform.",
+            "project_build_mode": True,
+            "adaptive_agent_selection": True,
+            "reviewer_policy_mode": "adaptive",
+            "skip_reviews": False,
+            "review_revision_counts": {},
+            "enforce_quality_gate": True,
+        }
+
+        needs_review, reason, _ = runtime._should_request_review(
+            state,
+            agent_name="backend_builder_agent",
+            output_text="Implemented API routes, services, auth middleware, and persistence layer.",
+            skip_review_once=False,
+        )
+
+        self.assertTrue(needs_review)
+        self.assertIn("quality gate", reason.lower())
+
+    def test_policy_gated_agents_are_removed_from_orchestrator_candidate_list(self):
+        runtime = AgentRuntime(build_registry())
+        state = {
+            "user_query": "Rename variable foo to bar.",
+            "current_objective": "Rename variable foo to bar.",
+            "available_agents": ["planner_agent", "reviewer_agent", "worker_agent"],
+            "plan_steps": [],
+            "plan_ready": False,
+            "adaptive_agent_selection": True,
+            "planner_policy_mode": "adaptive",
+            "reviewer_policy_mode": "adaptive",
+            "review_pending": False,
+        }
+        state["_policy_blocked_agents"] = sorted(runtime._policy_blocked_agents(state))
+
+        available = runtime._available_agent_descriptions(state)
+
+        self.assertIn("worker_agent", available)
+        self.assertNotIn("planner_agent", available)
+        self.assertNotIn("reviewer_agent", available)
+
 
 if __name__ == "__main__":
     unittest.main()

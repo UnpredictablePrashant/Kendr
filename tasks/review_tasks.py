@@ -1,7 +1,7 @@
 import json
 
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output, recent_messages_for_agent
-from tasks.utils import OUTPUT_DIR, llm, log_task_update, normalize_llm_text, write_text_file
+from tasks.utils import OUTPUT_DIR, llm, log_task_update, model_for_agent, normalize_llm_text, write_text_file
 
 
 def _strip_code_fences(text: str) -> str:
@@ -11,6 +11,110 @@ def _strip_code_fences(text: str) -> str:
         if len(lines) >= 2:
             return "\n".join(lines[1:-1]).strip()
     return stripped
+
+
+def _estimate_safe_context_tokens(provider: str, model: str) -> int:
+    """Return 75 % of the estimated context window (tokens) for prompt selection.
+
+    Ollama's default num_ctx is often 2048-4096 regardless of the model's
+    theoretical maximum, so cap conservatively at 8 192 for that provider.
+    """
+    from kendr.llm_router import get_context_window, PROVIDER_OLLAMA
+
+    window = get_context_window(model)
+    if provider == PROVIDER_OLLAMA:
+        window = min(window, 8192)
+    return int(window * 0.75)
+
+
+def _build_detailed_prompt(
+    current_objective, user_query, latest_agent, planned_step_id,
+    planned_step_title, planned_step_success, revision_attempts,
+    latest_output, recent_history, allowed_text,
+) -> str:
+    """Full-detail prompt for large-context models (GPT-4o, Claude, Gemini, etc.)."""
+    output_trimmed = (latest_output or "")[:4000]
+    history_trimmed = []
+    for h in recent_history[-8:]:
+        entry = dict(h)
+        if "output_excerpt" in entry:
+            entry["output_excerpt"] = str(entry["output_excerpt"] or "")[:500]
+        history_trimmed.append(entry)
+
+    return f"""You are a strict workflow reviewer in a multi-agent system.
+Review if the latest agent output satisfies the current step's success criteria.
+
+Current objective: {current_objective}
+Original user query: {user_query}
+Latest agent: {latest_agent}
+Step id: {planned_step_id or 'n/a'} | Title: {planned_step_title or 'n/a'}
+Success criteria: {planned_step_success or 'n/a'}
+Prior revisions: {revision_attempts}
+
+Latest output:
+{output_trimmed}
+
+Recent history (last 8 steps):
+{json.dumps(history_trimmed, indent=2)}
+
+Rules:
+- Approve if the output materially satisfies the success criteria.
+- Only revise if you can name a concrete, fixable deficiency.
+- Do NOT revise just because the output is imperfect.
+- If prior_revisions >= 2, approve unless critically broken.
+- next_agent must be one of: {allowed_text}, finish
+
+Return ONLY valid JSON, no extra text:
+{{"decision":"approve","reason":"","is_output_correct":true,"revised_objective":"{current_objective}","step_reviews":[{{"agent":"{latest_agent}","status":"correct","notes":""}}],"next_agent":"finish","corrected_values":{{}}}}
+
+Or if revising:
+{{"decision":"revise","reason":"specific deficiency","is_output_correct":false,"revised_objective":"...","step_reviews":[{{"agent":"{latest_agent}","status":"needs_revision","notes":"..."}}],"next_agent":"worker_agent","corrected_values":{{}}}}
+"""
+
+
+def _build_compact_prompt(
+    current_objective, user_query, latest_agent, planned_step_id,
+    planned_step_title, planned_step_success, revision_attempts,
+    latest_output, recent_history, allowed_text,
+) -> str:
+    """Minimal prompt for small-context models (llama3.2, mistral-7b, etc.)."""
+    output_trimmed = (latest_output or "")[:1200]
+    history_trimmed = []
+    for h in recent_history[-3:]:
+        entry = dict(h)
+        if "output_excerpt" in entry:
+            entry["output_excerpt"] = str(entry["output_excerpt"] or "")[:200]
+        history_trimmed.append(entry)
+
+    return f"""You are a strict workflow reviewer in a multi-agent system.
+Review if the latest agent output satisfies the current step's success criteria.
+
+Current objective: {current_objective}
+Original user query: {user_query}
+Latest agent: {latest_agent}
+Step id: {planned_step_id or 'n/a'} | Title: {planned_step_title or 'n/a'}
+Success criteria: {planned_step_success or 'n/a'}
+Prior revisions: {revision_attempts}
+
+Latest output (truncated):
+{output_trimmed}
+
+Recent history (last 3 steps):
+{json.dumps(history_trimmed, indent=2)}
+
+Rules:
+- Approve if the output materially satisfies the success criteria.
+- Only revise if you can name a concrete, fixable deficiency.
+- Do NOT revise just because the output is imperfect.
+- If prior_revisions >= 2, approve unless critically broken.
+- next_agent must be one of: {allowed_text}, finish
+
+Return ONLY valid JSON, no extra text:
+{{"decision":"approve","reason":"","is_output_correct":true,"revised_objective":"{current_objective}","step_reviews":[{{"agent":"{latest_agent}","status":"correct","notes":""}}],"next_agent":"finish","corrected_values":{{}}}}
+
+Or if revising:
+{{"decision":"revise","reason":"specific deficiency","is_output_correct":false,"revised_objective":"...","step_reviews":[{{"agent":"{latest_agent}","status":"needs_revision","notes":"..."}}],"next_agent":"worker_agent","corrected_values":{{}}}}
+"""
 
 
 def _parse_review_output(raw_output: str) -> dict:
@@ -75,62 +179,65 @@ def reviewer_agent(state):
         "Reviewer",
         f"Review pass #{state['reviewer_calls']} started. Auditing the latest step against the current objective.",
     )
-    prompt=f"""
-    You are a strict workflow reviewer agent in a multi-agent system.
 
-    Your job is to review the current objective, the latest work done by the agents, and whether the latest output is correct.
-    If the work is wrong or incomplete, you must:
-    1. correct or tighten the objective,
-    2. decide which agent should work again,
-    3. provide corrected values for that agent.
+    # --- Prompt tier selection based on model context window ---
+    from kendr.llm_router import get_active_provider
+    _provider = get_active_provider()
+    _model = model_for_agent("reviewer_agent")
+    _safe_tokens = _estimate_safe_context_tokens(_provider, _model)
 
-    Current objective: {current_objective}
-    Original user query: {state['user_query']}
-    Latest agent: {latest_agent}
-    Current planned step id: {planned_step_id or 'n/a'}
-    Current planned step title: {planned_step_title or 'n/a'}
-    Current planned step success criteria: {planned_step_success or 'n/a'}
-    Prior revision attempts for this step: {revision_attempts}
-    Latest output:
-    {latest_output}
+    _prompt_args = (
+        current_objective, state["user_query"], latest_agent,
+        planned_step_id, planned_step_title, planned_step_success,
+        revision_attempts, latest_output, recent_history, allowed_text,
+    )
 
-    Recent agent history:
-    {json.dumps(recent_history, indent=2)}
+    _detailed = _build_detailed_prompt(*_prompt_args)
+    _compact  = _build_compact_prompt(*_prompt_args)
 
-    Recent A2A messages for the reviewer:
-    {a2a_context}
+    _detailed_tokens = len(_detailed) / 4
+    _compact_tokens  = len(_compact)  / 4
 
-    Relevant structured state for the latest agent:
-    {json.dumps(latest_structured_context, indent=2, ensure_ascii=False)}
+    if _detailed_tokens <= _safe_tokens:
+        prompt = _detailed
+        log_task_update("Reviewer", f"Using detailed prompt (~{int(_detailed_tokens)} tokens, limit {_safe_tokens}).")
+    elif _compact_tokens <= _safe_tokens:
+        prompt = _compact
+        log_task_update(
+            "Reviewer",
+            f"Model {_model!r} has limited context ({_safe_tokens} safe tokens). "
+            f"Using compact prompt (~{int(_compact_tokens)} tokens).",
+        )
+    else:
+        # Even compact prompt would overflow — surface a user-facing warning and stop cleanly.
+        overflow_msg = (
+            f"⚠️ Context overflow: the current model ({_model!r}) does not have "
+            f"enough context window to run the reviewer agent "
+            f"(estimated {int(_compact_tokens)} tokens needed, ~{_safe_tokens} available).\n\n"
+            f"Please switch to a larger model, such as:\n"
+            f"  • OpenAI: gpt-4o or gpt-4o-mini\n"
+            f"  • Anthropic: claude-haiku-4-5, claude-sonnet-4-6\n"
+            f"  • Ollama: llama3.1:8b or larger\n\n"
+            f"You can change the model in Kendr settings."
+        )
+        log_task_update("Reviewer", f"Context overflow for {_model!r}. Notifying user.")
+        # Set approve so the orchestrator exits the reviewer branch cleanly,
+        # then force __finish__ so the run terminates with the warning as output.
+        state["review_decision"] = "approve"
+        state["review_reason"] = "Context overflow — run terminated."
+        state["review_is_output_correct"] = False
+        state["review_pending"] = False
+        state["next_agent"] = "__finish__"
+        state["final_output"] = overflow_msg
+        state["workflow_status"] = "context_overflow"
+        state["context_overflow_warning"] = overflow_msg
+        state = publish_agent_output(
+            state, "reviewer_agent", overflow_msg,
+            f"reviewer_overflow_{state['reviewer_calls']}",
+            recipients=["orchestrator_agent"],
+        )
+        return state
 
-    Current setup summary:
-    {state.get("setup_summary", "")}
-
-    Review the latest output against the current planned step, not against the final end-to-end deliverable.
-    Approve the step if it materially satisfies the current objective and success criteria, even if the full user request is not finished yet.
-    Do not request a retry unless you can name a concrete deficiency that the next attempt can realistically fix.
-    Allowed next agents when revision is needed:
-    {allowed_text}
-
-    Return ONLY valid JSON in this exact schema:
-    {{
-      "decision": "approve" or "revise",
-      "reason": "brief reason",
-      "is_output_correct": true or false,
-      "revised_objective": "the best current objective",
-      "step_reviews": [
-        {{
-          "agent": "agent name",
-          "status": "correct|needs_revision|insufficient",
-          "notes": "brief note"
-        }}
-      ],
-      "next_agent": "{allowed_enum}",
-      "corrected_values": {{
-        "key": "value"
-      }}
-    }}
-    """
     response=llm.invoke(prompt)
     raw_output=normalize_llm_text(response.content if hasattr(response, "content") else response).strip()
 

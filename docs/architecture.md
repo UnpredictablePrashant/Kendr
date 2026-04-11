@@ -57,6 +57,11 @@ The registry layer does four things:
 - discovers external plugins from plugin search paths
 - exposes providers, channels, plugins, and agents through one runtime registry
 
+Discovery now supports two operating modes:
+
+- best-effort by default, which records discovery issues instead of crashing startup
+- strict mode via `build_registry(strict=True)` for CI, packaging, and validation flows
+
 Default external plugin search paths:
 
 - `./plugins`
@@ -145,3 +150,4 @@ See [Install](install.md) and [Integrations](integrations.md) for the operationa
 - [Core Intelligence Stack](super_agent_stack.md)
 - [superRAG](superrag_feature.md)
 - [Local Drive Case Study](local_drive_case_study.md)
+- [Platform Refactor Plan](platform_refactor_plan.md)

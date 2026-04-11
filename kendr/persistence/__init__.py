@@ -95,6 +95,13 @@ from .skill_store import (
     set_skill_installed,
     update_user_skill,
 )
+from .assistant_store import (
+    create_assistant,
+    delete_assistant,
+    get_assistant,
+    list_assistants,
+    update_assistant,
+)
 
 __all__ = [
     "DB_PATH",
@@ -178,4 +185,9 @@ __all__ = [
     "list_user_skills",
     "set_skill_installed",
     "update_user_skill",
+    "create_assistant",
+    "delete_assistant",
+    "get_assistant",
+    "list_assistants",
+    "update_assistant",
 ]

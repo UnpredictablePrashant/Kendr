@@ -322,6 +322,16 @@ class CliSmokeTests(unittest.TestCase):
         self.assertIsInstance(payload, list)
         self.assertTrue(payload)
 
+    def test_integrations_list_json(self):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            exit_code = main(["integrations", "list", "--json"])
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(buffer.getvalue())
+        self.assertIsInstance(payload, list)
+        self.assertTrue(payload)
+        self.assertIn("is_configured", payload[0])
+
     def test_setup_components_json(self):
         buffer = io.StringIO()
         with redirect_stdout(buffer):

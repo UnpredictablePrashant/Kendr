@@ -1,4 +1,4 @@
-"""Skill-based routing registry.
+"""Agent routing index.
 
 Auto-discovers all registered agents (including MCP tools) at gateway startup,
 builds an intent-keyword index, and provides ``top_match()`` for fast
@@ -9,19 +9,18 @@ Usage
 -----
 At startup::
 
-    from kendr.skill_registry import build_skill_registry
-    sr = build_skill_registry(registry)
+    from kendr.agent_routing import build_agent_routing_index
+    ar = build_agent_routing_index(registry)
 
 In the orchestrator::
 
-    target = sr.top_match(user_query)
+    target = ar.top_match(user_query)
     if target:
         state["next_agent"] = target   # skip planner
 """
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -29,34 +28,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from kendr.registry import Registry
 
-
-# Maps agent-name prefix → (integration_id, required_env_vars)
-# Used to auto-detect which agents need additional credentials to work.
-_INTEGRATION_REQUIREMENTS: dict[str, tuple[str, tuple[str, ...]]] = {
-    "slack_":           ("slack",           ("SLACK_BOT_TOKEN",)),
-    "whatsapp_":        ("whatsapp",        ("WHATSAPP_ACCESS_TOKEN",)),
-    "telegram_":        ("telegram",        ("TELEGRAM_BOT_TOKEN",)),
-    "github_":          ("github",          ("GITHUB_TOKEN",)),
-    "aws_":             ("aws",             ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")),
-    "qdrant_":          ("qdrant",          ("QDRANT_URL",)),
-    "elevenlabs_":      ("elevenlabs",      ("ELEVENLABS_API_KEY",)),
-    "serpapi_":         ("serpapi",         ("SERPAPI_API_KEY",)),
-    "gmail_":           ("google_workspace",("GMAIL_CLIENT_ID",)),
-    "google_drive_":    ("google_workspace",("GOOGLE_DRIVE_CLIENT_ID",)),
-    "microsoft_":       ("microsoft_graph", ("MICROSOFT_CLIENT_ID",)),
-    "onedrive_":        ("microsoft_graph", ("MICROSOFT_CLIENT_ID",)),
-    "nmap_":            ("nmap",            ("NMAP_PATH",)),
-    "zap_":             ("zap",             ("ZAP_API_KEY",)),
-}
-
-
-def _infer_integration(agent_name: str) -> tuple[str, tuple[str, ...]] | None:
-    """Return (integration_id, required_env_vars) inferred from agent name prefix, or None."""
-    name_lower = agent_name.lower()
-    for prefix, req in _INTEGRATION_REQUIREMENTS.items():
-        if name_lower.startswith(prefix):
-            return req
-    return None
+from kendr.integration_registry import check_agent_integration_config
 
 
 # Agents that are part of the orchestration infrastructure and must never
@@ -98,7 +70,7 @@ _CATEGORY_META: dict[str, dict] = {
 
 
 @dataclass
-class SkillCard:
+class AgentCard:
     agent_name: str
     display_name: str
     description: str
@@ -131,8 +103,8 @@ class SkillCard:
         }
 
 
-class SkillRegistry:
-    """Intent-routing registry built from all registered agents.
+class AgentRoutingIndex:
+    """Intent-routing index built from all registered agents.
 
     Call ``top_match(query)`` to get a high-confidence single-agent route or
     ``None`` when the query is ambiguous (fall through to the planner).
@@ -144,7 +116,7 @@ class SkillRegistry:
     DIRECT_ROUTE_DOMINANCE: float = 2.2
 
     def __init__(self, registry: "Registry") -> None:
-        self._cards: list[SkillCard] = []
+        self._cards: list[AgentCard] = []
         # keyword → list of (agent_name, weight)
         self._index: dict[str, list[tuple[str, float]]] = {}
         self._build(registry)
@@ -152,6 +124,7 @@ class SkillRegistry:
     # ------------------------------------------------------------------ build
 
     def _check_condition(self, cond: str) -> bool:
+        import os
         cond = cond.strip()
         if not cond or cond == "always":
             return True
@@ -172,35 +145,20 @@ class SkillRegistry:
             return True
         return all(self._check_condition(c) for c in conditions)
 
-    def _make_card(self, agent, meta: dict) -> SkillCard:
+    def _make_card(self, agent, meta: dict) -> AgentCard:
         name = agent.name
         base = name[:-6] if name.endswith("_agent") else name
         default_display = base.replace("_", " ").title()
         active_when = list(meta.get("active_when") or [])
         is_active = self._is_active(active_when)
 
-        integration_id = ""
-        missing_vars: list[str] = []
-        needs_config = False
-        config_hint = meta.get("config_hint", "")
+        integration_id, missing_vars, needs_config, config_hint = (
+            check_agent_integration_config(name, meta.get("config_hint", ""))
+        )
+        if needs_config and is_active and not active_when:
+            is_active = False
 
-        inferred = _infer_integration(name)
-        if inferred:
-            int_id, required_vars = inferred
-            missing = [v for v in required_vars if not os.environ.get(v, "").strip()]
-            if missing:
-                needs_config = True
-                integration_id = int_id
-                missing_vars = list(missing)
-                if not config_hint:
-                    config_hint = (
-                        f"Requires {int_id} credentials. "
-                        f"Set {', '.join(missing)} in Setup & Config."
-                    )
-                if is_active and not active_when:
-                    is_active = False
-
-        return SkillCard(
+        return AgentCard(
             agent_name=name,
             display_name=meta.get("display_name") or default_display,
             description=meta.get("description") or agent.description or "",
@@ -215,7 +173,7 @@ class SkillRegistry:
             missing_vars=missing_vars,
         )
 
-    def _index_card(self, card: SkillCard) -> None:
+    def _index_card(self, card: AgentCard) -> None:
         """Add card tokens to the inverted index with weights."""
         seen: dict[str, float] = {}
 
@@ -293,13 +251,13 @@ class SkillRegistry:
 
     # ------------------------------------------------------------------ cards
 
-    def get_all_cards(self) -> list[SkillCard]:
+    def get_all_cards(self) -> list[AgentCard]:
         return list(self._cards)
 
-    def get_active_cards(self) -> list[SkillCard]:
+    def get_active_cards(self) -> list[AgentCard]:
         return [c for c in self._cards if c.is_active]
 
-    def get_inactive_cards(self) -> list[SkillCard]:
+    def get_inactive_cards(self) -> list[AgentCard]:
         return [c for c in self._cards if not c.is_active]
 
     def summary(self) -> dict:
@@ -325,14 +283,18 @@ class SkillRegistry:
         skills = _get_installed_user_skills()
         if not skills:
             return ""
-        lines = ["## Installed Custom Skills\n",
-                 "You can invoke these skills by calling `execute_skill(slug, inputs)`:\n"]
+        lines = [
+            "## Installed Custom Skills\n",
+            "Route to the corresponding `skill_<slug>_agent` to invoke a skill:\n",
+        ]
         for s in skills:
             kind = s.get("skill_type", "")
             icon = s.get("icon", "⚡")
             desc = (s.get("description", "") or "").strip()
             slug = s.get("slug", "")
-            lines.append(f"- {icon} **{s['name']}** (`{slug}`, type={kind}): {desc}")
+            safe_slug = "".join(c if c.isalnum() else "_" for c in slug.lower()).strip("_")
+            agent_name = f"skill_{safe_slug}_agent"
+            lines.append(f"- {icon} **{s['name']}** → `{agent_name}` (type={kind}): {desc}")
         return "\n".join(lines)
 
 
@@ -345,6 +307,6 @@ def _get_installed_user_skills() -> list[dict]:
         return []
 
 
-def build_skill_registry(registry: "Registry") -> SkillRegistry:
+def build_agent_routing_index(registry: "Registry") -> AgentRoutingIndex:
     """Convenience factory — call once at startup."""
-    return SkillRegistry(registry)
+    return AgentRoutingIndex(registry)

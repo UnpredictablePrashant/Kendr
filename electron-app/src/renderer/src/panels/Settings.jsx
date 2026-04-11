@@ -7,6 +7,7 @@ const TABS = [
   { id: 'rag',      label: 'RAG & Data' },
   { id: 'models',   label: 'Models' },
   { id: 'editor',   label: 'Editor' },
+  { id: 'chat',     label: 'Chat' },
 ]
 
 export default function Settings() {
@@ -279,6 +280,45 @@ export default function Settings() {
               <input type="checkbox" className="st-check" checked={!!s.formatOnSave} onChange={e => update('formatOnSave', e.target.checked)} />
             </Row>
           </Section>
+        )}
+
+        {/* ── Chat ── */}
+        {tab === 'chat' && (
+          <>
+            <Section title="History">
+              <Row label="Retention Period">
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <input
+                    className="st-input st-input--sm"
+                    type="number"
+                    min="0"
+                    max="365"
+                    value={s.chatHistoryRetentionDays ?? 14}
+                    onChange={e => update('chatHistoryRetentionDays', +e.target.value)}
+                  />
+                  <span className="st-hint">days &nbsp;(0 = keep forever)</span>
+                </div>
+              </Row>
+              <div className="st-info-banner" style={{ marginTop: 8 }}>
+                Chat history is stored locally on your device. Conversations older than the
+                retention period are automatically deleted when the app loads.
+                Default is&nbsp;<strong>14 days</strong>.
+              </div>
+              <div className="st-actions">
+                <button
+                  className="st-btn"
+                  onClick={() => {
+                    if (window.confirm('Delete all chat history? This cannot be undone.')) {
+                      localStorage.removeItem('kendr_sessions_v1')
+                      localStorage.removeItem('kendr_chat_history_v1')
+                    }
+                  }}
+                >
+                  Clear All History
+                </button>
+              </div>
+            </Section>
+          </>
         )}
       </div>
 

@@ -1,8 +1,15 @@
 # Plugin SDK
 
-Kendr supports external plugins as simple Python modules discovered from plugin search paths.
+Kendr supports external runtime plugins as simple Python modules discovered from plugin search paths.
 
 This page defines the versioned contract for external contributors.
+
+Important naming boundary:
+
+- `runtime plugin`: packaged code that registers agents, providers, channels, or future workflows with the runtime
+- `integration`: a configured connection to an external system such as GitHub, Slack, or Gmail
+
+Those are different concepts even if older code still uses `plugin` naming in some places.
 
 ## Status
 
@@ -72,6 +79,7 @@ PLUGIN = PluginManifest(
     name="acme.example",
     description="Example Kendr plugin.",
     version="0.1.0",
+    plugin_type="runtime_plugin",
     sdk_version="1.0",
     runtime_api="registry-v1",
     entry_point="register",
@@ -87,6 +95,7 @@ Manifest expectations:
 
 - `name`: globally unique plugin id
 - `version`: plugin version
+- `plugin_type`: runtime extension shape, currently `runtime_plugin`
 - `sdk_version`: Kendr SDK contract version
 - `runtime_api`: registry/runtime contract family
 - `entry_point`: callable invoked with `registry`
@@ -180,6 +189,8 @@ registry = build_registry()
 assert "acme.example" in registry.plugins
 assert "my_agent" in registry.agents
 ```
+
+If you need discovery to fail hard during CI or packaging validation, call `build_registry(strict=True)`. The default mode is best-effort and records discovery issues so optional integrations do not break startup.
 
 You can also validate the discovery surface from the CLI:
 

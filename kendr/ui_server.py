@@ -36,14 +36,19 @@ from tasks.setup_config_store import (
 
 try:
     from kendr.persistence import (
+        create_assistant as _db_create_assistant,
         cleanup_stale_runs as _db_cleanup_stale_runs,
+        delete_assistant as _db_delete_assistant,
         delete_chat_session as _db_delete_chat_session,
         delete_run as _db_delete_run,
+        get_assistant as _db_get_assistant,
         get_channel_session as _db_get_channel_session,
         list_agent_executions_for_run as _list_run_steps,
+        list_assistants as _db_list_assistants,
         list_artifacts_for_run as _list_run_artifacts,
         list_run_messages as _db_list_run_messages,
         get_run as _db_get_run,
+        update_assistant as _db_update_assistant,
         upsert_channel_session as _db_upsert_channel_session,
     )
     from kendr.persistence.run_store import get_run_output_dir_from_manifest as _get_run_output_dir_from_manifest
@@ -52,12 +57,20 @@ except Exception:
     _HAS_PERSISTENCE = False
     def _db_cleanup_stale_runs(**kw):  # type: ignore[misc]
         return 0
+    def _db_create_assistant(**kw):  # type: ignore[misc]
+        return {}
+    def _db_delete_assistant(assistant_id, **kw):  # type: ignore[misc]
+        return False
     def _db_delete_chat_session(chat_session_id, **kw):  # type: ignore[misc]
         return {"deleted_runs": [], "deleted_dirs": [], "errors": []}
     def _db_delete_run(run_id, **kw):  # type: ignore[misc]
         return {"ok": True, "deleted_run": run_id, "errors": []}
+    def _db_get_assistant(assistant_id, **kw):  # type: ignore[misc]
+        return None
     def _db_get_channel_session(session_key, **kw):  # type: ignore[misc]
         return None
+    def _db_list_assistants(**kw):  # type: ignore[misc]
+        return []
     def _list_run_steps(run_id):  # type: ignore[misc]
         return []
     def _list_run_artifacts(run_id):  # type: ignore[misc]
@@ -67,6 +80,8 @@ except Exception:
     def _db_get_run(run_id):  # type: ignore[misc]
         return None
     def _db_upsert_channel_session(session_key, payload, **kw):  # type: ignore[misc]
+        return None
+    def _db_update_assistant(assistant_id, **kw):  # type: ignore[misc]
         return None
     def _get_run_output_dir_from_manifest(run_id, **kw):  # type: ignore[misc]
         return ""
@@ -226,6 +241,88 @@ def _gateway_long_timeout_seconds() -> float | None:
     except Exception:
         return 21600.0
     return None if timeout <= 0 else timeout
+
+
+def _assistant_workspace_id(body: dict | None = None, parsed=None) -> str:
+    if isinstance(body, dict):
+        raw = str(body.get("workspace_id") or body.get("workspace") or "").strip()
+        if raw:
+            return raw
+    if parsed is not None:
+        params = parse_qs(parsed.query or "")
+        raw = str((params.get("workspace_id") or params.get("workspace") or [""])[0] or "").strip()
+        if raw:
+            return raw
+    return "default"
+
+
+def _assistant_local_paths(memory_config: dict | None) -> list[str]:
+    config = memory_config if isinstance(memory_config, dict) else {}
+    values = config.get("local_paths") or config.get("paths") or []
+    if not isinstance(values, list):
+        return []
+    return [normalize_host_path_str(str(item or "").strip()) for item in values if str(item or "").strip()]
+
+
+def _collect_local_attachment_notes(local_paths: list[str]) -> list[str]:
+    notes: list[str] = []
+    for raw_path in local_paths[:8]:
+        candidate = normalize_host_path_str(str(raw_path or "").strip())
+        if not candidate:
+            continue
+        try:
+            if os.path.isfile(candidate):
+                with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
+                    excerpt = fh.read(2000)
+                notes.append(
+                    f"=== Attached file: {os.path.basename(candidate)} ===\nPath: {candidate}\n{excerpt}"
+                )
+            elif os.path.isdir(candidate):
+                entries = sorted(os.listdir(candidate))[:40]
+                notes.append(
+                    f"=== Attached folder: {os.path.basename(candidate)} ===\nPath: {candidate}\nEntries: {entries}"
+                )
+        except Exception:
+            notes.append(f"Attached path: {candidate}")
+    return notes
+
+
+def _assistant_system_prompt(assistant: dict) -> str:
+    name = str(assistant.get("name", "") or "").strip() or "Untitled Assistant"
+    description = str(assistant.get("description", "") or "").strip()
+    goal = str(assistant.get("goal", "") or "").strip()
+    system_prompt = str(assistant.get("system_prompt", "") or "").strip()
+    routing_policy = str(assistant.get("routing_policy", "") or "balanced").strip()
+    attached_capabilities = assistant.get("attached_capabilities") or []
+    memory_config = assistant.get("memory_config") or {}
+
+    lines = [
+        f"You are {name}, a configured assistant inside Kendr.",
+        "Answer directly, clearly, and practically.",
+        f"Execution profile: {routing_policy}.",
+    ]
+    if description:
+        lines.append(f"Description: {description}")
+    if goal:
+        lines.append(f"Primary goal: {goal}")
+    if attached_capabilities:
+        capability_labels = []
+        for item in attached_capabilities[:12]:
+            if isinstance(item, dict):
+                label = str(item.get("name") or item.get("capability_key") or item.get("capability_id") or "").strip()
+                if label:
+                    capability_labels.append(label)
+        if capability_labels:
+            lines.append("Attached capabilities: " + ", ".join(capability_labels))
+    if isinstance(memory_config, dict):
+        summary = str(memory_config.get("summary") or memory_config.get("notes") or "").strip()
+        if summary:
+            lines.append(f"Memory guidance: {summary}")
+    if system_prompt:
+        lines.append("")
+        lines.append("Additional instructions:")
+        lines.append(system_prompt)
+    return "\n".join(lines).strip()
 
 
 def _normalize_mcp_add_payload(body: dict) -> list[dict]:
@@ -10051,7 +10148,7 @@ tr:hover td { background: rgba(0,201,167,0.03); }
   <div class="panel">
     <div class="panel-title">Search</div>
     <div class="row">
-      <div><label>Type</label><select id="fltType"><option value="">Any</option><option value="skill">skill</option><option value="mcp_server">mcp_server</option><option value="mcp_tool">mcp_tool</option><option value="api_service">api_service</option><option value="api_operation">api_operation</option><option value="agent">agent</option><option value="plugin">plugin</option><option value="workflow">workflow</option></select></div>
+      <div><label>Type</label><select id="fltType"><option value="">Any</option><option value="skill">skill</option><option value="mcp_server">mcp_server</option><option value="mcp_tool">mcp_tool</option><option value="api_service">api_service</option><option value="api_operation">api_operation</option><option value="agent">agent</option><option value="integration">integration</option><option value="workflow">workflow</option></select></div>
       <div><label>Status</label><select id="fltStatus"><option value="">Any</option><option value="draft">draft</option><option value="verified">verified</option><option value="active">active</option><option value="disabled">disabled</option><option value="deprecated">deprecated</option></select></div>
       <div><label>Visibility</label><select id="fltVisibility"><option value="">Any</option><option value="private">private</option><option value="workspace">workspace</option><option value="public">public</option></select></div>
       <div class="col3"><label>Search</label><input id="fltQ" placeholder="name, key, description"></div>
@@ -11414,6 +11511,23 @@ strong { color: var(--text); }
         if path == "/api/models/ollama/docker/status":
             self._handle_ollama_docker_status()
             return
+        if path == "/api/assistants":
+            workspace_id = _assistant_workspace_id(parsed=parsed)
+            params = parse_qs(parsed.query or "")
+            status_filter = str((params.get("status") or [""])[0] or "").strip()
+            search = str((params.get("q") or [""])[0] or "").strip()
+            items = _db_list_assistants(workspace_id=workspace_id, status=status_filter, search=search, limit=200)
+            self._json(200, {"assistants": items, "workspace_id": workspace_id, "count": len(items)})
+            return
+        if path.startswith("/api/assistants/"):
+            assistant_id = path[len("/api/assistants/"):].strip()
+            if assistant_id and "/" not in assistant_id:
+                item = _db_get_assistant(assistant_id)
+                if not item:
+                    self._json(404, {"error": "assistant_not_found"})
+                    return
+                self._json(200, item)
+                return
         if path == "/api/skills":
             try:
                 data = _gateway_get("/registry/skills", timeout=5.0)
@@ -11421,6 +11535,27 @@ strong { color: var(--text); }
             except Exception:
                 self._json(503, {"error": "Gateway offline", "summary": {}, "cards": []})
             return
+        # ── Unified connector catalog ─────────────────────────────────────────
+        if path == "/api/connectors":
+            status, data = _gateway_forward_json("GET", "/registry/connectors", timeout=8.0)
+            self._json(status, data)
+            return
+        # ── Skill marketplace (proxied to gateway) ────────────────────────────
+        if path == "/api/marketplace/skills":
+            suffix = f"?{parsed.query}" if parsed.query else ""
+            status, data = _gateway_forward_json("GET", f"/api/marketplace/skills{suffix}", timeout=8.0)
+            self._json(status, data)
+            return
+        if path == "/api/marketplace/skills/installed":
+            status, data = _gateway_forward_json("GET", "/api/marketplace/skills/installed", timeout=8.0)
+            self._json(status, data)
+            return
+        if path.startswith("/api/marketplace/skills/"):
+            rest = path[len("/api/marketplace/skills/"):]
+            if rest:
+                status, data = _gateway_forward_json("GET", f"/api/marketplace/skills/{rest}", timeout=8.0)
+                self._json(status, data)
+                return
         if path == "/api/capabilities":
             suffix = f"?{parsed.query}" if parsed.query else ""
             status, data = _gateway_forward_json("GET", f"/registry/capabilities{suffix}", timeout=8.0)
@@ -11811,6 +11946,9 @@ strong { color: var(--text); }
         if path == "/api/chat/simple":
             self._handle_simple_chat(body)
             return
+        if path == "/api/assistants":
+            self._handle_assistants_create(body)
+            return
         if path == "/api/models/set":
             self._handle_models_set(body)
             return
@@ -11881,6 +12019,24 @@ strong { color: var(--text); }
             project_id = path[len("/api/projects/"):-len("/git/pull")]
             self._handle_project_git_pull(project_id)
             return
+        if path.startswith("/api/assistants/"):
+            rest = path[len("/api/assistants/"):].strip()
+            if "/" not in rest:
+                self._json(404, {"error": "not_found"})
+                return
+            assistant_id, action = rest.split("/", 1)
+            action = action.strip().lower()
+            if action == "update":
+                self._handle_assistants_update(assistant_id, body)
+                return
+            if action == "delete":
+                self._handle_assistants_delete(assistant_id)
+                return
+            if action == "test":
+                self._handle_assistants_test(assistant_id, body)
+                return
+            self._json(404, {"error": "not_found"})
+            return
         if path.startswith("/api/projects/") and path.endswith("/git/push"):
             project_id = path[len("/api/projects/"):-len("/git/push")]
             self._handle_project_git_push(project_id)
@@ -11938,6 +12094,18 @@ strong { color: var(--text); }
             else:
                 self._json(404, {"error": "not_found"})
             return
+        # ── Skill marketplace POST routes (proxied to gateway) ───────────────
+        if path == "/api/marketplace/skills/create":
+            status, data = _gateway_forward_json("POST", "/api/marketplace/skills/create", payload=body, timeout=8.0)
+            self._json(status, data)
+            return
+        if path.startswith("/api/marketplace/skills/"):
+            rest = path[len("/api/marketplace/skills/"):]
+            action = rest.rsplit("/", 1)[-1] if "/" in rest else ""
+            if action in {"install", "uninstall", "test", "edit", "delete"}:
+                status, data = _gateway_forward_json("POST", f"/api/marketplace/skills/{rest}", payload=body, timeout=10.0)
+                self._json(status, data)
+                return
         # ── RAG routes ──────────────────────────────────────────────────────
         if path == "/api/rag/kbs":
             self._handle_rag_create_kb(body)
@@ -12012,8 +12180,11 @@ strong { color: var(--text); }
         for key in ("project_id", "project_name", "project_stack", "stack", "project_root",
                     "github_repo", "auto_approve", "skip_test_agent", "skip_devops_agent",
                     "shell_auto_approve", "privileged_mode", "privileged_approved",
-                    "privileged_approval_note", "privileged_allow_destructive",
-                    "privileged_allowed_paths", "workflow_type", "deep_research_mode",
+                    "privileged_approval_note", "privileged_approval_mode",
+                    "privileged_require_approvals", "privileged_read_only",
+                    "privileged_allow_root", "privileged_allow_destructive",
+                    "privileged_enable_backup", "privileged_allowed_paths", "privileged_allowed_domains",
+                    "workflow_type", "deep_research_mode",
                     "long_document_mode", "long_document_pages", "long_document_title",
                     "research_output_formats", "research_citation_style",
                     "research_enable_plagiarism_check", "research_web_search_enabled", "research_date_range",
@@ -12188,7 +12359,13 @@ strong { color: var(--text); }
                 for key in ("force", "branch"):
                     if key in body:
                         resume_payload[key] = bool(body.get(key))
-                for key in ("provider", "model", "project_id", "project_root", "project_name", "workflow_type"):
+                for key in (
+                    "provider", "model", "project_id", "project_root", "project_name", "workflow_type",
+                    "shell_auto_approve", "privileged_mode", "privileged_approved", "privileged_approval_note",
+                    "privileged_approval_mode", "privileged_require_approvals", "privileged_read_only",
+                    "privileged_allow_root", "privileged_allow_destructive", "privileged_enable_backup",
+                    "privileged_allowed_paths", "privileged_allowed_domains",
+                ):
                     value = body.get(key)
                     if value is not None and str(value).strip():
                         resume_payload[key] = value
@@ -13116,6 +13293,112 @@ strong { color: var(--text); }
             response = llm.invoke(messages)
             answer = response.content if hasattr(response, "content") else str(response)
             self._json(200, {"answer": answer, "provider": provider, "model": model})
+        except Exception as exc:
+            self._json(500, {"error": str(exc)})
+
+    def _handle_assistants_create(self, body: dict) -> None:
+        name = str(body.get("name") or "").strip()
+        if not name:
+            self._json(400, {"error": "name is required"})
+            return
+        try:
+            item = _db_create_assistant(
+                workspace_id=_assistant_workspace_id(body=body),
+                owner_user_id=str(body.get("owner_user_id") or "desktop_user").strip() or "desktop_user",
+                name=name,
+                description=str(body.get("description") or "").strip(),
+                goal=str(body.get("goal") or "").strip(),
+                system_prompt=str(body.get("system_prompt") or "").strip(),
+                model_provider=str(body.get("model_provider") or "").strip(),
+                model_name=str(body.get("model_name") or "").strip(),
+                routing_policy=str(body.get("routing_policy") or "balanced").strip() or "balanced",
+                status=str(body.get("status") or "draft").strip() or "draft",
+                attached_capabilities=body.get("attached_capabilities") if isinstance(body.get("attached_capabilities"), list) else [],
+                memory_config=body.get("memory_config") if isinstance(body.get("memory_config"), dict) else {},
+                metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else {},
+            )
+            self._json(200, item)
+        except Exception as exc:
+            self._json(400, {"error": str(exc)})
+
+    def _handle_assistants_update(self, assistant_id: str, body: dict) -> None:
+        if not assistant_id:
+            self._json(400, {"error": "missing_assistant_id"})
+            return
+        try:
+            item = _db_update_assistant(
+                assistant_id,
+                name=str(body.get("name")).strip() if body.get("name") is not None else None,
+                description=str(body.get("description")).strip() if body.get("description") is not None else None,
+                goal=str(body.get("goal")).strip() if body.get("goal") is not None else None,
+                system_prompt=str(body.get("system_prompt")).strip() if body.get("system_prompt") is not None else None,
+                model_provider=str(body.get("model_provider")).strip() if body.get("model_provider") is not None else None,
+                model_name=str(body.get("model_name")).strip() if body.get("model_name") is not None else None,
+                routing_policy=str(body.get("routing_policy")).strip() if body.get("routing_policy") is not None else None,
+                status=str(body.get("status")).strip() if body.get("status") is not None else None,
+                attached_capabilities=body.get("attached_capabilities") if isinstance(body.get("attached_capabilities"), list) else None,
+                memory_config=body.get("memory_config") if isinstance(body.get("memory_config"), dict) else None,
+                metadata=body.get("metadata") if isinstance(body.get("metadata"), dict) else None,
+            )
+            if not item:
+                self._json(404, {"error": "assistant_not_found"})
+                return
+            self._json(200, item)
+        except Exception as exc:
+            self._json(400, {"error": str(exc)})
+
+    def _handle_assistants_delete(self, assistant_id: str) -> None:
+        if not assistant_id:
+            self._json(400, {"error": "missing_assistant_id"})
+            return
+        try:
+            ok = _db_delete_assistant(assistant_id)
+            if not ok:
+                self._json(404, {"error": "assistant_not_found"})
+                return
+            self._json(200, {"ok": True, "assistant_id": assistant_id})
+        except Exception as exc:
+            self._json(400, {"error": str(exc)})
+
+    def _handle_assistants_test(self, assistant_id: str, body: dict) -> None:
+        assistant = _db_get_assistant(assistant_id)
+        if not assistant:
+            self._json(404, {"error": "assistant_not_found"})
+            return
+
+        message = str(body.get("message") or body.get("text") or "").strip()
+        if not message:
+            self._json(400, {"error": "message is required"})
+            return
+
+        model_override = str(body.get("model") or assistant.get("model_name") or "").strip() or None
+        provider_override = str(body.get("provider") or assistant.get("model_provider") or "").strip() or None
+        local_paths = _assistant_local_paths(assistant.get("memory_config"))
+
+        try:
+            from kendr.llm_router import build_llm, get_active_provider, get_model_for_provider
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            provider = provider_override or get_active_provider()
+            model = model_override or get_model_for_provider(provider)
+            llm = build_llm(provider, model)
+
+            attachment_notes = _collect_local_attachment_notes(local_paths)
+            system_ctx = _assistant_system_prompt(assistant)
+            if attachment_notes:
+                system_ctx += "\n\nAttached local context:\n" + "\n\n".join(attachment_notes)
+
+            messages = [SystemMessage(content=system_ctx), HumanMessage(content=message)]
+            response = llm.invoke(messages)
+            answer = response.content if hasattr(response, "content") else str(response)
+            _db_update_assistant(assistant_id, last_tested_at=_utc_now_iso())
+            self._json(200, {
+                "assistant_id": assistant_id,
+                "answer": answer,
+                "provider": provider,
+                "model": model,
+                "system_prompt_preview": system_ctx[:3000],
+            })
         except Exception as exc:
             self._json(500, {"error": str(exc)})
 

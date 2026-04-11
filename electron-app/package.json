@@ -10,7 +10,11 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "package": "npm run build && electron-builder",
-    "rebuild": "electron-rebuild -f -w node-pty"
+    "package:win": "npm run build && electron-builder --win",
+    "package:mac": "npm run build && electron-builder --mac",
+    "package:linux": "npm run build && electron-builder --linux",
+    "rebuild": "electron-rebuild -f -w node-pty",
+    "build-icons": "node ../scripts/build-icons.mjs"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.6.0",
@@ -28,24 +32,117 @@
     "electron": "^32.2.0",
     "electron-builder": "^25.1.8",
     "electron-vite": "^2.3.0",
+    "png-to-ico": "^3.0.1",
+    "sharp": "^0.34.5",
     "vite": "^5.4.8"
   },
   "build": {
     "appId": "com.kendr.desktop",
     "productName": "Kendr",
-    "directories": { "output": "dist" },
-    "files": ["out/**/*"],
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "out/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../",
+        "to": "kendr-backend",
+        "filter": [
+          "gateway_server.py",
+          "app.py",
+          "kendr/**/*",
+          "tasks/**/*",
+          "mcp_servers/**/*",
+          "plugin_templates/**/*",
+          "project_templates/**/*",
+          "pyproject.toml",
+          "requirements.txt",
+          "!**/__pycache__/**",
+          "!**/*.pyc",
+          "!**/*.pyo",
+          "!**/.venv/**",
+          "!**/electron-app/**",
+          "!**/node_modules/**",
+          "!**/tests/**",
+          "!**/docs/**",
+          "!**/output/**",
+          "!**/logs/**",
+          "!**/.git/**",
+          "!**/dist/**",
+          "!**/build/**",
+          "!**/*.egg-info/**",
+          "!**/attached_assets/**",
+          "!**/openai_flowchart/**",
+          "!**/.deps/**"
+        ]
+      }
+    ],
     "win": {
-      "target": "nsis",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
       "icon": "resources/icon.ico"
     },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Kendr"
+    },
     "mac": {
-      "target": "dmg",
-      "icon": "resources/icon.icns"
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "icon": "resources/icon.icns",
+      "category": "public.app-category.developer-tools",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false
+    },
+    "dmg": {
+      "contents": [
+        {
+          "x": 130,
+          "y": 220
+        },
+        {
+          "x": 410,
+          "y": 220,
+          "type": "link",
+          "path": "/Applications"
+        }
+      ]
     },
     "linux": {
-      "target": "AppImage",
-      "icon": "resources/icon.png"
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "deb",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "resources/icon.png",
+      "category": "Development"
     }
   }
 }

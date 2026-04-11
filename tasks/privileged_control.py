@@ -140,6 +140,10 @@ def build_privileged_policy(state: dict) -> dict:
         or state.get("privileged_auto_approve")
         or os.getenv("KENDR_AUTO_APPROVE_COMMANDS", False)
     )
+    raw_approval_mode = str(
+        state.get("privileged_approval_mode") or os.getenv("KENDR_APPROVAL_MODE", "session")
+    ).strip().lower()
+    approval_mode = "per_command" if raw_approval_mode in {"per_command", "every_command", "always_ask"} else "session"
 
     approved = _truthy(state.get("privileged_approved", False)) or auto_approve
     approval_note = str(state.get("privileged_approval_note", "")).strip()
@@ -151,6 +155,7 @@ def build_privileged_policy(state: dict) -> dict:
         "approved": approved,
         "approval_note": approval_note,
         "auto_approve": auto_approve,
+        "approval_mode": approval_mode,
         "require_approvals": _truthy(state.get("privileged_require_approvals", os.getenv("KENDR_REQUIRE_APPROVALS", True))),
         "read_only": _truthy(state.get("privileged_read_only", os.getenv("KENDR_READ_ONLY_MODE", False))),
         "allow_root": _truthy(state.get("privileged_allow_root", os.getenv("KENDR_ALLOW_ROOT", False))),
@@ -227,7 +232,7 @@ def ensure_command_allowed(command: str, working_directory: str, policy: dict) -
         else:
             if not policy.get("approved", False) or not policy.get("approval_note", ""):
                 raise PermissionError(
-                    "Shell execution requires explicit approval. "
+                    "approval_required: Shell execution requires explicit approval. "
                     "Enable Shell Automation mode in the chat header, or pass "
                     "privileged_approved=True and a privileged_approval_note."
                 )

@@ -95,6 +95,24 @@ class PersistenceCoreTests(unittest.TestCase):
             self.assertIn(str(Path(legacy_a).resolve()), found)
             self.assertIn(str(Path(legacy_b).resolve()), found)
 
+    def test_list_legacy_databases_skips_workspace_defaults_for_custom_target(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target_db = os.path.join(tmpdir, "central.sqlite3")
+            workspace_default = str((Path.cwd() / "output" / "agent_workflow.sqlite3").resolve())
+            with patch.dict(
+                os.environ,
+                {
+                    "KENDR_DB_LEGACY_PATHS": "",
+                    "KENDR_WORKING_DIR": "",
+                    "KENDR_DB_SEARCH_ROOTS": "",
+                    "KENDR_DB_ENABLE_RECURSIVE_SEARCH": "0",
+                },
+                clear=False,
+            ):
+                found = set(list_legacy_databases(target_db))
+
+            self.assertNotIn(workspace_default, found)
+
     def test_auto_migration_retries_after_transient_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             target_db = os.path.join(tmpdir, "central.sqlite3")

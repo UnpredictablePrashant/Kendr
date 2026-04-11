@@ -69,6 +69,14 @@ class RuntimeState(TypedDict, total=False):
     enforce_quality_gate: bool
     quality_gate_passed: bool
     quality_gate_report: str
+    adaptive_agent_selection: bool
+    planner_policy_mode: str
+    reviewer_policy_mode: str
+    planner_score_threshold: int
+    reviewer_score_threshold: int
+    review_pending_reason: str
+    planner_policy_last: dict[str, Any]
+    review_policy_last: dict[str, Any]
     test_agent_status: str
     security_authorized: bool
     security_target_url: str

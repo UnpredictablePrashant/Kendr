@@ -7,6 +7,7 @@ from typing import Callable
 StateHandler = Callable[[dict], dict]
 PLUGIN_SDK_VERSION = "1.0"
 PLUGIN_RUNTIME_API = "registry-v1"
+PLUGIN_TYPE_RUNTIME = "runtime_plugin"
 
 
 @dataclass(slots=True)
@@ -49,6 +50,7 @@ class PluginDefinition:
     runtime_api: str = PLUGIN_RUNTIME_API
     entry_point: str = "register"
     kind: str = "builtin"
+    plugin_type: str = PLUGIN_TYPE_RUNTIME
     metadata: dict = field(default_factory=dict)
 
 
@@ -60,6 +62,7 @@ class PluginManifest:
     sdk_version: str = PLUGIN_SDK_VERSION
     runtime_api: str = PLUGIN_RUNTIME_API
     entry_point: str = "register"
+    plugin_type: str = PLUGIN_TYPE_RUNTIME
     compatible_core: str = ""
     capabilities: list[str] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
@@ -75,6 +78,7 @@ class PluginManifest:
             sdk_version=str(raw.get("sdk_version", PLUGIN_SDK_VERSION)).strip() or PLUGIN_SDK_VERSION,
             runtime_api=str(raw.get("runtime_api", PLUGIN_RUNTIME_API)).strip() or PLUGIN_RUNTIME_API,
             entry_point=str(raw.get("entry_point", "register")).strip() or "register",
+            plugin_type=str(raw.get("plugin_type", PLUGIN_TYPE_RUNTIME)).strip() or PLUGIN_TYPE_RUNTIME,
             compatible_core=str(raw.get("compatible_core", "")).strip(),
             capabilities=[
                 str(item).strip()
@@ -99,5 +103,6 @@ class PluginManifest:
             runtime_api=self.runtime_api,
             entry_point=self.entry_point,
             kind=kind,
+            plugin_type=self.plugin_type,
             metadata=extra_metadata,
         )

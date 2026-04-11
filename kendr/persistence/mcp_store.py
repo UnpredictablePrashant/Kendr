@@ -16,11 +16,47 @@ from hashlib import sha1
 from typing import Any
 
 from .core import DB_PATH, _connect, initialize_db, resolve_db_path
+from kendr.secret_store import build_secret_ref, delete_secret, get_secret, is_secret_ref, put_secret
 
 _log = logging.getLogger("kendr.persistence.mcp_store")
 
-_REGISTRY_JSON = os.path.join(os.path.expanduser("~"), ".kendr", "mcp.json")
-_LEGACY_JSON = os.path.join(os.path.expanduser("~"), ".kendr", "mcp_registry.json")
+
+def _kendr_home_dir() -> str:
+    root = str(os.getenv("KENDR_HOME", "")).strip()
+    if root:
+        return str(os.path.expanduser(root))
+    return os.path.join(os.path.expanduser("~"), ".kendr")
+
+
+def _mcp_auth_ref(server_id: str) -> str:
+    return build_secret_ref("mcp", server_id, "auth_token")
+
+
+def _store_mcp_auth_token(server_id: str, auth_token: str) -> str:
+    token = str(auth_token or "").strip()
+    if not token:
+        return ""
+    if is_secret_ref(token):
+        return token
+    ref = _mcp_auth_ref(server_id)
+    put_secret(ref, token)
+    return ref
+
+
+def _resolve_mcp_auth_token(server_id: str, raw_auth_token: str, db_path: str) -> str:
+    token = str(raw_auth_token or "").strip()
+    if not token:
+        return ""
+    if is_secret_ref(token):
+        value = get_secret(token, default="")
+        return str(value or "")
+    try:
+        ref = _store_mcp_auth_token(server_id, token)
+        with _connect(db_path) as conn:
+            conn.execute("UPDATE mcp_servers SET auth_token=? WHERE server_id=?", (ref, server_id))
+        return token
+    except Exception:
+        return token
 
 
 def _unwrap_fastmcp_command(command: str, args: list[Any]) -> tuple[str, str] | None:
@@ -51,12 +87,14 @@ def _unwrap_fastmcp_connection(connection: str) -> tuple[str, str] | None:
 def _migrated_flag_path(db_path: str) -> str:
     resolved = resolve_db_path(db_path)
     digest = sha1(resolved.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
-    return os.path.join(os.path.expanduser("~"), ".kendr", f"mcp_migrated_{digest}.flag")
+    return os.path.join(_kendr_home_dir(), f"mcp_migrated_{digest}.flag")
 
 
 def _registry_json_candidates() -> list[str]:
+    registry_json = os.path.join(_kendr_home_dir(), "mcp.json")
+    legacy_json = os.path.join(_kendr_home_dir(), "mcp_registry.json")
     candidates = []
-    for path in (_REGISTRY_JSON, _LEGACY_JSON):
+    for path in (registry_json, legacy_json):
         if path not in candidates:
             candidates.append(path)
     return candidates
@@ -165,8 +203,6 @@ def _registry_payload_from_rows(rows: list[dict]) -> dict:
         entry["disabled"] = not bool(row.get("enabled", True))
         if row.get("description"):
             entry["description"] = str(row.get("description") or "")
-        if row.get("auth_token"):
-            entry["auth_token"] = str(row.get("auth_token") or "")
         mcp_servers[key] = entry
     return {"mcpServers": mcp_servers}
 
@@ -175,7 +211,7 @@ def _write_registry_payload(db_path: str = DB_PATH) -> None:
     initialize_db(db_path)
     with _connect(db_path) as conn:
         rows = conn.execute("SELECT * FROM mcp_servers ORDER BY LOWER(name)").fetchall()
-    payload = _registry_payload_from_rows([_row_to_dict(r) for r in rows])
+    payload = _registry_payload_from_rows([_row_to_dict(r, db_path=db_path) for r in rows])
     for path in _registry_json_candidates():
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -244,7 +280,7 @@ def _sync_db_from_registry_json(db_path: str = DB_PATH) -> None:
                         entry["type"],
                         entry["connection"],
                         entry["description"],
-                        entry["auth_token"],
+                        _store_mcp_auth_token(server_id, entry["auth_token"]) if entry["auth_token"] else str(existing_by_id[server_id]["auth_token"] or ""),
                         1 if entry["enabled"] else 0,
                         server_id,
                     ),
@@ -264,7 +300,7 @@ def _sync_db_from_registry_json(db_path: str = DB_PATH) -> None:
                         entry["type"],
                         entry["connection"],
                         entry["description"],
-                        entry["auth_token"],
+                        _store_mcp_auth_token(server_id, entry["auth_token"]),
                         1 if entry["enabled"] else 0,
                         now,
                     ),
@@ -297,7 +333,7 @@ def is_default_server(server_id: str) -> bool:
     return str(server_id) in _DEFAULT_SERVER_IDS
 
 
-def _row_to_dict(row) -> dict:
+def _row_to_dict(row, *, db_path: str = DB_PATH) -> dict:
     d = dict(row)
     tools_json = d.pop("tools_json", "[]") or "[]"
     try:
@@ -307,6 +343,7 @@ def _row_to_dict(row) -> dict:
     d["enabled"] = bool(d.get("enabled", 1))
     d["tool_count"] = d.get("tool_count", 0) or 0
     d["id"] = d.pop("server_id")
+    d["auth_token"] = _resolve_mcp_auth_token(d["id"], str(d.get("auth_token", "") or ""), db_path)
     d["is_default"] = d["id"] in _DEFAULT_SERVER_IDS
     return d
 
@@ -315,7 +352,8 @@ def _maybe_migrate(db_path: str = DB_PATH) -> None:
     migrated_flag = _migrated_flag_path(db_path)
     if os.path.exists(migrated_flag):
         return
-    if not os.path.isfile(_LEGACY_JSON):
+    legacy_json = os.path.join(_kendr_home_dir(), "mcp_registry.json")
+    if not os.path.isfile(legacy_json):
         try:
             os.makedirs(os.path.dirname(migrated_flag), exist_ok=True)
             open(migrated_flag, "w").close()
@@ -323,7 +361,7 @@ def _maybe_migrate(db_path: str = DB_PATH) -> None:
             pass
         return
     try:
-        with open(_LEGACY_JSON, "r", encoding="utf-8") as fh:
+        with open(legacy_json, "r", encoding="utf-8") as fh:
             legacy = json.load(fh)
         servers = legacy.get("servers", {})
         if servers:
@@ -351,7 +389,7 @@ def _maybe_migrate(db_path: str = DB_PATH) -> None:
                             srv.get("type", "http"),
                             srv.get("connection", ""),
                             srv.get("description", ""),
-                            srv.get("auth_token", ""),
+                            _store_mcp_auth_token(sid, str(srv.get("auth_token", "") or "")),
                             1 if srv.get("enabled", True) else 0,
                             json.dumps(srv.get("tools", [])),
                             srv.get("tool_count", 0),
@@ -378,7 +416,7 @@ def _seed_default_servers(db_path: str = DB_PATH) -> None:
     If the user later removes an entry it will NOT be re-added (the seed flag
     for that id is written after insertion).
     """
-    seed_flag_dir = os.path.join(os.path.expanduser("~"), ".kendr")
+    seed_flag_dir = _kendr_home_dir()
     os.makedirs(seed_flag_dir, exist_ok=True)
 
     initialize_db(db_path)
@@ -415,7 +453,7 @@ def _seed_default_servers(db_path: str = DB_PATH) -> None:
                     server["type"],
                     server["connection"],
                     server["description"],
-                    server["auth_token"],
+                    _store_mcp_auth_token(sid, server["auth_token"]),
                     1 if server["enabled"] else 0,
                     now,
                 ),
@@ -444,7 +482,7 @@ def list_mcp_servers(db_path: str = DB_PATH) -> list[dict]:
         rows = conn.execute(
             "SELECT * FROM mcp_servers ORDER BY LOWER(name)"
         ).fetchall()
-    return [_row_to_dict(r) for r in rows]
+    return [_row_to_dict(r, db_path=db_path) for r in rows]
 
 
 def get_mcp_server(server_id: str, db_path: str = DB_PATH) -> dict | None:
@@ -456,7 +494,7 @@ def get_mcp_server(server_id: str, db_path: str = DB_PATH) -> dict | None:
         row = conn.execute(
             "SELECT * FROM mcp_servers WHERE server_id=?", (server_id,)
         ).fetchone()
-    return _row_to_dict(row) if row else None
+    return _row_to_dict(row, db_path=db_path) if row else None
 
 
 def add_mcp_server(
@@ -487,7 +525,7 @@ def add_mcp_server(
                 server_type,
                 connection,
                 description,
-                auth_token,
+                _store_mcp_auth_token(server_id, auth_token),
                 1 if enabled else 0,
                 now,
             ),
@@ -499,10 +537,15 @@ def add_mcp_server(
 def remove_mcp_server(server_id: str, db_path: str = DB_PATH) -> bool:
     initialize_db(db_path)
     with _connect(db_path) as conn:
+        row = conn.execute("SELECT auth_token FROM mcp_servers WHERE server_id=?", (server_id,)).fetchone()
+    old_value = str(row["auth_token"] or "") if row else ""
+    with _connect(db_path) as conn:
         changed = conn.execute(
             "DELETE FROM mcp_servers WHERE server_id=?", (server_id,)
         ).rowcount
     if changed > 0:
+        if is_secret_ref(old_value):
+            delete_secret(old_value)
         _write_registry_payload(db_path)
     return changed > 0
 

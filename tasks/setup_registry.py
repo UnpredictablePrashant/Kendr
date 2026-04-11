@@ -63,6 +63,13 @@ def load_token_store() -> dict:
     if providers:
         return providers
     data = _read_json(TOKEN_STORE_PATH, {})
+    if isinstance(data, dict):
+        for provider, payload in data.items():
+            if isinstance(payload, dict):
+                try:
+                    set_setup_provider_tokens(provider, payload, updated_at=str(_now_ts()))
+                except Exception:
+                    pass
     return data if isinstance(data, dict) else {}
 
 
@@ -71,7 +78,8 @@ def save_token_store(data: dict) -> None:
         for provider, payload in data.items():
             if isinstance(payload, dict):
                 set_setup_provider_tokens(provider, payload, updated_at=str(_now_ts()))
-    _write_json(TOKEN_STORE_PATH, data)
+    # Legacy JSON token persistence is intentionally disabled so secrets do not
+    # remain duplicated on disk outside the dedicated secret store.
 
 
 def get_provider_tokens(provider: str) -> dict:
@@ -80,15 +88,17 @@ def get_provider_tokens(provider: str) -> dict:
         return db_payload if isinstance(db_payload, dict) else {}
     data = load_token_store()
     provider_payload = data.get(provider, {})
+    if isinstance(provider_payload, dict) and provider_payload:
+        try:
+            set_setup_provider_tokens(provider, provider_payload, updated_at=str(_now_ts()))
+        except Exception:
+            pass
     return provider_payload if isinstance(provider_payload, dict) else {}
 
 
 def set_provider_tokens(provider: str, tokens: dict) -> dict:
-    data = load_token_store()
     merged = {**get_provider_tokens(provider), **tokens}
-    data[provider] = merged
     set_setup_provider_tokens(provider, merged, updated_at=str(_now_ts()))
-    save_token_store(data)
     return merged
 
 

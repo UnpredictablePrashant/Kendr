@@ -239,7 +239,7 @@ def normalize_plan_data(raw_plan: Any, objective: str) -> dict[str, Any]:
     fallback = {
         "needs_clarification": False,
         "clarification_questions": [],
-        "summary": "Build the work in reviewed stages and verify each major milestone before final delivery.",
+        "summary": "Build the work in clear execution stages and validate outputs against the objective.",
         "steps": [
             {
                 "id": "step-1",
@@ -250,17 +250,6 @@ def normalize_plan_data(raw_plan: Any, objective: str) -> dict[str, Any]:
                 "parallel_group": "",
                 "success_criteria": "Produce a complete draft that addresses the full objective.",
                 "rationale": "Create the main deliverable.",
-                "substeps": [],
-            },
-            {
-                "id": "step-2",
-                "title": "Quality review",
-                "agent": "reviewer_agent",
-                "task": "Review the deliverable against the objective and require revisions if needed.",
-                "depends_on": ["step-1"],
-                "parallel_group": "",
-                "success_criteria": "Approve only if the output is complete and accurate.",
-                "rationale": "Prevent incomplete final output.",
                 "substeps": [],
             },
         ],
@@ -382,7 +371,7 @@ def _planning_context(state: dict, objective: str) -> str:
         "objective": objective,
         "current_objective": state.get("current_objective", ""),
         "available_agents": state.get("available_agents", []),
-        "skill_registry_hints": state.get("plan_agent_hints", []),
+        "agent_routing_hints": state.get("plan_agent_hints", []),
         "local_drive_paths": state.get("local_drive_paths", []),
         "local_drive_summary": str(state.get("local_drive_summary", "")).strip()[:6000],
         "long_document_mode": bool(state.get("long_document_mode", False)),
@@ -429,6 +418,7 @@ STEP LIMITS — strictly enforced:
 - "success_criteria": ONE short phrase describing the observable output (e.g. "Python file with passing tests", "JSON list of 5 competitors"). Not a paragraph.
 - Do NOT include "rationale" in steps — it wastes tokens and adds no value.
 - Do NOT assign planner_agent as a step agent. Planning is separate from execution.
+- Do NOT add reviewer_agent as a default step. Use reviewer_agent only for explicitly high-risk validation gates (security/compliance/destructive ops/final production verification).
 - Do not start execution. Only plan.
 
 STEP STATUS LIFECYCLE — each step starts as "pending". The runtime will:
@@ -442,7 +432,7 @@ CLARIFICATION POLICY — be very strict:
 - For ALL content/research/writing: assume and proceed. State assumptions in "summary". NEVER stop for content decisions.
 - When in doubt, assume and proceed. Asking unnecessary questions is a serious failure.
 
-AGENT ROUTING — the planning context has "skill_registry_hints" pre-computed by the skill registry. Treat as strong suggestions. Fallback intent keywords:
+AGENT ROUTING — the planning context has "agent_routing_hints" pre-computed by the agent routing index. Treat as strong suggestions. Fallback intent keywords:
 - github_agent: repo, PR, commit, branch, git, issue, fork
 - coding_agent / master_coding_agent: write code, implement, generate code, fix bug, refactor
 - aws_automation_agent: AWS, EC2, S3, Lambda, CloudFormation, IAM
