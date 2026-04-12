@@ -12102,7 +12102,7 @@ strong { color: var(--text); }
         if path.startswith("/api/marketplace/skills/"):
             rest = path[len("/api/marketplace/skills/"):]
             action = rest.rsplit("/", 1)[-1] if "/" in rest else ""
-            if action in {"install", "uninstall", "test", "edit", "delete"}:
+            if action in {"install", "uninstall", "test", "approve", "revoke-approval", "edit", "delete"}:
                 status, data = _gateway_forward_json("POST", f"/api/marketplace/skills/{rest}", payload=body, timeout=10.0)
                 self._json(status, data)
                 return

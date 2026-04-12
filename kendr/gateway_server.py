@@ -36,12 +36,15 @@ from kendr.capability_sync import sync_mcp_capabilities
 from kendr.openapi_importer import import_openapi_as_capabilities, parse_openapi_payload
 from kendr.skill_manager import (
     get_marketplace,
+    grant_skill_approval,
     install_catalog_skill,
     uninstall_catalog_skill,
     create_custom_skill,
     edit_custom_skill,
+    list_skill_approval_grants,
     list_runtime_skills,
     remove_custom_skill,
+    revoke_skill_approval,
     resolve_runtime_skill,
     test_skill,
 )
@@ -560,6 +563,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/api/marketplace/skills/"):
             skill_id = parsed.path.split("/api/marketplace/skills/", 1)[1].strip()
+            if skill_id.endswith("/approvals"):
+                resolved_skill_id = skill_id.rsplit("/approvals", 1)[0].strip()
+                params = parse_qs(parsed.query or "")
+                session_id = str((params.get("session_id") or [""])[0] or "").strip()
+                status = str((params.get("status") or [""])[0] or "").strip()
+                items = list_skill_approval_grants(skill_id=resolved_skill_id, session_id=session_id, status=status)
+                self._send_json(200, {"items": items, "count": len(items)})
+                return
             if skill_id:
                 row = resolve_runtime_skill(skill_id=skill_id)
                 if row:
@@ -879,10 +890,48 @@ class GatewayHandler(BaseHTTPRequestHandler):
                     skill_id,
                     payload.get("inputs", payload),
                     approval=payload.get("approval") if isinstance(payload.get("approval"), dict) else None,
+                    session_id=str(payload.get("session_id", "") or "").strip(),
                 )
-                self._send_json(200, result)
+                if result.get("error_type") == "approval_required":
+                    self._send_json(409, result)
+                else:
+                    self._send_json(200, result)
             except Exception as exc:
                 self._send_json(500, {"success": False, "error": str(exc)})
+            return
+        if self.path.startswith("/api/marketplace/skills/") and self.path.endswith("/approve"):
+            skill_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/approve", 1)[0].strip()
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            try:
+                grant = grant_skill_approval(
+                    skill_id=skill_id,
+                    scope=str(payload.get("scope", "once") or "once").strip(),
+                    note=str(payload.get("note", "") or "").strip(),
+                    actor=str(payload.get("actor", "user") or "user").strip(),
+                    session_id=str(payload.get("session_id", "") or "").strip(),
+                )
+                self._send_json(200, {"ok": True, "grant": grant})
+            except Exception as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            return
+        if self.path.startswith("/api/marketplace/skills/") and self.path.endswith("/revoke-approval"):
+            skill_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/revoke-approval", 1)[0].strip()
+            payload, err = self._read_json_body()
+            if payload is None:
+                self._send_json(400, {"error": "invalid_json", "detail": err})
+                return
+            grant_id = str(payload.get("grant_id", "") or "").strip()
+            if not skill_id or not grant_id:
+                self._send_json(400, {"ok": False, "error": "grant_id_required"})
+                return
+            grant = revoke_skill_approval(grant_id=grant_id)
+            if grant:
+                self._send_json(200, {"ok": True, "grant": grant})
+            else:
+                self._send_json(404, {"ok": False, "error": "grant_not_found"})
             return
         if self.path.startswith("/api/marketplace/skills/") and self.path.endswith("/edit"):
             skill_id = self.path.split("/api/marketplace/skills/", 1)[1].rsplit("/edit", 1)[0].strip()

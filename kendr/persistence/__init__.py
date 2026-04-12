@@ -95,6 +95,14 @@ from .skill_store import (
     set_skill_installed,
     update_user_skill,
 )
+from .approval_store import (
+    consume_approval_grant,
+    create_approval_grant,
+    find_matching_approval_grant,
+    get_approval_grant,
+    list_approval_grants,
+    revoke_approval_grant,
+)
 from .assistant_store import (
     create_assistant,
     delete_assistant,
@@ -185,6 +193,12 @@ __all__ = [
     "list_user_skills",
     "set_skill_installed",
     "update_user_skill",
+    "consume_approval_grant",
+    "create_approval_grant",
+    "find_matching_approval_grant",
+    "get_approval_grant",
+    "list_approval_grants",
+    "revoke_approval_grant",
     "create_assistant",
     "delete_assistant",
     "get_assistant",

@@ -18,22 +18,29 @@ from datetime import datetime, timezone
 from typing import Any
 
 from kendr.extension_permissions import (
-    ensure_manifest_approval,
     merge_permissions_into_metadata,
     normalize_approval,
+    permission_manifest_hash,
     permission_manifest_from_metadata,
+    permission_manifest_items,
     summarize_permission_manifest,
 )
 from kendr.persistence import (
+    consume_approval_grant,
+    create_approval_grant,
     create_user_skill,
     delete_user_skill,
+    find_matching_approval_grant,
     get_user_skill,
     insert_privileged_audit_event,
+    list_approval_grants,
     list_user_skills,
+    revoke_approval_grant,
     set_skill_installed,
     update_user_skill,
 )
 from kendr.skill_catalog import CATALOG_BY_ID, list_catalog_skills, catalog_categories
+from kendr.workflow_contract import approval_request_to_text, build_approval_request
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +58,7 @@ def get_marketplace(q: str = "", category: str = "") -> dict:
         slug = item["id"]
         installed_row = installed_rows.get(slug)
         core_row = _build_core_skill_row(slug)
-        effective_row = installed_row or core_row
+        effective_row = resolve_runtime_skill(skill_id=str(installed_row.get("skill_id", ""))) if installed_row else core_row
         item["is_core"] = bool(item.get("is_core", False))
         item["is_installed"] = installed_row is not None or core_row is not None
         item["skill_id"] = effective_row["skill_id"] if effective_row else None
@@ -84,7 +91,13 @@ def get_marketplace(q: str = "", category: str = "") -> dict:
 
 def _catalog_metadata(entry, *, existing_metadata: dict | None = None) -> dict:
     base = dict(existing_metadata or {})
-    existing_permissions = base.pop("permissions", None) if isinstance(base.get("permissions"), dict) else None
+    raw_permissions = base.pop("permissions", None) if isinstance(base.get("permissions"), dict) else None
+    existing_permissions = raw_permissions if isinstance(raw_permissions, dict) and raw_permissions else None
+    if bool(getattr(entry, "core", False)):
+        # Core catalog permissions are owned by the catalog definition, not
+        # persisted rows. Installed rows can carry stale normalized manifests
+        # from older versions, which should not override current core policy.
+        existing_permissions = None
     if entry.requires_config:
         base.setdefault("requires_config", list(entry.requires_config))
     if getattr(entry, "core", False):
@@ -149,7 +162,13 @@ def resolve_runtime_skill(*, skill_id: str = "", slug: str = "") -> dict | None:
 
 def list_runtime_skills() -> list[dict]:
     rows = list_user_skills(is_installed=True)
-    by_slug = {str(row.get("slug", "")).strip(): dict(row) for row in rows if str(row.get("slug", "")).strip()}
+    by_slug: dict[str, dict] = {}
+    for row in rows:
+        slug = str(row.get("slug", "")).strip()
+        if not slug:
+            continue
+        resolved = resolve_runtime_skill(skill_id=str(row.get("skill_id", "")).strip()) or dict(row)
+        by_slug[slug] = resolved
     for catalog_id, entry in CATALOG_BY_ID.items():
         if bool(getattr(entry, "core", False)) and catalog_id not in by_slug:
             core_row = _build_core_skill_row(catalog_id)
@@ -327,6 +346,199 @@ def _record_permission_event(skill_label: str, *, action: str, status: str, deta
         pass
 
 
+class SkillApprovalRequired(RuntimeError):
+    def __init__(self, payload: dict):
+        self.payload = payload
+        super().__init__(str(payload.get("error", "approval_required")))
+
+
+def _skill_subject_id(row: dict) -> str:
+    slug = str(row.get("slug", "") or row.get("skill_id", "")).strip()
+    return f"skill:{slug}"
+
+
+def _skill_manifest_hash(manifest: dict) -> str:
+    return permission_manifest_hash(manifest)
+
+
+def _skill_grant_metadata(row: dict, manifest: dict) -> dict:
+    return {
+        "skill_id": str(row.get("skill_id", "")).strip(),
+        "skill_slug": str(row.get("slug", "")).strip(),
+        "skill_name": str(row.get("name", "")).strip(),
+        "manifest_summary": summarize_permission_manifest(manifest),
+    }
+
+
+def _build_skill_approval_payload(row: dict, manifest: dict, *, session_id: str = "") -> dict:
+    summary_items = permission_manifest_items(manifest)
+    skill_name = str(row.get("name", row.get("slug", "Skill"))).strip() or "Skill"
+    scope = f"skill_permission:{row.get('slug', row.get('skill_id', 'unknown'))}"
+    manifest_hash = _skill_manifest_hash(manifest)
+    request = build_approval_request(
+        scope=scope,
+        title=f"Approve skill execution for {skill_name}",
+        summary=f"{skill_name} requires approval before execution because it requests elevated permissions.",
+        sections=[
+            {"title": "Requested permissions", "items": summary_items},
+            {"title": "Grant options", "items": ["Allow once", "Allow for this session", "Always allow for this manifest"]},
+        ],
+        help_text="Create a grant with scope once, session, or always to continue.",
+        metadata={
+            "approval_mode": "skill_permission_grant",
+            "subject_type": "skill",
+            "subject_id": _skill_subject_id(row),
+            "manifest_hash": manifest_hash,
+            "skill_id": str(row.get("skill_id", "")).strip(),
+            "skill_slug": str(row.get("slug", "")).strip(),
+            "suggested_scopes": ["once", "session", "always"],
+            "session_id": str(session_id or "").strip(),
+            "permission_summary": summarize_permission_manifest(manifest),
+        },
+    )
+    return {
+        "success": False,
+        "error_type": "approval_required",
+        "error": f"{skill_name} requires explicit approval before execution.",
+        "awaiting_user_input": True,
+        "pending_user_input_kind": "skill_approval",
+        "approval_pending_scope": scope,
+        "approval_request": request,
+        "pending_user_question": approval_request_to_text(request),
+        "skill_id": str(row.get("skill_id", "")).strip(),
+        "skill_slug": str(row.get("slug", "")).strip(),
+        "manifest_hash": manifest_hash,
+        "permission_manifest": manifest,
+        "permission_summary": summarize_permission_manifest(manifest),
+    }
+
+
+def grant_skill_approval(
+    *,
+    skill_id: str = "",
+    slug: str = "",
+    scope: str,
+    note: str,
+    actor: str = "user",
+    session_id: str = "",
+) -> dict:
+    row = resolve_runtime_skill(skill_id=skill_id, slug=slug)
+    if not row:
+        raise ValueError("skill_not_found")
+    manifest = permission_manifest_from_metadata(
+        row.get("metadata", {}),
+        skill_type=str(row.get("skill_type", "") or ""),
+        catalog_id=str(row.get("catalog_id", "") or ""),
+        cwd=_default_execution_cwd(),
+    )
+    normalized_scope = str(scope or "once").strip().lower()
+    if normalized_scope not in {"once", "session", "always"}:
+        raise ValueError("scope must be one of: once, session, always")
+    if not str(note or "").strip():
+        raise ValueError("approval note is required")
+    grant = create_approval_grant(
+        subject_type="skill",
+        subject_id=_skill_subject_id(row),
+        manifest_hash=_skill_manifest_hash(manifest),
+        scope=normalized_scope,
+        actor=str(actor or "user").strip() or "user",
+        note=str(note or "").strip(),
+        session_id=str(session_id or "").strip(),
+        permissions=manifest,
+        metadata=_skill_grant_metadata(row, manifest),
+    )
+    _record_permission_event(
+        f"skill:{row.get('slug', row.get('skill_id', 'unknown'))}",
+        action="approval_grant_created",
+        status="approved",
+        detail={"grant": grant, "scope": normalized_scope},
+    )
+    return grant
+
+
+def list_skill_approval_grants(*, skill_id: str = "", slug: str = "", session_id: str = "", status: str = "") -> list[dict]:
+    row = resolve_runtime_skill(skill_id=skill_id, slug=slug)
+    if not row:
+        return []
+    return list_approval_grants(
+        subject_type="skill",
+        subject_id=_skill_subject_id(row),
+        session_id=str(session_id or "").strip(),
+        status=str(status or "").strip(),
+    )
+
+
+def revoke_skill_approval(*, grant_id: str) -> dict | None:
+    grant = revoke_approval_grant(grant_id)
+    if grant:
+        _record_permission_event(
+            str(grant.get("subject_id", "skill")),
+            action="approval_grant_revoked",
+            status="ok",
+            detail={"grant_id": grant_id},
+        )
+    return grant
+
+
+def _resolve_skill_execution_approval(row: dict, manifest: dict, approval: dict | None, *, session_id: str = "") -> tuple[dict | None, dict | None]:
+    normalized = normalize_approval(approval)
+    if not manifest.get("requires_approval", False):
+        return normalized if isinstance(approval, dict) else None, None
+
+    if normalized.get("approved", False):
+        if not str(normalized.get("note", "") or "").strip():
+            raise SkillApprovalRequired(_build_skill_approval_payload(row, manifest, session_id=session_id))
+        scope = str((approval or {}).get("scope", "once") or "once").strip().lower()
+        grant = create_approval_grant(
+            subject_type="skill",
+            subject_id=_skill_subject_id(row),
+            manifest_hash=_skill_manifest_hash(manifest),
+            scope=scope if scope in {"once", "session", "always"} else "once",
+            actor=str(normalized.get("actor", "user") or "user").strip() or "user",
+            note=str(normalized.get("note", "") or "").strip(),
+            session_id=str(session_id or (approval or {}).get("session_id", "") or "").strip(),
+            permissions=manifest,
+            metadata=_skill_grant_metadata(row, manifest),
+        )
+        if str(grant.get("scope", "")).strip().lower() == "once":
+            grant = consume_approval_grant(grant["grant_id"]) or grant
+        approved = {
+            "approved": True,
+            "note": grant.get("note", ""),
+            "actor": grant.get("actor", "user"),
+            "scope": grant.get("scope", "once"),
+            "grant_id": grant.get("grant_id", ""),
+            "grant_source": "explicit",
+        }
+        return approved, grant
+
+    grant = find_matching_approval_grant(
+        subject_type="skill",
+        subject_id=_skill_subject_id(row),
+        manifest_hash=_skill_manifest_hash(manifest),
+        session_id=str(session_id or "").strip(),
+    )
+    if grant:
+        consumed = consume_approval_grant(grant["grant_id"]) or grant
+        approved = {
+            "approved": True,
+            "note": consumed.get("note", ""),
+            "actor": consumed.get("actor", "user"),
+            "scope": consumed.get("scope", "once"),
+            "grant_id": consumed.get("grant_id", ""),
+            "grant_source": "stored",
+        }
+        _record_permission_event(
+            f"skill:{row.get('slug', row.get('skill_id', 'unknown'))}",
+            action="approval_grant_consumed",
+            status="approved",
+            detail={"grant_id": consumed.get("grant_id", ""), "scope": consumed.get("scope", "")},
+        )
+        return approved, consumed
+
+    raise SkillApprovalRequired(_build_skill_approval_payload(row, manifest, session_id=session_id))
+
+
 def _strip_execution_control(inputs: dict) -> tuple[dict, dict | None]:
     payload = dict(inputs or {})
     approval = payload.pop("_approval", None)
@@ -493,7 +705,7 @@ def _run_catalog_skill(catalog_id: str, inputs: dict, *, permission_manifest: di
         return {"output": None, "stdout": "", "stderr": "", "success": False, "error": traceback.format_exc()}
 
 
-def test_skill(skill_id: str, inputs: dict, *, approval: dict | None = None) -> dict:
+def test_skill(skill_id: str, inputs: dict, *, approval: dict | None = None, session_id: str = "") -> dict:
     """Run a skill with the provided inputs and return the execution result."""
     row = resolve_runtime_skill(skill_id=skill_id)
     if not row:
@@ -510,43 +722,45 @@ def test_skill(skill_id: str, inputs: dict, *, approval: dict | None = None) -> 
         cwd=_default_execution_cwd(),
     )
     skill_label = f"skill:{row.get('slug', row.get('skill_id', 'unknown'))}"
+    try:
+        resolved_approval, _grant = _resolve_skill_execution_approval(
+            row,
+            permission_manifest,
+            effective_approval,
+            session_id=str(session_id or "").strip(),
+        )
+    except SkillApprovalRequired as exc:
+        _record_permission_event(
+            skill_label,
+            action="skill_approval_requested",
+            status="blocked",
+            detail={"approval_request": exc.payload.get("approval_request", {}), "manifest_hash": exc.payload.get("manifest_hash", "")},
+        )
+        return exc.payload
 
     if skill_type == "python":
-        return _run_python_skill(code, safe_inputs, permission_manifest=permission_manifest, approval=effective_approval, skill_label=skill_label)
+        return _run_python_skill(code, safe_inputs, permission_manifest=permission_manifest, approval=resolved_approval, skill_label=skill_label)
     elif skill_type == "prompt":
-        try:
-            ensure_manifest_approval(permission_manifest, effective_approval, capability="Prompt skill")
-        except PermissionError as exc:
-            _record_permission_event(
-                skill_label,
-                action="prompt_skill_execution",
-                status="blocked",
-                detail={
-                    "error": str(exc),
-                    "permissions": summarize_permission_manifest(permission_manifest),
-                },
-            )
-            return {"output": None, "stdout": "", "stderr": "", "success": False, "error": str(exc)}
         return _run_prompt_skill(code, safe_inputs)
     elif skill_type == "catalog":
         return _run_catalog_skill(
             row.get("catalog_id", ""),
             safe_inputs,
             permission_manifest=permission_manifest,
-            approval=effective_approval,
+            approval=resolved_approval,
         )
     else:
         return {"success": False, "error": f"Unknown skill_type: {skill_type!r}"}
 
 
-def execute_skill_by_slug(slug: str, inputs: dict, *, approval: dict | None = None) -> dict:
+def execute_skill_by_slug(slug: str, inputs: dict, *, approval: dict | None = None, session_id: str = "") -> dict:
     """Public API for agents to call a skill by its slug."""
     row = resolve_runtime_skill(slug=slug)
     if not row:
         return {"success": False, "error": f"Skill '{slug}' not found or not installed."}
     if not row.get("is_installed"):
         return {"success": False, "error": f"Skill '{slug}' is not installed."}
-    return test_skill(row["skill_id"], inputs, approval=approval)
+    return test_skill(row["skill_id"], inputs, approval=approval, session_id=session_id)
 
 
 # ---------------------------------------------------------------------------

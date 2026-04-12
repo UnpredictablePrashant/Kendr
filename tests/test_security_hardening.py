@@ -7,6 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from kendr.persistence.approval_store import (
+    consume_approval_grant,
+    create_approval_grant,
+    find_matching_approval_grant,
+)
 from kendr.persistence.mcp_store import add_mcp_server, get_mcp_server, _registry_payload_from_rows
 from kendr.persistence.setup_store import (
     get_setup_config_value,
@@ -16,7 +21,7 @@ from kendr.persistence.setup_store import (
     set_setup_provider_tokens,
     upsert_setup_config_value,
 )
-from kendr.skill_manager import _run_python_skill, execute_skill_by_slug, get_marketplace, test_skill
+from kendr.skill_manager import _run_python_skill, execute_skill_by_slug, get_marketplace, grant_skill_approval, test_skill
 
 
 class SecretStorageTests(unittest.TestCase):
@@ -89,6 +94,50 @@ class SecretStorageTests(unittest.TestCase):
                 self.assertEqual(server["auth_token"], "super-secret-token")
                 payload = _registry_payload_from_rows([server])
                 self.assertNotIn("auth_token", payload["mcpServers"]["Secure MCP"])
+
+
+class ApprovalGrantStoreTests(unittest.TestCase):
+    def test_session_grant_matches_and_once_grant_is_consumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = str(Path(tmp) / "agent_workflow.sqlite3")
+            once = create_approval_grant(
+                subject_type="skill",
+                subject_id="skill:demo",
+                manifest_hash="hash-1",
+                scope="once",
+                actor="user",
+                note="Allow once",
+                db_path=db_path,
+            )
+            session = create_approval_grant(
+                subject_type="skill",
+                subject_id="skill:demo",
+                manifest_hash="hash-2",
+                scope="session",
+                actor="user",
+                note="Allow session",
+                session_id="sess-1",
+                db_path=db_path,
+            )
+
+            matched_once = find_matching_approval_grant(
+                subject_type="skill",
+                subject_id="skill:demo",
+                manifest_hash="hash-1",
+                db_path=db_path,
+            )
+            consumed_once = consume_approval_grant(once["grant_id"], db_path=db_path)
+            matched_session = find_matching_approval_grant(
+                subject_type="skill",
+                subject_id="skill:demo",
+                manifest_hash="hash-2",
+                session_id="sess-1",
+                db_path=db_path,
+            )
+
+        self.assertEqual(matched_once["grant_id"], once["grant_id"])
+        self.assertEqual(consumed_once["status"], "used")
+        self.assertEqual(matched_session["grant_id"], session["grant_id"])
 
 
 class ExtensionHostIsolationTests(unittest.TestCase):
@@ -236,6 +285,81 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         self.assertTrue(web_search["is_core"])
         self.assertTrue(web_search["is_installed"])
         self.assertEqual(web_search["skill_id"], "core:web-search")
+
+    def test_marketplace_uses_catalog_permissions_for_installed_core_skill(self):
+        stale_installed = {
+            "skill_id": "installed-web-search",
+            "slug": "web-search",
+            "name": "Web Search",
+            "skill_type": "catalog",
+            "catalog_id": "web-search",
+            "metadata": {
+                "permissions": {
+                    "requires_approval": False,
+                    "filesystem": {"read": [], "write": []},
+                    "environment": {"read": []},
+                    "network": {"allow": False, "domains": []},
+                    "shell": {"allow": False, "allow_root": False, "allow_destructive": False},
+                }
+            },
+            "is_installed": True,
+        }
+
+        def _list_user_skills(*args, **kwargs):
+            return [stale_installed]
+
+        with patch("kendr.skill_manager.list_user_skills", side_effect=_list_user_skills):
+            with patch("kendr.skill_manager.get_user_skill", return_value=stale_installed):
+                marketplace = get_marketplace()
+
+        web_search = next(item for item in marketplace["catalog"] if item["id"] == "web-search")
+        self.assertEqual(web_search["skill_id"], "installed-web-search")
+        self.assertTrue(web_search["permission_manifest"]["network"]["allow"])
+        self.assertEqual(web_search["permission_manifest"]["network"]["domains"], ["api.duckduckgo.com"])
+
+    def test_python_skill_returns_structured_approval_request(self):
+        skill_row = {
+            "skill_id": "skill-6",
+            "slug": "approval-demo",
+            "skill_type": "python",
+            "catalog_id": "",
+            "code": "output = 1",
+            "metadata": {},
+            "is_installed": True,
+            "name": "Approval Demo",
+        }
+        with patch("kendr.skill_manager.get_user_skill", return_value=skill_row):
+            result = test_skill("skill-6", {}, session_id="sess-1")
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error_type"], "approval_required")
+        self.assertTrue(result["awaiting_user_input"])
+        self.assertEqual(result["pending_user_input_kind"], "skill_approval")
+        self.assertIn("suggested_scopes", result["approval_request"]["metadata"])
+
+    def test_once_grant_created_via_api_path_is_consumed_by_next_execution(self):
+        skill_row = {
+            "skill_id": "skill-7",
+            "slug": "approval-once-demo",
+            "skill_type": "python",
+            "catalog_id": "",
+            "code": "output = 7",
+            "metadata": {},
+            "is_installed": True,
+            "name": "Approval Once Demo",
+        }
+        with patch("kendr.skill_manager.get_user_skill", return_value=skill_row):
+            grant = grant_skill_approval(
+                skill_id="skill-7",
+                scope="once",
+                note="Allow one execution",
+                session_id="sess-2",
+            )
+            result = test_skill("skill-7", {}, session_id="sess-2")
+
+        self.assertEqual(grant["status"], "active")
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertEqual(result["output"], 7)
 
 
 if __name__ == "__main__":

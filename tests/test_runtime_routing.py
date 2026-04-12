@@ -602,6 +602,34 @@ class RuntimeRoutingTests(unittest.TestCase):
         self.assertEqual(state["long_document_plan_status"], "approved")
         self.assertTrue(state["long_document_execute_from_saved_outline"])
 
+    def test_build_initial_state_preserves_session_id_for_pending_skill_approval(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            prior_state = {
+                "session_id": "session_skill_approval_demo",
+                "last_objective": "Search the web for the latest laptop CPU benchmarks.",
+                "awaiting_user_input": True,
+                "pending_user_input_kind": "skill_approval",
+                "approval_pending_scope": "skill_permission:web-search",
+                "pending_user_question": "Approve skill execution for Web Search.",
+                "approval_request": {
+                    "scope": "skill_permission:web-search",
+                    "metadata": {
+                        "approval_mode": "skill_permission_grant",
+                        "skill_id": "core:web-search",
+                        "skill_slug": "web-search",
+                        "session_id": "session_skill_approval_demo",
+                    },
+                },
+            }
+            state = runtime.build_initial_state("approve for this session", channel_session={"state": prior_state})
+
+        self.assertEqual(state["session_id"], "session_skill_approval_demo")
+        self.assertEqual(state["current_objective"], "Search the web for the latest laptop CPU benchmarks.")
+        self.assertEqual(state["pending_user_input_kind"], "")
+        self.assertEqual(state["approval_pending_scope"], "")
+        self.assertEqual(state["approval_request"], {})
+
     def test_build_initial_state_restores_scope_only_pending_deep_research_confirmation(self):
         with (
             patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),

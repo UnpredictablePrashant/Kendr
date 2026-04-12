@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -187,3 +189,28 @@ def summarize_permission_manifest(manifest: dict) -> dict:
         "network_allowed": bool(network.get("allow", False)),
         "network_domains": _string_list(network.get("domains")),
     }
+
+
+def permission_manifest_hash(manifest: dict) -> str:
+    serialized = json.dumps(normalize_permission_manifest(manifest), sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def permission_manifest_items(manifest: dict) -> list[str]:
+    summary = summarize_permission_manifest(manifest)
+    items: list[str] = []
+    if summary.get("filesystem_read_roots"):
+        items.append(f"Filesystem read roots: {summary['filesystem_read_roots']}")
+    if summary.get("filesystem_write_roots"):
+        items.append(f"Filesystem write roots: {summary['filesystem_write_roots']}")
+    env_keys = summary.get("environment_keys", []) or []
+    if env_keys:
+        items.append("Environment keys: " + ", ".join(env_keys))
+    if summary.get("shell_allowed"):
+        items.append("Shell execution enabled")
+    if summary.get("network_allowed"):
+        domains = summary.get("network_domains", []) or []
+        items.append("Network domains: " + (", ".join(domains) if domains else "any"))
+    if not items:
+        items.append("No elevated permissions declared")
+    return items

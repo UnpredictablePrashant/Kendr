@@ -1948,8 +1948,66 @@ button.status-item:hover { background: rgba(255,255,255,.06); }
   max-height: 320px; overflow-y: auto;
 }
 .kc-modal-prompt .kc-md { font-size: 12px; color: var(--kc-text-muted, #aab0ba); }
+.kc-approval-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.kc-approval-section {
+  background: rgba(255,255,255,.02);
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.kc-approval-section-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--kc-text-muted, #aab0ba);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  margin-bottom: 6px;
+}
+.kc-approval-list {
+  margin: 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--kc-text, #e6edf3);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.kc-approval-help {
+  font-size: 11px;
+  color: var(--kc-text-muted, #aab0ba);
+  line-height: 1.5;
+}
+.kc-approval-note-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.kc-approval-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--kc-text-muted, #aab0ba);
+  text-transform: uppercase;
+  letter-spacing: .08em;
+}
+.kc-approval-error {
+  font-size: 12px;
+  color: var(--kc-crimson, #FF6B6B);
+  background: rgba(255,107,107,.08);
+  border: 1px solid rgba(255,107,107,.24);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
 .kc-modal-quick {
   display: flex; flex-wrap: wrap; gap: 8px;
+}
+.kc-modal-quick--stacked .kc-modal-quick-btn {
+  flex: 1 1 160px;
+  justify-content: center;
 }
 .kc-modal-quick-btn {
   background: rgba(255,179,71,.08); border: 1px solid rgba(255,179,71,.25);
@@ -1957,6 +2015,7 @@ button.status-item:hover { background: rgba(255,255,255,.06); }
   font-size: 12px; font-weight: 500; cursor: pointer; transition: background .15s, color .15s;
 }
 .kc-modal-quick-btn:hover { background: rgba(255,179,71,.15); color: var(--kc-text, #e6edf3); }
+.kc-modal-quick-btn:disabled { opacity: .55; cursor: default; }
 .kc-modal-quick-btn--approve {
   background: rgba(0,201,167,.12); border-color: rgba(0,201,167,.35);
   color: var(--kc-teal, #00C9A7);

@@ -4465,6 +4465,8 @@ Return ONLY valid JSON in this exact schema:
                 initial_state["project_root"] = str(prior_channel_state.get("project_root", "") or "")
             if prior_channel_state.get("project_stack"):
                 initial_state["project_stack"] = str(prior_channel_state.get("project_stack", "") or "")
+            if prior_channel_state.get("session_id"):
+                initial_state["session_id"] = str(prior_channel_state.get("session_id", "") or "").strip() or initial_state.get("session_id", "")
             if prior_channel_state.get("superrag_active_session_id"):
                 initial_state["superrag_active_session_id"] = str(prior_channel_state.get("superrag_active_session_id", "")).strip()
             if prior_channel_state.get("last_objective"):

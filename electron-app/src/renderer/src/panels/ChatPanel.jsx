@@ -515,6 +515,8 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
               workflowId: d.workflow_id || runId,
               prompt: d.pending_user_question || output || 'Waiting for your input.',
               kind:   d.pending_user_input_kind || '',
+              scope: d.approval_pending_scope || '',
+              approvalRequest: d.approval_request || null,
             }
           })
           dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: output, status: 'awaiting', artifacts: d.artifact_files || [] } })
@@ -580,6 +582,36 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     dispatch({ type: 'SET_STREAMING', val: false })
     appDispatch({ type: 'SET_STREAMING', streaming: false })
   }, [chat.activeRunId, chat.messages, apiBase, appDispatch])
+
+  const submitSkillApproval = useCallback(async (scope, note = '') => {
+    const ctx = chat.awaitingContext || {}
+    const request = (ctx.approvalRequest && typeof ctx.approvalRequest === 'object') ? ctx.approvalRequest : {}
+    const metadata = (request.metadata && typeof request.metadata === 'object') ? request.metadata : {}
+    const skillId = String(metadata.skill_id || '').trim()
+    const sessionId = String(metadata.session_id || '').trim()
+    if (!skillId) throw new Error('Missing skill id for approval.')
+
+    const response = await fetch(`${apiBase}/api/marketplace/skills/${encodeURIComponent(skillId)}/approve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        scope,
+        note: String(note || '').trim() || `Approved ${String(metadata.skill_slug || skillId)} from the desktop chat UI (${scope}).`,
+        session_id: sessionId,
+      }),
+    })
+    const data = await response.json().catch(() => ({}))
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || data.detail || response.statusText)
+    }
+
+    const reply = scope === 'always'
+      ? 'approve always'
+      : scope === 'session'
+        ? 'approve for this session'
+        : 'approve once'
+    await send(reply, true)
+  }, [apiBase, chat.awaitingContext, send])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send() }
@@ -723,6 +755,8 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           onChange={setResumeInput}
           onSend={() => send(resumeInput, true)}
           onQuickReply={r => send(r, true)}
+          onSkillApprove={submitSkillApproval}
+          onStop={stopRun}
           onDismiss={() => { dispatch({ type: 'CLEAR_AWAITING' }); setResumeInput('') }}
         />
       )}
@@ -1212,57 +1246,156 @@ function formatTs(ts) {
 }
 
 // ─── Agent Approval Modal ─────────────────────────────────────────────────────
-function AgentApprovalModal({ ctx, value, onChange, onSend, onQuickReply, onDismiss }) {
+function AgentApprovalModal({ ctx, value, onChange, onSend, onQuickReply, onSkillApprove, onStop, onDismiss }) {
   const inputRef = useRef(null)
   const [showSuggest, setShowSuggest] = useState(false)
+  const [approvalNote, setApprovalNote] = useState('')
+  const [approvalBusy, setApprovalBusy] = useState('')
+  const [approvalError, setApprovalError] = useState('')
+
+  const approvalRequest = (ctx?.approvalRequest && typeof ctx.approvalRequest === 'object') ? ctx.approvalRequest : {}
+  const approvalActions = (approvalRequest.actions && typeof approvalRequest.actions === 'object') ? approvalRequest.actions : {}
+  const approvalMetadata = (approvalRequest.metadata && typeof approvalRequest.metadata === 'object') ? approvalRequest.metadata : {}
+  const isSkillApproval = String(ctx?.kind || '').toLowerCase() === 'skill_approval'
+    || String(approvalMetadata.approval_mode || '').toLowerCase() === 'skill_permission_grant'
 
   useEffect(() => {
     if (showSuggest) inputRef.current?.focus()
   }, [showSuggest])
+
+  useEffect(() => {
+    setApprovalNote('')
+    setApprovalBusy('')
+    setApprovalError('')
+    setShowSuggest(false)
+  }, [ctx?.runId, ctx?.scope, ctx?.kind])
 
   const handleKey = (e) => {
     if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); onSend() }
     if (e.key === 'Escape') onDismiss()
   }
 
+  const handleSkillApproval = async (scope) => {
+    if (!onSkillApprove) return
+    setApprovalBusy(scope)
+    setApprovalError('')
+    try {
+      await onSkillApprove(scope, approvalNote)
+    } catch (err) {
+      setApprovalError(err.message || 'Approval failed.')
+    } finally {
+      setApprovalBusy('')
+    }
+  }
+
+  const suggestedScopes = Array.isArray(approvalMetadata.suggested_scopes) && approvalMetadata.suggested_scopes.length
+    ? approvalMetadata.suggested_scopes
+    : ['once', 'session', 'always']
+  const scopeLabels = {
+    once: 'Allow once',
+    session: 'Allow this session',
+    always: 'Always allow',
+  }
+
   return (
-    <div className="kc-modal-overlay" onClick={e => e.target === e.currentTarget && onDismiss()}>
+    <div className="kc-modal-overlay" onClick={e => { if (!isSkillApproval && e.target === e.currentTarget) onDismiss() }}>
       <div className="kc-modal">
         <div className="kc-modal-header">
-          <span className="kc-modal-icon">⏳</span>
-          <span className="kc-modal-title">Agent is waiting for your input</span>
-          <button className="kc-modal-close" onClick={onDismiss}>✕</button>
+          <span className="kc-modal-icon">{isSkillApproval ? '🛡️' : '⏳'}</span>
+          <span className="kc-modal-title">{approvalRequest.title || (isSkillApproval ? 'Skill permission required' : 'Agent is waiting for your input')}</span>
+          {!isSkillApproval && <button className="kc-modal-close" onClick={onDismiss}>✕</button>}
         </div>
-        <div className="kc-modal-prompt">
-          <MarkdownRenderer content={ctx.prompt} />
-        </div>
-        <div className="kc-modal-quick">
-          <button className="kc-modal-quick-btn kc-modal-quick-btn--approve" onClick={() => onQuickReply('approve')}>Approve</button>
-          <button
-            className={`kc-modal-quick-btn kc-modal-quick-btn--suggest${showSuggest ? ' kc-modal-quick-btn--active' : ''}`}
-            onClick={() => { setShowSuggest(v => !v); onChange('') }}
-          >Suggest</button>
-          <button className="kc-modal-quick-btn kc-modal-quick-btn--reject" onClick={() => onQuickReply('cancel')}>Reject</button>
-        </div>
-        {showSuggest && (
-          <div className="kc-modal-input-row">
-            <textarea
-              ref={inputRef}
-              className="kc-modal-input"
-              placeholder="Type your suggestion… (Ctrl+Enter to send)"
-              value={value}
-              onChange={e => onChange(e.target.value)}
-              onKeyDown={handleKey}
-              rows={3}
-            />
-            <button
-              className="kc-modal-send"
-              onClick={onSend}
-              disabled={!value.trim()}
-            >
-              <SendIcon />
-            </button>
+        {(approvalRequest.summary || ctx.prompt) && (
+          <div className="kc-modal-prompt">
+            <MarkdownRenderer content={approvalRequest.summary || ctx.prompt} />
           </div>
+        )}
+        {Array.isArray(approvalRequest.sections) && approvalRequest.sections.length > 0 && (
+          <div className="kc-approval-sections">
+            {approvalRequest.sections.map((section, index) => (
+              <div key={`${section.title || 'section'}-${index}`} className="kc-approval-section">
+                {section.title && <div className="kc-approval-section-title">{section.title}</div>}
+                {Array.isArray(section.items) && section.items.length > 0 && (
+                  <ul className="kc-approval-list">
+                    {section.items.map((item, itemIndex) => (
+                      <li key={`${index}-${itemIndex}`}>{item}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {approvalRequest.help_text && (
+          <div className="kc-approval-help">{approvalRequest.help_text}</div>
+        )}
+
+        {isSkillApproval ? (
+          <>
+            <div className="kc-approval-note-row">
+              <label className="kc-approval-label">Approval note</label>
+              <textarea
+                className="kc-modal-input"
+                placeholder="Optional note for the audit log"
+                value={approvalNote}
+                onChange={e => setApprovalNote(e.target.value)}
+                rows={2}
+              />
+            </div>
+            {approvalError && <div className="kc-approval-error">⚠ {approvalError}</div>}
+            <div className="kc-modal-quick kc-modal-quick--stacked">
+              {suggestedScopes.map((scope) => (
+                <button
+                  key={scope}
+                  className="kc-modal-quick-btn kc-modal-quick-btn--approve"
+                  onClick={() => handleSkillApproval(scope)}
+                  disabled={!!approvalBusy}
+                >
+                  {approvalBusy === scope ? 'Approving…' : (scopeLabels[scope] || `Approve (${scope})`)}
+                </button>
+              ))}
+              <button className="kc-modal-quick-btn kc-modal-quick-btn--reject" onClick={onStop}>
+                Stop run
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="kc-modal-quick">
+              <button className="kc-modal-quick-btn kc-modal-quick-btn--approve" onClick={() => onQuickReply('approve')}>
+                {approvalActions.accept_label || 'Approve'}
+              </button>
+              <button
+                className={`kc-modal-quick-btn kc-modal-quick-btn--suggest${showSuggest ? ' kc-modal-quick-btn--active' : ''}`}
+                onClick={() => { setShowSuggest(v => !v); onChange('') }}
+              >
+                {approvalActions.suggest_label || 'Suggest'}
+              </button>
+              <button className="kc-modal-quick-btn kc-modal-quick-btn--reject" onClick={() => onQuickReply('cancel')}>
+                {approvalActions.reject_label || 'Reject'}
+              </button>
+            </div>
+            {showSuggest && (
+              <div className="kc-modal-input-row">
+                <textarea
+                  ref={inputRef}
+                  className="kc-modal-input"
+                  placeholder="Type your suggestion… (Ctrl+Enter to send)"
+                  value={value}
+                  onChange={e => onChange(e.target.value)}
+                  onKeyDown={handleKey}
+                  rows={3}
+                />
+                <button
+                  className="kc-modal-send"
+                  onClick={onSend}
+                  disabled={!value.trim()}
+                >
+                  <SendIcon />
+                </button>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

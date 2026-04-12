@@ -524,6 +524,9 @@ function CreateSkillModal({ base, onClose, onCreated }) {
 // ─── test skill modal ────────────────────────────────────────────────────────
 
 function TestSkillModal({ base, skill, onClose }) {
+  const skillId = skill.skill_id || skill.id
+  const approvalSessionIdRef = useRef(`skill-test-${String(skillId || 'skill').replace(/[^a-z0-9_-]+/ig, '-')}-${Date.now().toString(36)}`)
+  const approvalSessionId = approvalSessionIdRef.current
   const [inputJson, setInputJson] = useState(() => {
     try {
       const schema = skill.input_schema || {}
@@ -540,25 +543,110 @@ function TestSkillModal({ base, skill, onClose }) {
   const [result, setResult] = useState(null)
   const [busy, setBusy]     = useState(false)
   const [err, setErr]       = useState(null)
+  const [approvalRequest, setApprovalRequest] = useState(null)
+  const [approvalNote, setApprovalNote] = useState('')
+  const [approvalBusy, setApprovalBusy] = useState('')
+  const [approvalErr, setApprovalErr] = useState(null)
+  const [grants, setGrants] = useState([])
+  const [revokeBusy, setRevokeBusy] = useState('')
 
-  const run = async () => {
-    setBusy(true); setErr(null); setResult(null)
+  const loadApprovals = useCallback(async () => {
+    try {
+      const r = await fetch(`${base}/api/marketplace/skills/${skillId}/approvals?status=active`)
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok) throw new Error(data.error || r.statusText)
+      setGrants(Array.isArray(data.items) ? data.items : [])
+    } catch (_) {}
+  }, [base, skillId])
+
+  useEffect(() => {
+    loadApprovals()
+  }, [loadApprovals])
+
+  const run = useCallback(async () => {
+    setBusy(true)
+    setErr(null)
+    setApprovalErr(null)
+    setResult(null)
     try {
       let inputs
       try { inputs = JSON.parse(inputJson) }
       catch { throw new Error('Invalid JSON in inputs') }
 
-      const skillId = skill.skill_id || skill.id
       const r = await fetch(`${base}/api/marketplace/skills/${skillId}/test`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ inputs }),
+        body: JSON.stringify({ inputs, session_id: approvalSessionId }),
       })
-      const data = await r.json()
+      const data = await r.json().catch(() => ({}))
+      if (r.status === 409 || data?.error_type === 'approval_required') {
+        setApprovalRequest(data)
+        setResult(data)
+        await loadApprovals()
+        return
+      }
+      if (!r.ok) throw new Error(data.error || data.detail || r.statusText)
+      setApprovalRequest(null)
       setResult(data)
     } catch (e) { setErr(e.message) }
-    finally { setBusy(false) }
-  }
+    finally {
+      setBusy(false)
+      loadApprovals()
+    }
+  }, [approvalSessionId, base, inputJson, loadApprovals, skillId])
+
+  const approve = useCallback(async (scope) => {
+    setApprovalBusy(scope)
+    setApprovalErr(null)
+    try {
+      const r = await fetch(`${base}/api/marketplace/skills/${skillId}/approve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          scope,
+          note: approvalNote.trim() || `Approved ${skill.name || skill.slug || skillId} from the desktop skills panel (${scope}).`,
+          session_id: approvalSessionId,
+        }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || !data.ok) throw new Error(data.error || data.detail || r.statusText)
+      setApprovalRequest(null)
+      await loadApprovals()
+      await run()
+    } catch (e) {
+      setApprovalErr(e.message)
+    } finally {
+      setApprovalBusy('')
+    }
+  }, [approvalNote, approvalSessionId, base, loadApprovals, run, skill.name, skill.slug, skillId])
+
+  const revokeGrant = useCallback(async (grantId) => {
+    setRevokeBusy(grantId)
+    setApprovalErr(null)
+    try {
+      const r = await fetch(`${base}/api/marketplace/skills/${skillId}/revoke-approval`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ grant_id: grantId }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || !data.ok) throw new Error(data.error || data.detail || r.statusText)
+      await loadApprovals()
+    } catch (e) {
+      setApprovalErr(e.message)
+    } finally {
+      setRevokeBusy('')
+    }
+  }, [base, loadApprovals, skillId])
+
+  const approvalSections = Array.isArray(approvalRequest?.approval_request?.sections)
+    ? approvalRequest.approval_request.sections
+    : []
+  const suggestedScopes = Array.isArray(approvalRequest?.approval_request?.metadata?.suggested_scopes)
+    ? approvalRequest.approval_request.metadata.suggested_scopes
+    : ['once', 'session', 'always']
+  const isApprovalPending = approvalRequest?.error_type === 'approval_required'
+  const activeGrants = grants.filter((grant) => String(grant.status || '').toLowerCase() === 'active')
 
   return (
     <ModalOverlay onClose={onClose}>
@@ -569,6 +657,14 @@ function TestSkillModal({ base, skill, onClose }) {
         <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>{skill.description}</div>
 
         {err && <div style={{ color: '#e74c3c', fontSize: 13 }}>⚠ {err}</div>}
+        {approvalErr && <div style={{ color: '#e74c3c', fontSize: 13 }}>⚠ {approvalErr}</div>}
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+          <span className="pp-badge pp-badge--muted">Session {approvalSessionId.slice(-10)}</span>
+          {activeGrants.length > 0 && (
+            <span className="pp-badge pp-badge--warn">{activeGrants.length} active grant{activeGrants.length === 1 ? '' : 's'}</span>
+          )}
+        </div>
 
         <FormField label="Inputs (JSON)">
           <textarea
@@ -588,7 +684,103 @@ function TestSkillModal({ base, skill, onClose }) {
           {busy ? '⏳ Running…' : '▶ Run Test'}
         </button>
 
-        {result && (
+        {isApprovalPending && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10, background: 'rgba(255,179,71,.08)', border: '1px solid rgba(255,179,71,.3)', borderRadius: 10, padding: 14 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontWeight: 700, fontSize: 13 }}>Permission required</span>
+              <span className="pp-badge pp-badge--warn">approval required</span>
+            </div>
+            {approvalRequest?.approval_request?.summary && (
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55 }}>
+                {approvalRequest.approval_request.summary}
+              </div>
+            )}
+            {approvalSections.map((section, index) => (
+              <div key={`${section.title || 'section'}-${index}`} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                {section.title && <div style={{ fontSize: 11, fontWeight: 700, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '.08em' }}>{section.title}</div>}
+                <ul style={{ margin: 0, paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 4, color: 'var(--text)' }}>
+                  {(section.items || []).map((item, itemIndex) => (
+                    <li key={`${index}-${itemIndex}`} style={{ fontSize: 12, lineHeight: 1.5 }}>{item}</li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+            {approvalRequest?.approval_request?.help_text && (
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+                {approvalRequest.approval_request.help_text}
+              </div>
+            )}
+            <FormField label="Approval note">
+              <textarea
+                value={approvalNote}
+                onChange={e => setApprovalNote(e.target.value)}
+                rows={2}
+                className="modal-input"
+                placeholder="Optional note for the audit log"
+              />
+            </FormField>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+              {suggestedScopes.map((scope) => (
+                <button
+                  key={scope}
+                  onClick={() => approve(scope)}
+                  disabled={!!approvalBusy}
+                  className="pp-btn pp-btn--primary"
+                >
+                  {approvalBusy === scope
+                    ? 'Approving…'
+                    : scope === 'session'
+                      ? 'Allow this session'
+                      : scope === 'always'
+                        ? 'Always allow'
+                        : 'Allow once'}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {activeGrants.length > 0 && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div style={{ fontWeight: 600, fontSize: 13 }}>Active grants</div>
+            {activeGrants.map((grant) => {
+              const isCurrentSession = grant.session_id && grant.session_id === approvalSessionId
+              return (
+                <div
+                  key={grant.grant_id}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: 12,
+                    border: '1px solid var(--border)',
+                    borderRadius: 8,
+                    padding: '10px 12px',
+                    background: 'var(--bg)',
+                  }}
+                >
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                      <span className="pp-badge pp-badge--ok">{grant.scope}</span>
+                      {isCurrentSession && <span className="pp-badge pp-badge--info">current session</span>}
+                      <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{grant.actor || 'user'}</span>
+                    </div>
+                    {grant.note && <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.45 }}>{grant.note}</div>}
+                  </div>
+                  <button
+                    onClick={() => revokeGrant(grant.grant_id)}
+                    disabled={revokeBusy === grant.grant_id}
+                    className="pp-btn pp-btn--ghost"
+                  >
+                    {revokeBusy === grant.grant_id ? 'Revoking…' : 'Revoke'}
+                  </button>
+                </div>
+              )
+            })}
+          </div>
+        )}
+
+        {result && !isApprovalPending && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ fontWeight: 600, fontSize: 13 }}>Result</span>

@@ -1930,6 +1930,43 @@ class TestUICapabilitiesSurface(unittest.TestCase):
         self.assertTrue(body.get("ok"))
         self.assertEqual(calls[0][0], "POST")
         self.assertEqual(calls[0][1], "/registry/policy-profiles")
+
+    def test_skill_approve_post_forwards_to_gateway_marketplace(self):
+        from kendr.ui_server import KendrUIHandler
+        from http.client import HTTPConnection
+
+        calls = []
+
+        def _forward(method, path, payload=None, timeout=5.0):
+            calls.append((method, path, payload))
+            return 200, {"ok": True, "grant": {"grant_id": "grant-1", "scope": "session"}}
+
+        with patch("kendr.ui_server._gateway_forward_json", side_effect=_forward):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), KendrUIHandler)
+            _, port = srv.server_address
+            t = threading.Thread(target=srv.handle_request, daemon=True)
+            t.start()
+            try:
+                conn = HTTPConnection("127.0.0.1", port, timeout=3)
+                payload = json.dumps({"scope": "session", "note": "Allow for this session", "session_id": "sess-ui"}).encode()
+                conn.request(
+                    "POST",
+                    "/api/marketplace/skills/skill-approval/approve",
+                    body=payload,
+                    headers={"Content-Type": "application/json", "Content-Length": str(len(payload))},
+                )
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+                conn.close()
+            finally:
+                srv.server_close()
+                t.join(timeout=3)
+
+        self.assertEqual(resp.status, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(calls[0][0], "POST")
+        self.assertEqual(calls[0][1], "/api/marketplace/skills/skill-approval/approve")
+        self.assertEqual(calls[0][2].get("session_id"), "sess-ui")
         self.assertEqual(calls[0][2].get("name"), "readonly-policy")
 
 

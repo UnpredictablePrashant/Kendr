@@ -148,6 +148,46 @@ class GatewaySurfaceSmokeTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["import_result"]["operations_synced"], 1)
 
+    def test_skill_test_endpoint_returns_approval_required_response(self):
+        request = urllib.request.Request(
+            f"{self.base_url}/api/marketplace/skills/skill-approval/test",
+            data=json.dumps({"inputs": {"command": "pwd"}, "session_id": "sess-1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        approval_payload = {
+            "success": False,
+            "error_type": "approval_required",
+            "error": "Approval required.",
+            "awaiting_user_input": True,
+            "pending_user_input_kind": "skill_approval",
+            "approval_pending_scope": "skill_permission:demo",
+            "approval_request": {"scope": "skill_permission:demo", "summary": "Approve skill."},
+        }
+        with (
+            patch("kendr.gateway_server.test_skill", return_value=approval_payload),
+            self.assertRaises(urllib.error.HTTPError) as exc,
+        ):
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(exc.exception.code, 409)
+        payload = json.loads(exc.exception.read().decode("utf-8"))
+        self.assertEqual(payload["error_type"], "approval_required")
+        self.assertTrue(payload["awaiting_user_input"])
+
+    def test_skill_approve_endpoint_returns_grant_payload(self):
+        request = urllib.request.Request(
+            f"{self.base_url}/api/marketplace/skills/skill-approval/approve",
+            data=json.dumps({"scope": "session", "note": "Allow for this session", "session_id": "sess-1"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        fake_grant = {"grant_id": "grant-1", "scope": "session", "session_id": "sess-1", "status": "active"}
+        with patch("kendr.gateway_server.grant_skill_approval", return_value=fake_grant):
+            with urllib.request.urlopen(request, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["grant"]["grant_id"], "grant-1")
+
     def test_capability_crud_and_lifecycle_endpoints(self):
         created = {
             "id": "cap-skill-1",

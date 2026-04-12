@@ -78,6 +78,7 @@ _CORE_TABLES = (
     "capability_audit_events",
     "user_skills",
     "assistants",
+    "approval_grants",
 )
 
 
@@ -757,6 +758,28 @@ def initialize_db(db_path: str = DB_PATH):
             );
             CREATE INDEX IF NOT EXISTS idx_user_skills_slug ON user_skills (slug);
             CREATE INDEX IF NOT EXISTS idx_user_skills_type_installed ON user_skills (skill_type, is_installed);
+
+            CREATE TABLE IF NOT EXISTS approval_grants (
+                grant_id TEXT PRIMARY KEY,
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                manifest_hash TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                session_id TEXT DEFAULT '',
+                actor TEXT NOT NULL,
+                note TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                permissions_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_used_at TEXT,
+                use_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_approval_grants_subject_manifest
+                ON approval_grants (subject_type, subject_id, manifest_hash, status);
+            CREATE INDEX IF NOT EXISTS idx_approval_grants_session
+                ON approval_grants (session_id, status, updated_at);
 
             CREATE TABLE IF NOT EXISTS assistants (
                 assistant_id TEXT PRIMARY KEY,

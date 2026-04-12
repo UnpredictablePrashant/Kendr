@@ -514,12 +514,19 @@ def _register_skill_agents(registry: Registry, *, strict: bool = False) -> None:
                 if not isinstance(raw, dict):
                     raw = {}
 
-                result = _exec(slug_, raw)
+                result = _exec(slug_, raw, session_id=str(state.get("session_id", "") or ""))
                 state["skill_result"] = result
                 state["skill_slug"] = slug_
                 state[f"skill_result_{slug_}"] = result
 
-                if result.get("success"):
+                if result.get("error_type") == "approval_required":
+                    state["awaiting_user_input"] = True
+                    state["pending_user_input_kind"] = str(result.get("pending_user_input_kind", "") or "skill_approval").strip()
+                    state["approval_pending_scope"] = str(result.get("approval_pending_scope", "") or f"skill_permission:{slug_}").strip()
+                    state["approval_request"] = result.get("approval_request", {}) if isinstance(result.get("approval_request"), dict) else {}
+                    state["pending_user_question"] = str(result.get("pending_user_question", "") or "").strip()
+                    state["skill_output"] = state["pending_user_question"] or f"Approval required to run skill '{slug_}'."
+                elif result.get("success"):
                     output = result.get("output") or result.get("stdout", "")
                     if not isinstance(output, str):
                         output = _json.dumps(output, ensure_ascii=False, indent=2)
