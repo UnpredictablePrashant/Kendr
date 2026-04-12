@@ -1871,12 +1871,17 @@ button.status-item:hover { background: rgba(255,255,255,.06); }
 
 /* Content & copy */
 .kc-content { position: relative; }
-.kc-copy-btn {
-  position: absolute; top: 0; right: 0;
-  font-size: 13px; color: var(--kc-muted); padding: 2px 6px;
-  border-radius: 4px; opacity: 0; transition: opacity .1s, background .1s;
+.kc-content-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 6px;
 }
-.kc-bubble--assistant:hover .kc-copy-btn { opacity: 1; }
+.kc-copy-btn {
+  font-size: 11px; color: var(--kc-muted); padding: 2px 8px;
+  border-radius: 6px; transition: background .1s, color .1s;
+  border: 1px solid var(--kc-border);
+  background: var(--kc-surface2);
+}
 .kc-copy-btn:hover { background: var(--kc-surface2); color: var(--kc-text); }
 
 /* Artifacts */
@@ -1898,6 +1903,34 @@ button.status-item:hover { background: rgba(255,255,255,.06); }
 
 /* Markdown */
 .kc-md { font-size: 13px; line-height: 1.65; color: var(--kc-text); }
+.kc-md--live { line-height: 1.55; }
+.kc-md-live-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  font: inherit;
+  color: var(--kc-text);
+}
+.kc-md-heading { color: var(--kc-text); font-weight: 700; line-height: 1.3; margin: 10px 0 6px; }
+.kc-md-heading--h1 { font-size: 20px; }
+.kc-md-heading--h2 { font-size: 18px; }
+.kc-md-heading--h3 { font-size: 16px; }
+.kc-md-heading--h4 { font-size: 14px; }
+.kc-md-heading--h5 { font-size: 13px; }
+.kc-md-heading--h6 { font-size: 12px; }
+.kc-md-paragraph { margin: 8px 0; color: var(--kc-text); }
+.kc-md-list { margin: 8px 0 10px 20px; color: var(--kc-text); }
+.kc-md-list li { margin: 3px 0; }
+.kc-md-quote {
+  margin: 10px 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--kc-border);
+  background: var(--kc-surface2);
+  border-radius: 6px;
+}
+.kc-md-quote p { margin: 0; color: var(--kc-text-muted, #aab0ba); }
+.kc-md-link { color: var(--kc-teal); text-decoration: underline; text-underline-offset: 2px; }
 .kc-inline-code {
   background: var(--kc-surface2); border: 1px solid var(--kc-border);
   padding: 1px 5px; border-radius: 4px;
@@ -3215,6 +3248,128 @@ button.status-item:hover { background: rgba(255,255,255,.06); }
 .pp-form-actions { display: flex; gap: 8px; margin-bottom: 10px; }
 .pp-form-hint { font-size: 11px; color: var(--text-muted); line-height: 1.5; }
 .pp-form-hint strong { color: var(--text); }
+
+/* ── Integrations overview connector cards ─────────────────────────────────── */
+.ih-connector-card {
+  background: var(--bg);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+  position: relative;
+}
+.ih-connector-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.ih-connector-card-title {
+  font-weight: 600;
+  font-size: 13px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ih-connector-card-status {
+  font-size: 11px;
+  font-weight: 500;
+  flex-shrink: 0;
+}
+.ih-connector-card-info-btn {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 700;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+}
+.ih-connector-card-info-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.ih-connector-card-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 5;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.ih-connector-card-popover {
+  position: fixed;
+  width: min(380px, calc(100vw - 40px));
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 12px 28px rgba(0,0,0,.45);
+  z-index: 20;
+  padding: 10px;
+}
+.ih-connector-card-popover-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+.ih-connector-card-popover-close {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  width: 22px;
+  height: 22px;
+  cursor: pointer;
+}
+.ih-connector-card-popover-close:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.ih-connector-card-popover-row {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.45;
+  margin-bottom: 6px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.ih-connector-card-popover-row strong {
+  color: var(--text);
+}
+.ih-connector-card-missing {
+  font-size: 11px;
+  color: #e6a700;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.ih-connector-card-inputs {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
 
 /* ── Scaffold modal ── */
 .pp-modal-backdrop {

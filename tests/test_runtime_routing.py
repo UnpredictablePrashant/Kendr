@@ -103,6 +103,208 @@ class RuntimeRoutingTests(unittest.TestCase):
         self.assertEqual(state["available_agents"], ["worker_agent"])
         self.assertEqual([card["agent_name"] for card in state["available_agent_cards"]], ["worker_agent"])
 
+    def test_execution_mode_controls_planner_policy(self):
+        with (
+            patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
+            patch("kendr.connector_registry.build_connector_catalog", return_value=[]),
+            patch("kendr.connector_registry.connector_catalog_prompt_block", return_value=""),
+            patch("tasks.a2a_protocol.upsert_agent_card"),
+            patch("tasks.a2a_protocol.insert_message"),
+            patch("tasks.a2a_protocol.upsert_task"),
+            patch("tasks.a2a_protocol.insert_artifact"),
+        ):
+            runtime = AgentRuntime(build_registry())
+            direct_state = runtime.build_initial_state(
+                "Inspect this project and run the best tool.",
+                execution_mode="direct_tools",
+            )
+            run_planner_direct, reason_direct, _signals_direct = runtime._should_run_planner(direct_state)
+
+            plan_state = runtime.build_initial_state(
+                "Inspect this project and run the best tool.",
+                execution_mode="plan",
+            )
+            run_planner_plan, reason_plan, _signals_plan = runtime._should_run_planner(plan_state)
+
+        self.assertEqual(direct_state["execution_mode"], "direct_tools")
+        self.assertEqual(direct_state["planner_policy_mode"], "never")
+        self.assertFalse(run_planner_direct)
+        self.assertIn("direct tool mode", reason_direct.lower())
+
+        self.assertEqual(plan_state["execution_mode"], "plan")
+        self.assertEqual(plan_state["planner_policy_mode"], "always")
+        self.assertTrue(run_planner_plan)
+        self.assertIn("plan mode", reason_plan.lower())
+
+    def test_drive_listing_query_routes_to_os_agent_with_command_hint(self):
+        with (
+            patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
+            patch("kendr.connector_registry.build_connector_catalog", return_value=[]),
+            patch("kendr.connector_registry.connector_catalog_prompt_block", return_value=""),
+            patch("tasks.a2a_protocol.upsert_agent_card"),
+            patch("tasks.a2a_protocol.insert_message"),
+            patch("tasks.a2a_protocol.upsert_task"),
+            patch("tasks.a2a_protocol.insert_artifact"),
+        ):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("which folders are there in my D drive?")
+            state["plan_steps"] = []
+            state["plan_ready"] = False
+            state["last_agent"] = ""
+
+            with patch("kendr.runtime.llm.invoke") as mock_invoke:
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "os_agent")
+        self.assertIn("local command execution workflow", routed_state["orchestrator_reason"].lower())
+        self.assertFalse(mock_invoke.called, "Direct os_agent routing should not call orchestrator LLM.")
+        self.assertTrue(routed_state.get("a2a", {}).get("tasks"))
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "os_agent")
+        updates = task.get("state_updates", {})
+        self.assertIn("os_command", updates)
+        self.assertIn("/mnt/d", str(updates.get("os_command", "")))
+
+    def test_direct_tool_mode_finishes_via_direct_tool_runtime(self):
+        with (
+            patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
+            patch("kendr.connector_registry.build_connector_catalog", return_value=[]),
+            patch("kendr.connector_registry.connector_catalog_prompt_block", return_value=""),
+            patch("tasks.a2a_protocol.upsert_agent_card"),
+            patch("tasks.a2a_protocol.insert_message"),
+            patch("tasks.a2a_protocol.upsert_task"),
+            patch("tasks.a2a_protocol.insert_artifact"),
+        ):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state(
+                "which folders are there in my D drive?",
+                execution_mode="direct_tools",
+            )
+
+            with (
+                patch(
+                    "kendr.runtime.run_direct_tool_loop",
+                    return_value={
+                        "status": "final",
+                        "reason": "Handled by direct tool runtime.",
+                        "response": "The top-level folders are: Projects, Media.",
+                    },
+                ) as mock_direct,
+                patch("kendr.runtime.llm.invoke") as mock_invoke,
+            ):
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "__finish__")
+        self.assertIn("Projects", routed_state["final_output"])
+        self.assertTrue(routed_state.get("direct_tool_loop_attempted"))
+        self.assertTrue(mock_direct.called)
+        self.assertFalse(mock_invoke.called, "Direct tool runtime handling should bypass the generic orchestrator LLM.")
+
+    def test_restore_pending_user_input_approves_integration_communication_access(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            initial_state = runtime.build_initial_state("Check my Slack channels.")
+            prior_state = {
+                "pending_user_input_kind": "integration_approval",
+                "approval_pending_scope": "integration_communication_access",
+                "approval_request": {
+                    "scope": "integration_communication_access",
+                    "title": "Communication Access Approval",
+                    "summary": "Approve access.",
+                },
+                "last_objective": "Check my Slack channels.",
+            }
+
+            runtime._restore_pending_user_input(initial_state, prior_state, "approve")
+
+        self.assertTrue(initial_state["communication_authorized"])
+        self.assertEqual(initial_state["pending_user_input_kind"], "")
+        self.assertEqual(initial_state["approval_pending_scope"], "")
+
+    def test_restore_pending_user_input_approves_integration_aws_access(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            initial_state = runtime.build_initial_state("List my S3 buckets.")
+            prior_state = {
+                "pending_user_input_kind": "integration_approval",
+                "approval_pending_scope": "integration_aws_access",
+                "approval_request": {
+                    "scope": "integration_aws_access",
+                    "title": "AWS Access Approval",
+                    "summary": "Approve access.",
+                },
+                "last_objective": "List my S3 buckets.",
+            }
+
+            runtime._restore_pending_user_input(initial_state, prior_state, "approve")
+
+        self.assertTrue(initial_state["aws_authorized"])
+        self.assertEqual(initial_state["pending_user_input_kind"], "")
+        self.assertEqual(initial_state["approval_pending_scope"], "")
+
+    def test_restore_pending_user_input_approves_integration_github_write_access(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            initial_state = runtime.build_initial_state("Open a pull request for openai/sample.")
+            prior_state = {
+                "pending_user_input_kind": "integration_approval",
+                "approval_pending_scope": "integration_github_write_access",
+                "approval_request": {
+                    "scope": "integration_github_write_access",
+                    "title": "GitHub Write Access Approval",
+                    "summary": "Approve write access.",
+                },
+                "last_objective": "Open a pull request for openai/sample.",
+            }
+
+            runtime._restore_pending_user_input(initial_state, prior_state, "approve")
+
+        self.assertTrue(initial_state["github_write_authorized"])
+        self.assertEqual(initial_state["pending_user_input_kind"], "")
+        self.assertEqual(initial_state["approval_pending_scope"], "")
+
+    def test_restore_pending_user_input_approves_integration_github_local_git_access(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            initial_state = runtime.build_initial_state("Write to a local repo file.")
+            prior_state = {
+                "pending_user_input_kind": "integration_approval",
+                "approval_pending_scope": "integration_github_local_git_access",
+                "approval_request": {
+                    "scope": "integration_github_local_git_access",
+                    "title": "Local Git Mutation Approval",
+                    "summary": "Approve local git changes.",
+                },
+                "last_objective": "Write to a local repo file.",
+            }
+
+            runtime._restore_pending_user_input(initial_state, prior_state, "approve")
+
+        self.assertTrue(initial_state["github_local_git_authorized"])
+        self.assertEqual(initial_state["pending_user_input_kind"], "")
+        self.assertEqual(initial_state["approval_pending_scope"], "")
+
+    def test_restore_pending_user_input_approves_integration_github_remote_git_access(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            initial_state = runtime.build_initial_state("Push my branch.")
+            prior_state = {
+                "pending_user_input_kind": "integration_approval",
+                "approval_pending_scope": "integration_github_remote_git_access",
+                "approval_request": {
+                    "scope": "integration_github_remote_git_access",
+                    "title": "Remote Git Network Approval",
+                    "summary": "Approve remote git access.",
+                },
+                "last_objective": "Push my branch.",
+            }
+
+            runtime._restore_pending_user_input(initial_state, prior_state, "approve")
+
+        self.assertTrue(initial_state["github_remote_git_authorized"])
+        self.assertEqual(initial_state["pending_user_input_kind"], "")
+        self.assertEqual(initial_state["approval_pending_scope"], "")
+
     def test_explicit_deep_research_request_routes_to_long_document_lane(self):
         with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
             runtime = AgentRuntime(build_registry())
@@ -118,6 +320,21 @@ class RuntimeRoutingTests(unittest.TestCase):
         task = routed_state["a2a"]["tasks"][-1]
         self.assertEqual(task["recipient"], "long_document_agent")
         self.assertEqual(routed_state["workflow_type"], "deep_research")
+
+    def test_project_audit_request_routes_to_master_coding_agent(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Audit this repository for production readiness and architecture risks.")
+
+            with patch("kendr.runtime.llm.invoke") as mock_invoke:
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "master_coding_agent")
+        self.assertIn("audit", routed_state["orchestrator_reason"].lower())
+        self.assertFalse(mock_invoke.called)
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "master_coding_agent")
+        self.assertEqual(task["intent"], "project-audit-dispatch")
 
     def test_preloaded_gateway_message_skips_channel_gateway_agent(self):
         with (
@@ -219,6 +436,96 @@ class RuntimeRoutingTests(unittest.TestCase):
         self.assertEqual(task["recipient"], "long_document_agent")
         self.assertEqual(task["intent"], "long-document-dispatch")
         self.assertEqual(routed_state["workflow_type"], "deep_research")
+
+    def test_document_generation_request_routes_to_long_document_via_registry(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Write a report on EV battery recycling and export it as a PDF.")
+
+            with patch("kendr.runtime.llm.invoke") as mock_invoke:
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "long_document_agent")
+        self.assertIn("document/report", routed_state["orchestrator_reason"].lower())
+        self.assertFalse(mock_invoke.called)
+        self.assertTrue(routed_state["long_document_mode"])
+        self.assertTrue(routed_state["long_document_job_started"])
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "long_document_agent")
+        self.assertEqual(task["intent"], "long-document-dispatch")
+
+    def test_research_request_routes_to_research_pipeline_via_registry(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Tell me about the current state of sodium-ion batteries.")
+
+            with patch("kendr.runtime.llm.invoke") as mock_invoke:
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "research_pipeline_agent")
+        self.assertIn("research / information task", routed_state["orchestrator_reason"].lower())
+        self.assertFalse(mock_invoke.called)
+        self.assertTrue(routed_state["research_pipeline_enabled"])
+        self.assertFalse(routed_state["research_pipeline_completed"])
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "research_pipeline_agent")
+        self.assertEqual(task["intent"], "research-pipeline-dispatch")
+
+    def test_local_drive_force_long_document_routes_after_ingestion_via_registry(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Do deep research on this dataset and produce a full report.")
+            state["local_drive_force_long_document"] = True
+            state["local_drive_calls"] = 1
+            state["long_document_mode"] = True
+            state["local_drive_summary"] = "Quarterly revenue and churn evidence from uploaded spreadsheets."
+
+            with patch("kendr.runtime.llm.invoke") as mock_invoke:
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "long_document_agent")
+        self.assertIn("local-drive ingestion is complete", routed_state["orchestrator_reason"].lower())
+        self.assertFalse(mock_invoke.called)
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "long_document_agent")
+        self.assertEqual(task["intent"], "drive-informed-long-document")
+        self.assertIn("Quarterly revenue and churn evidence", task["content"])
+
+    def test_research_pipeline_continuation_routes_via_registry(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Tell me about the current state of sodium-ion batteries.")
+            state["research_pipeline_enabled"] = True
+            state["research_pipeline_completed"] = False
+
+            with patch("kendr.runtime.llm.invoke") as mock_invoke:
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "research_pipeline_agent")
+        self.assertIn("research_pipeline_enabled is set", routed_state["orchestrator_reason"])
+        self.assertFalse(mock_invoke.called)
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "research_pipeline_agent")
+        self.assertEqual(task["intent"], "research-pipeline-dispatch")
+
+    def test_research_synthesis_routes_to_worker_via_registry(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Tell me about the current state of sodium-ion batteries.")
+            state["last_agent"] = "research_pipeline_agent"
+            state["research_pipeline_report"] = "Source A says X. Source B says Y."
+
+            with patch("kendr.runtime.llm.invoke") as mock_invoke:
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "worker_agent")
+        self.assertIn("research collection complete", routed_state["orchestrator_reason"].lower())
+        self.assertFalse(mock_invoke.called)
+        self.assertTrue(routed_state["research_synthesis_done"])
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["recipient"], "worker_agent")
+        self.assertEqual(task["intent"], "research-synthesis")
+        self.assertIn("Source A says X", task["content"])
 
     def test_reviewer_approval_finishes_when_no_planned_steps_remain(self):
         with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):

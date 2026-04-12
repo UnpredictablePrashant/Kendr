@@ -452,6 +452,33 @@ class GatewaySurfaceSmokeTests(unittest.TestCase):
         self.assertEqual(overrides["provider"], "openai")
         self.assertEqual(overrides["model"], "gpt-5.1")
 
+    def test_ingest_preserves_execution_mode_override(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = urllib.request.Request(
+                f"{self.base_url}/ingest",
+                data=json.dumps(
+                    {
+                        "text": "inspect the repo",
+                        "channel": "webchat",
+                        "sender_id": "user-1",
+                        "chat_id": "chat-1",
+                        "working_directory": tmpdir,
+                        "execution_mode": "direct_tools",
+                    }
+                ).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+
+            with patch.object(gateway.RUNTIME, "run_query", return_value={"run_id": "run-3", "final_output": "ok"}) as run_query:
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+
+        self.assertEqual(payload["run_id"], "run-3")
+        _, kwargs = run_query.call_args
+        overrides = kwargs["state_overrides"]
+        self.assertEqual(overrides["execution_mode"], "direct_tools")
+
     def test_session_router_preserves_existing_session_state_keys(self):
         persisted_payload = {}
 

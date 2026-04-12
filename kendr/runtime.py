@@ -13,6 +13,7 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 from kendr.orchestration import ResumeStateOverrides, RuntimeState, state_awaiting_user_input
 from kendr.execution_trace import append_execution_event, render_execution_event_line
+from kendr.direct_tools import run_direct_tool_loop
 from kendr.persistence import (
     get_channel_session,
     initialize_db,
@@ -31,6 +32,7 @@ from kendr.workflow_contract import (
     is_deep_research_workflow_type,
     normalize_approval_request,
 )
+from kendr.workflow_registry import WorkflowDispatchPlan, match_explicit_workflow
 
 from tasks.a2a_protocol import (
     append_artifact,
@@ -111,6 +113,27 @@ class AgentRuntime:
 
     def _agent_descriptions(self) -> dict[str, str]:
         return self.registry.agent_descriptions()
+
+    def _apply_workflow_dispatch_plan(self, state: dict, plan: WorkflowDispatchPlan) -> dict:
+        for key, value in (plan.state_mutations or {}).items():
+            state[key] = value
+        state["orchestrator_reason"] = str(plan.reason or "").strip()
+        state["next_agent"] = str(plan.agent_name or "").strip()
+        if state["orchestrator_reason"]:
+            log_task_update("Orchestrator", state["orchestrator_reason"])
+        state = append_task(
+            state,
+            make_task(
+                sender="orchestrator_agent",
+                recipient=str(plan.agent_name or "").strip(),
+                intent=str(plan.intent or "").strip(),
+                content=str(plan.content or "").strip(),
+                state_updates=dict(plan.state_updates or {}),
+            ),
+        )
+        if str(plan.decision_note or "").strip():
+            record_work_note(state, "orchestrator_agent", "decision", str(plan.decision_note).strip())
+        return state
 
     def apply_runtime_setup(self, state: dict) -> dict:
         working_dir = str(state.get("working_directory", "") or "").strip()
@@ -274,6 +297,27 @@ class AgentRuntime:
             return "never"
         return default
 
+    def _resolve_execution_mode(self, state: Mapping[str, Any], *, default: str = "adaptive") -> str:
+        raw_value = state.get("execution_mode", "")
+        value = str(raw_value or "").strip().lower()
+        if value in {"direct", "direct_tools", "tool", "tools", "agent", "agent_mode"}:
+            return "direct_tools"
+        if value in {"plan", "planning", "plan_mode"}:
+            return "plan"
+        if value in {"adaptive", "auto", "default", ""}:
+            planner_mode = self._resolve_policy_mode(
+                state,
+                primary_key="planner_policy_mode",
+                aliases=("planner_mode",),
+                default="adaptive",
+            )
+            if planner_mode == "never":
+                return "direct_tools"
+            if planner_mode == "always":
+                return "plan"
+            return "adaptive"
+        return default
+
     def _objective_text(self, state: Mapping[str, Any]) -> str:
         return " ".join(
             [
@@ -316,6 +360,12 @@ class AgentRuntime:
         }
 
     def _should_run_planner(self, state: Mapping[str, Any]) -> tuple[bool, str, dict[str, Any]]:
+        execution_mode = self._resolve_execution_mode(state, default="adaptive")
+        if execution_mode == "direct_tools":
+            return False, "Direct tool mode selected: skip planner and route through tool-capable agents.", {"execution_mode": execution_mode}
+        if execution_mode == "plan":
+            return True, "Plan mode selected: planner is required before execution.", {"execution_mode": execution_mode}
+
         mode = self._resolve_policy_mode(
             state,
             primary_key="planner_policy_mode",
@@ -389,6 +439,37 @@ class AgentRuntime:
         if score >= threshold:
             return True, "Adaptive planner policy selected staged planning.", signals
         return False, "Adaptive planner policy selected direct execution routing.", signals
+
+    def _should_attempt_direct_tool_loop(self, state: Mapping[str, Any], *, in_task_phase: bool) -> bool:
+        if self._resolve_execution_mode(state, default="adaptive") != "direct_tools":
+            return False
+        if not in_task_phase:
+            return False
+        if bool(state.get("direct_tool_loop_attempted", False)):
+            return False
+        if self._awaiting_user_input(state):
+            return False
+        if state.get("plan_steps") or bool(state.get("plan_ready", False)):
+            return False
+        if state.get("last_agent"):
+            return False
+        if self._is_project_build_request(dict(state)):
+            return False
+        if self._is_project_workbench_request(dict(state)):
+            return False
+        if self._is_project_audit_request(dict(state)):
+            return False
+        if self._is_deep_research_workflow(dict(state)) or self._is_long_document_request(dict(state)):
+            return False
+        if self._is_superrag_request(dict(state)):
+            return False
+        if self._has_local_drive_request(dict(state)):
+            return False
+        if self._is_github_request(dict(state)):
+            return False
+        if self._is_communication_summary_request(dict(state)):
+            return False
+        return True
 
     def _review_signal_snapshot(self, state: Mapping[str, Any], agent_name: str, output_text: str) -> dict[str, Any]:
         objective_text = self._objective_text(state).lower()
@@ -1270,6 +1351,7 @@ class AgentRuntime:
                 "long_document_plan_version": int(state.get("long_document_plan_version", 0) or 0),
                 "long_document_outline": state.get("long_document_outline", {}),
                 "superrag_active_session_id": state.get("superrag_active_session_id", ""),
+                "execution_mode": str(state.get("execution_mode", "adaptive") or "adaptive").strip().lower(),
                 "adaptive_agent_selection": _truthy(state.get("adaptive_agent_selection"), True),
                 "planner_policy_mode": str(state.get("planner_policy_mode", "adaptive") or "adaptive").strip().lower(),
                 "reviewer_policy_mode": str(state.get("reviewer_policy_mode", "adaptive") or "adaptive").strip().lower(),
@@ -1623,7 +1705,92 @@ class AgentRuntime:
             "bash command",
             "cmd /c",
         )
-        return any(marker in text for marker in markers)
+        if any(marker in text for marker in markers):
+            return True
+
+        listing_intent = any(
+            marker in text
+            for marker in (
+                "which folders",
+                "which directories",
+                "list folders",
+                "list directories",
+                "show folders",
+                "show directories",
+                "folder names",
+                "directory names",
+                "what folders are",
+                "what files are",
+                "contents of",
+                "what is in my",
+                "what's in my",
+            )
+        )
+        filesystem_target = any(
+            marker in text
+            for marker in (
+                "drive",
+                "folder",
+                "directory",
+                "directories",
+                "filesystem",
+                "file system",
+                "/mnt/",
+                "c:",
+                "d:",
+                "e:",
+                "f:",
+            )
+        )
+        return listing_intent and filesystem_target
+
+    def _derive_local_command_hint(self, state: Mapping[str, Any]) -> dict[str, Any]:
+        query = " ".join(
+            [
+                str(state.get("user_query", "") or ""),
+                str(state.get("current_objective", "") or ""),
+            ]
+        ).strip()
+        lowered = query.lower()
+        if not lowered:
+            return {}
+
+        drive_match = re.search(r"\b([a-z])\s*:?\\?\s*drive\b", lowered) or re.search(r"\b([a-z]):\b", lowered)
+        drive_letter = drive_match.group(1).lower() if drive_match else ""
+        listing_request = any(
+            marker in lowered
+            for marker in (
+                "which folders",
+                "which directories",
+                "list folders",
+                "list directories",
+                "show folders",
+                "show directories",
+                "folder names",
+                "directory names",
+                "what folders are",
+                "what files are",
+                "contents of",
+                "what is in my",
+                "what's in my",
+            )
+        )
+        if not listing_request:
+            return {}
+
+        if drive_letter:
+            if os.name == "nt":
+                return {
+                    "os_command": f"Get-ChildItem -Name -Directory {drive_letter.upper()}:\\",
+                    "shell": "powershell",
+                    "target_os": "windows",
+                }
+            return {"os_command": f"ls -1 /mnt/{drive_letter}"}
+
+        if "current directory" in lowered or "this directory" in lowered:
+            return {"os_command": "ls -1 ."}
+
+        return {}
 
     def _is_communication_summary_request(self, state: dict) -> bool:
         # Do not route capability/skills inventory prompts into communication
@@ -2616,6 +2783,27 @@ class AgentRuntime:
             log_task_update("Orchestrator", "Capability discovery shortcut — returning inventory directly.")
             return state
 
+        if self._should_attempt_direct_tool_loop(state, in_task_phase=in_task_phase):
+            direct_result = run_direct_tool_loop(state)
+            state["direct_tool_loop_attempted"] = True
+            direct_status = str(direct_result.get("status", "") or "").strip().lower()
+            if direct_status in {"final", "awaiting_input"}:
+                final_text = str(direct_result.get("response", "") or state.get("pending_user_question", "") or "").strip()
+                if not final_text:
+                    final_text = state.get("draft_response") or state.get("last_agent_output") or "Direct tool execution completed."
+                state["orchestrator_reason"] = str(direct_result.get("reason", "") or "Handled by the direct tool runtime.").strip()
+                state["next_agent"] = "__finish__"
+                state["draft_response"] = final_text
+                state["final_output"] = final_text
+                message_role = "approval" if state_awaiting_user_input(state) else "final"
+                state = append_message(state, make_message("orchestrator_agent", "user", message_role, final_text))
+                log_task_update("Orchestrator", f"Direct tool runtime handled the request ({direct_status}).")
+                return state
+            fallback_reason = str(direct_result.get("reason", "") or "").strip()
+            if fallback_reason:
+                state["direct_tool_fallback_reason"] = fallback_reason
+                log_task_update("Orchestrator", f"Direct tool runtime fallback: {fallback_reason}")
+
         # --- Skill registry: single-agent direct routing (bypass planner) ---
         # Fire only on the very first orchestrator call so we don't re-route mid-plan.
         _skill_route_eligible = (
@@ -2704,128 +2892,9 @@ class AgentRuntime:
             ))
             return state
 
-        # --- Project builder: blueprint before planning ---
-        if (
-            not state.get("plan_steps")
-            and state.get("last_agent") != "project_blueprint_agent"
-            and not state.get("blueprint_json")
-            and self._is_agent_available(state, "project_blueprint_agent")
-            and self._is_project_build_request(state)
-            and not bool(state.get("dev_pipeline_mode", False))
-        ):
-            state["project_build_mode"] = True
-            reason = "Build request detected. Route to project_blueprint_agent for technical architecture."
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "project_blueprint_agent"
-            state = append_task(state, make_task(
-                sender="orchestrator_agent", recipient="project_blueprint_agent",
-                intent="project-blueprint", content=current_objective,
-                state_updates={"blueprint_request": current_objective},
-            ))
-            return state
-
-        if (
-            not state.get("plan_steps")
-            and state.get("last_agent") != "os_agent"
-            and self._is_agent_available(state, "os_agent")
-            and self._is_local_command_request(state)
-            and not self._is_project_build_request(state)
-        ):
-            reason = "The request is a local command execution workflow. Route to os_agent for controlled shell execution."
-            objective = state.get("current_objective") or state.get("user_query", "")
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "os_agent"
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="os_agent",
-                    intent="local-command-dispatch",
-                    content=objective,
-                    state_updates={"current_objective": objective},
-                ),
-            )
-            return state
-
-        if (
-            not state.get("plan_steps")
-            and state.get("last_agent") != "github_agent"
-            and self._is_agent_available(state, "github_agent")
-            and self._is_github_request(state)
-            and not self._is_project_build_request(state)
-        ):
-            reason = (
-                "The request is a GitHub / git repository workflow (PR, issue, clone, push, etc.). "
-                "Route to github_agent for direct, deterministic execution."
-            )
-            objective = state.get("current_objective") or state.get("user_query", "")
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "github_agent"
-            state["github_task"] = state.get("github_task") or objective
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="github_agent",
-                    intent="github-operation",
-                    content=objective,
-                    state_updates={"github_task": state["github_task"]},
-                ),
-            )
-            return state
-
-        if (
-            not state.get("plan_steps")
-            and state.get("last_agent") != "communication_summary_agent"
-            and self._is_agent_available(state, "communication_summary_agent")
-            and self._is_communication_summary_request(state)
-            and not self._is_project_build_request(state)
-        ):
-            reason = "The request is a communication digest/summary workflow. Route to communication_summary_agent."
-            objective = state.get("current_objective") or state.get("user_query", "")
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "communication_summary_agent"
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="communication_summary_agent",
-                    intent="communication-digest",
-                    content=objective,
-                    state_updates={"current_objective": objective},
-                ),
-            )
-            return state
-
-        if (
-            not state.get("plan_steps")
-            and state.get("last_agent") != "master_coding_agent"
-            and self._is_agent_available(state, "master_coding_agent")
-            and self._is_project_workbench_request(state)
-        ):
-            reason = (
-                "Project workbench request detected with an active repository context. "
-                "Route directly to master_coding_agent for code-aware inspection or implementation, bypassing the generic planner."
-            )
-            objective = state.get("current_objective") or state.get("user_query", "")
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "master_coding_agent"
-            state["codebase_mode"] = True
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="master_coding_agent",
-                    intent="project-workbench-dispatch",
-                    content=objective,
-                    state_updates={
-                        "master_coding_request": objective,
-                        "coding_task": objective,
-                        "codebase_mode": True,
-                    },
-                ),
-            )
-            return state
+        explicit_workflow = match_explicit_workflow(self, state, stage="early")
+        if explicit_workflow is not None:
+            return self._apply_workflow_dispatch_plan(state, explicit_workflow)
 
         # --- Project builder: blueprint approval gate ---
         if bool(state.get("blueprint_waiting_for_approval", False)):
@@ -2874,87 +2943,9 @@ class AgentRuntime:
             )
             return state
 
-        # --- Document-generation fast-path: route to long_document_agent when the user
-        # wants a researched document/report as a file (MD + PDF + DOCX output). This
-        # bypasses the planner entirely — long_document_agent handles its own planning,
-        # multi-source research, writing, and format export internally. ---
-        if (
-            not state.get("plan_steps")
-            and not state.get("long_document_mode")
-            and not state.get("long_document_job_started")
-            and state.get("last_agent") not in {"long_document_agent"}
-            and self._is_document_generation_request(state)
-            and self._is_agent_available(state, "long_document_agent")
-        ):
-            doc_query = str(state.get("current_objective") or state.get("user_query", "")).strip()
-            reason = (
-                "The request asks for a researched document/report to be produced as a file. "
-                "Routing directly to long_document_agent which will research, write, and export "
-                "the document as Markdown, PDF, and DOCX."
-            )
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "long_document_agent"
-            state["long_document_mode"] = True
-            state["workflow_type"] = state.get("workflow_type") or "long_document"
-            state["long_document_job_started"] = True
-            state["long_document_collect_sources_first"] = True
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="long_document_agent",
-                    intent="long-document-dispatch",
-                    content=doc_query,
-                    state_updates={
-                        "long_document_mode": True,
-                        "long_document_collect_sources_first": True,
-                        "current_objective": doc_query,
-                    },
-                ),
-            )
-            log_task_update("Orchestrator", reason)
-            return state
-
-        # --- Research fast-path: bypass planner for clear information / research requests ---
-        # Mirrors the pattern used by github_agent and os_agent — deterministic routing before
-        # the planner ensures research agents (with real internet access) are used instead of
-        # the generic worker_agent (LLM-only, no web search).
-        if (
-            not state.get("plan_steps")
-            and not state.get("research_pipeline_enabled")
-            and not state.get("research_synthesis_done")
-            and state.get("last_agent") not in {"research_pipeline_agent", "deep_research_agent"}
-            and self._is_research_request(state)
-        ):
-            research_query = str(state.get("current_objective") or state.get("user_query", "")).strip()
-            if (
-                not self._is_deep_research_request(state)
-                and self._is_agent_available(state, "research_pipeline_agent")
-            ):
-                reason = (
-                    "The request is a research / information task. Bypassing the planner and routing "
-                    "to research_pipeline_agent for multi-source web evidence collection."
-                )
-                sources = state.get("research_sources") or ["web"]
-                state["research_pipeline_enabled"] = True
-                state["research_pipeline_completed"] = False
-                state["orchestrator_reason"] = reason
-                state["next_agent"] = "research_pipeline_agent"
-                state = append_task(
-                    state,
-                    make_task(
-                        sender="orchestrator_agent",
-                        recipient="research_pipeline_agent",
-                        intent="research-pipeline-dispatch",
-                        content=research_query,
-                        state_updates={
-                            "research_sources": sources,
-                            "research_pipeline_enabled": True,
-                        },
-                    ),
-                )
-                log_task_update("Orchestrator", reason)
-                return state
+        explicit_workflow = match_explicit_workflow(self, state, stage="pre_planner")
+        if explicit_workflow is not None:
+            return self._apply_workflow_dispatch_plan(state, explicit_workflow)
 
         # Guard: if a research agent just finished (synthesis pending) OR synthesis is already
         # done (worker just wrote the report), skip the planner entirely so it does not
@@ -3056,46 +3047,9 @@ class AgentRuntime:
             )
             return state
 
-        if (
-            not state.get("plan_steps")
-            and
-            bool(state.get("local_drive_force_long_document", False))
-            and self._is_long_document_request(state)
-            and self._is_agent_available(state, "long_document_agent")
-            and state.get("last_agent") != "long_document_agent"
-            and int(state.get("local_drive_calls", 0) or 0) > 0
-        ):
-            reason = (
-                "Local-drive ingestion is complete and a deep research report was requested. "
-                "Route to long_document_agent for staged long-running synthesis."
-            )
-            objective = str(state.get("current_objective") or state.get("user_query", "")).strip()
-            drive_summary = str(state.get("local_drive_summary") or state.get("document_summary") or "").strip()
-            long_doc_objective = objective
-            if drive_summary:
-                long_doc_objective = (
-                    f"{objective}\n\nUse this local-drive evidence summary as primary context:\n"
-                    f"{self._truncate(drive_summary, 5000)}"
-                )
-            updates = {
-                "current_objective": long_doc_objective,
-                "long_document_mode": True,
-            }
-            if int(state.get("long_document_pages", 0) or 0) <= 0:
-                updates["long_document_pages"] = 50
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "long_document_agent"
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="long_document_agent",
-                    intent="drive-informed-long-document",
-                    content=long_doc_objective,
-                    state_updates=updates,
-                ),
-            )
-            return state
+        explicit_workflow = match_explicit_workflow(self, state, stage="post_approval")
+        if explicit_workflow is not None:
+            return self._apply_workflow_dispatch_plan(state, explicit_workflow)
 
         if state.get("last_agent") and state.get("last_agent") != "reviewer_agent" and state.get("review_pending") and self._is_agent_available(state, "reviewer_agent"):
             reason = str(state.get("review_pending_reason", "")).strip() or f"Review the completed step from {state['last_agent']} before continuing."
@@ -3410,218 +3364,21 @@ class AgentRuntime:
                 )
                 return state
 
-        if (
-            not state.get("plan_steps")
-            and
-            state.get("last_agent") != "master_coding_agent"
-            and self._is_agent_available(state, "master_coding_agent")
-            and self._is_project_audit_request(state)
-        ):
-            reason = "The request is a project/codebase audit. Route to master_coding_agent for a structured production-readiness assessment."
-            objective = state.get("current_objective") or state.get("user_query", "")
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "master_coding_agent"
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="master_coding_agent",
-                    intent="project-audit-dispatch",
-                    content=objective,
-                    state_updates={"master_coding_request": objective, "coding_task": objective},
-                ),
-            )
-            return state
+        explicit_workflow = match_explicit_workflow(self, state, stage="late")
+        if explicit_workflow is not None:
+            return self._apply_workflow_dispatch_plan(state, explicit_workflow)
 
-        if (
-            not state.get("plan_steps")
-            and
-            state.get("last_agent") != "superrag_agent"
-            and self._is_agent_available(state, "superrag_agent")
-            and self._is_superrag_request(state)
-        ):
-            reason = (
-                "The request is a RAG/session knowledge-system workflow. "
-                "Route to superrag_agent for ingestion, indexing, session switching, or chat."
-            )
-            objective = state.get("current_objective") or state.get("user_query", "")
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "superrag_agent"
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="superrag_agent",
-                    intent="superrag-dispatch",
-                    content=objective,
-                    state_updates={"current_objective": objective},
-                ),
-            )
-            record_work_note(
-                state,
-                "orchestrator_agent",
-                "decision",
-                f"next_agent=superrag_agent\nreason={reason}\nstate_updates={{'current_objective': '{objective}'}}",
-            )
-            return state
-
-        if (
-            bool(state.get("research_pipeline_enabled", False))
-            and not bool(state.get("research_pipeline_completed", False))
-            and not state.get("plan_steps")
-            and state.get("last_agent") != "research_pipeline_agent"
-            and self._is_agent_available(state, "research_pipeline_agent")
-        ):
-            pipeline_query = state.get("current_objective") or state.get("user_query", "")
-            reason = (
-                "research_pipeline_enabled is set. Routing to research_pipeline_agent "
-                "to perform parallel multi-source evidence collection and LLM synthesis."
-            )
-            sources = state.get("research_sources") or ["web"]
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "research_pipeline_agent"
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="research_pipeline_agent",
-                    intent="research-pipeline-dispatch",
-                    content=pipeline_query,
-                    state_updates={
-                        "research_sources": sources,
-                        "research_pipeline_enabled": True,
-                    },
-                ),
-            )
-            record_work_note(
-                state,
-                "orchestrator_agent",
-                "decision",
-                (
-                    f"next_agent=research_pipeline_agent\nreason={reason}\n"
-                    f"state_updates={{'research_sources': {sources!r}, 'research_pipeline_enabled': True}}"
-                ),
-            )
-            return state
-
-        if (
-            not state.get("plan_steps")
-            and
-            state.get("last_agent") != "deep_research_agent"
-            and self._is_agent_available(state, "deep_research_agent")
-            and not self._is_long_document_request(state)
-            and self._is_deep_research_request(state)
-        ):
-            reason = "The request is a deep research task. Route to deep_research_agent for deep research execution."
-            research_query = state.get("current_objective") or state.get("user_query", "")
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "deep_research_agent"
-            state["workflow_type"] = state.get("workflow_type") or "deep_research"
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="deep_research_agent",
-                    intent="deep-research-dispatch",
-                    content=research_query,
-                    state_updates={"research_query": research_query},
-                ),
-            )
-            record_work_note(
-                state,
-                "orchestrator_agent",
-                "decision",
-                f"next_agent=deep_research_agent\nreason={reason}\nstate_updates={{'research_query': '{research_query}'}}",
-            )
-            return state
-
-        if (
-            not state.get("plan_steps")
-            and
-            state.get("last_agent") != "long_document_agent"
-            and self._is_agent_available(state, "long_document_agent")
-            and self._is_long_document_request(state)
-        ):
-            reason = (
-                "The request is a deep research report objective. "
-                "Route to long_document_agent for staged section research and final merge."
-            )
-            long_doc_objective = state.get("current_objective") or state.get("user_query", "")
-            updates = {
-                "current_objective": long_doc_objective,
-                "long_document_mode": True,
-            }
-            state["orchestrator_reason"] = reason
-            state["next_agent"] = "long_document_agent"
-            state["workflow_type"] = state.get("workflow_type") or ("deep_research" if self._is_deep_research_request(state) else "long_document")
-            state = append_task(
-                state,
-                make_task(
-                    sender="orchestrator_agent",
-                    recipient="long_document_agent",
-                    intent="long-document-dispatch",
-                    content=long_doc_objective,
-                    state_updates=updates,
-                ),
-            )
-            record_work_note(
-                state,
-                "orchestrator_agent",
-                "decision",
-                (
-                    "next_agent=long_document_agent\n"
-                    f"reason={reason}\n"
-                    f"state_updates={json.dumps(updates, ensure_ascii=False)}"
-                ),
-            )
-            return state
-
-        # --- Research synthesis: after a research agent finishes (no plan_steps), route to
-        # worker_agent for a clean final write-up instead of dumping raw research output. ---
-        if (
-            not state.get("plan_steps")
-            and not state.get("research_synthesis_done")
-            and state.get("last_agent") in {"research_pipeline_agent", "deep_research_agent"}
-            and self._is_agent_available(state, "worker_agent")
-        ):
-            research_body = (
-                str(state.get("research_pipeline_report") or "").strip()
-                or str(state.get("research_pipeline_synthesis") or "").strip()
-                or str(state.get("research_result") or "").strip()
-                or str(state.get("draft_response") or "").strip()
-            )
-            if research_body:
-                original_query = str(state.get("user_query") or state.get("current_objective") or "").strip()
-                synthesis_objective = (
-                    f"You have been given the following research findings collected from the web. "
-                    f"Write a comprehensive, well-structured, and easy-to-read final report that "
-                    f"directly answers the user's query. Cite sources where available. Do not omit "
-                    f"important details.\n\n"
-                    f"User's original query: {original_query}\n\n"
-                    f"Research findings:\n{research_body[:12000]}"
-                )
-                state["research_synthesis_done"] = True
-                state["current_objective"] = synthesis_objective
-                reason = (
-                    "Research collection complete. Routing to worker_agent to synthesize "
-                    "the findings into a final structured report."
-                )
-                state["orchestrator_reason"] = reason
-                state["next_agent"] = "worker_agent"
-                state = append_task(
-                    state,
-                    make_task(
-                        sender="orchestrator_agent",
-                        recipient="worker_agent",
-                        intent="research-synthesis",
-                        content=synthesis_objective,
-                        state_updates={"current_objective": synthesis_objective},
-                    ),
-                )
-                log_task_update("Orchestrator", reason)
-                return state
+        explicit_workflow = match_explicit_workflow(self, state, stage="continuation")
+        if explicit_workflow is not None:
+            return self._apply_workflow_dispatch_plan(state, explicit_workflow)
 
         state["_policy_blocked_agents"] = sorted(self._policy_blocked_agents(state))
+        execution_mode = self._resolve_execution_mode(state, default="adaptive")
+        direct_tool_rule = (
+            "- Direct tool mode is enabled: prefer specialized `mcp_*` and `skill_*` agents (or other domain-specific agents) over `worker_agent` when a match exists."
+            if execution_mode == "direct_tools"
+            else ""
+        )
 
         prompt = f"""
 You are the orchestration agent for a plugin-driven multi-agent AI system.
@@ -3646,6 +3403,7 @@ Rules:
 - If the reviewer already requested a retry, follow that instruction rather than inventing a different reroute.
 - Avoid repeating the same failing agent unless the inputs changed.
 - Put only useful state updates for the chosen agent in `state_updates`.
+{direct_tool_rule}
 
 Current user query:
 {state.get("user_query", "")}
@@ -3897,6 +3655,91 @@ Return ONLY valid JSON in this exact schema:
                     "Run cancelled per your response. Add more source files and re-run when ready, "
                     "or reply with updated instructions to proceed."
                 )
+                return
+
+        if scope == "integration_communication_access":
+            if response["action"] == "approve":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["communication_authorized"] = True
+                return
+            if response["action"] == "revise":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["user_cancelled"] = True
+                initial_state["final_output"] = "Integration access cancelled by user."
+                return
+
+        if scope == "integration_aws_access":
+            if response["action"] == "approve":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["aws_authorized"] = True
+                return
+            if response["action"] == "revise":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["user_cancelled"] = True
+                initial_state["final_output"] = "AWS access cancelled by user."
+                return
+
+        if scope == "integration_github_write_access":
+            if response["action"] == "approve":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["github_write_authorized"] = True
+                return
+            if response["action"] == "revise":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["user_cancelled"] = True
+                initial_state["final_output"] = "GitHub write access cancelled by user."
+                return
+
+        if scope == "integration_github_local_git_access":
+            if response["action"] == "approve":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["github_local_git_authorized"] = True
+                return
+            if response["action"] == "revise":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["user_cancelled"] = True
+                initial_state["final_output"] = "Local git mutation access cancelled by user."
+                return
+
+        if scope == "integration_github_remote_git_access":
+            if response["action"] == "approve":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["github_remote_git_authorized"] = True
+                return
+            if response["action"] == "revise":
+                initial_state["pending_user_input_kind"] = ""
+                initial_state["approval_pending_scope"] = ""
+                initial_state["pending_user_question"] = ""
+                initial_state["approval_request"] = {}
+                initial_state["user_cancelled"] = True
+                initial_state["final_output"] = "Remote git access cancelled by user."
                 return
 
         if scope in {"shell_command", "shell_plan_step"}:
@@ -4293,7 +4136,13 @@ Return ONLY valid JSON in this exact schema:
             "review_subject_step_id": "",
             "review_subject_agent": "",
             "review_revision_counts": {},
+            "direct_tool_loop_attempted": False,
+            "direct_tool_trace": [],
+            "direct_tool_last_result": {},
+            "direct_tool_fallback_reason": "",
+            "direct_tool_native_fallback_reason": "",
             "adaptive_agent_selection": _truthy(overrides.get("adaptive_agent_selection"), True),
+            "execution_mode": str(overrides.get("execution_mode", "adaptive") or "adaptive").strip().lower() or "adaptive",
             "planner_policy_mode": str(
                 overrides.get("planner_policy_mode", overrides.get("planner_mode", "adaptive")) or "adaptive"
             ).strip().lower() or "adaptive",
@@ -4307,6 +4156,9 @@ Return ONLY valid JSON in this exact schema:
             "enforce_quality_gate": bool(overrides.get("enforce_quality_gate", True)),
             "quality_gate_passed": False,
             "quality_gate_report": "",
+            "github_write_authorized": _truthy(overrides.get("github_write_authorized"), False),
+            "github_local_git_authorized": _truthy(overrides.get("github_local_git_authorized"), False),
+            "github_remote_git_authorized": _truthy(overrides.get("github_remote_git_authorized"), False),
             "worker_calls": 0,
             "reviewer_calls": 0,
             "revision_count": 0,
@@ -4350,6 +4202,11 @@ Return ONLY valid JSON in this exact schema:
             aliases=("planner_mode",),
             default="adaptive",
         )
+        initial_state["execution_mode"] = self._resolve_execution_mode(initial_state, default="adaptive")
+        if initial_state["execution_mode"] == "direct_tools":
+            initial_state["planner_policy_mode"] = "never"
+        elif initial_state["execution_mode"] == "plan":
+            initial_state["planner_policy_mode"] = "always"
         initial_state["reviewer_policy_mode"] = self._resolve_policy_mode(
             initial_state,
             primary_key="reviewer_policy_mode",
@@ -4376,6 +4233,10 @@ Return ONLY valid JSON in this exact schema:
                 ).strip().lower()
                 if persisted_planner_mode:
                     initial_state["planner_policy_mode"] = persisted_planner_mode
+            if "execution_mode" not in overrides:
+                persisted_execution_mode = str(prior_channel_state.get("execution_mode", "") or "").strip().lower()
+                if persisted_execution_mode:
+                    initial_state["execution_mode"] = persisted_execution_mode
             if "reviewer_policy_mode" not in overrides and "reviewer_mode" not in overrides:
                 persisted_reviewer_mode = str(
                     prior_channel_state.get("reviewer_policy_mode", prior_channel_state.get("reviewer_mode", ""))
@@ -4502,6 +4363,11 @@ Return ONLY valid JSON in this exact schema:
             aliases=("planner_mode",),
             default="adaptive",
         )
+        initial_state["execution_mode"] = self._resolve_execution_mode(initial_state, default="adaptive")
+        if initial_state["execution_mode"] == "direct_tools":
+            initial_state["planner_policy_mode"] = "never"
+        elif initial_state["execution_mode"] == "plan":
+            initial_state["planner_policy_mode"] = "always"
         initial_state["reviewer_policy_mode"] = self._resolve_policy_mode(
             initial_state,
             primary_key="reviewer_policy_mode",
@@ -4520,6 +4386,11 @@ Return ONLY valid JSON in this exact schema:
             aliases=("planner_mode",),
             default="adaptive",
         )
+        initial_state["execution_mode"] = self._resolve_execution_mode(initial_state, default="adaptive")
+        if initial_state["execution_mode"] == "direct_tools":
+            initial_state["planner_policy_mode"] = "never"
+        elif initial_state["execution_mode"] == "plan":
+            initial_state["planner_policy_mode"] = "always"
         initial_state["reviewer_policy_mode"] = self._resolve_policy_mode(
             initial_state,
             primary_key="reviewer_policy_mode",

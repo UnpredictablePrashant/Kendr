@@ -23,6 +23,24 @@ def _bool_value(value, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalize_access_mode(value, default: str = "sandbox") -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized not in {"sandbox", "full_access"}:
+        return str(default or "sandbox").strip().lower() or "sandbox"
+    return normalized
+
+
+def _normalize_desktop_permissions(payload, *, defaults: dict | None = None) -> dict:
+    base = defaults if isinstance(defaults, dict) else {}
+    raw = payload if isinstance(payload, dict) else {}
+    return {
+        "allow": _bool_value(raw.get("allow"), bool(base.get("allow", False))),
+        "apps": _string_list(raw.get("apps", base.get("apps", []))),
+        "access_mode": _normalize_access_mode(raw.get("access_mode"), str(base.get("access_mode", "sandbox") or "sandbox")),
+        "warn_on_full_access": _bool_value(raw.get("warn_on_full_access"), bool(base.get("warn_on_full_access", True))),
+    }
+
+
 def _normalize_paths(paths, *, cwd: str = "") -> list[str]:
     resolved: list[str] = []
     base = str(cwd or "").strip()
@@ -61,6 +79,12 @@ def default_permission_manifest(*, skill_type: str = "", catalog_id: str = "", c
             "allow_root": False,
             "allow_destructive": False,
         },
+        "desktop": {
+            "allow": False,
+            "apps": [],
+            "access_mode": "sandbox",
+            "warn_on_full_access": True,
+        },
     }
     kind = str(skill_type or "").strip().lower()
     catalog = str(catalog_id or "").strip().lower()
@@ -79,6 +103,18 @@ def default_permission_manifest(*, skill_type: str = "", catalog_id: str = "", c
     elif kind == "catalog" and catalog == "api-caller":
         manifest["requires_approval"] = True
         manifest["network"]["allow"] = True
+    elif kind == "catalog" and catalog == "desktop-automation":
+        manifest["desktop"] = {
+            "allow": True,
+            "apps": [
+                "generic",
+                "whatsapp",
+                "telegram",
+                "microsoft_365",
+            ],
+            "access_mode": "sandbox",
+            "warn_on_full_access": True,
+        }
     return manifest
 
 
@@ -95,6 +131,7 @@ def normalize_permission_manifest(
     raw_env = raw.get("environment", {}) if isinstance(raw.get("environment"), dict) else {}
     raw_network = raw.get("network", {}) if isinstance(raw.get("network"), dict) else {}
     raw_shell = raw.get("shell", {}) if isinstance(raw.get("shell"), dict) else {}
+    raw_desktop = raw.get("desktop", {}) if isinstance(raw.get("desktop"), dict) else {}
 
     manifest = {
         "requires_approval": _bool_value(raw.get("requires_approval"), bool(defaults.get("requires_approval", False))),
@@ -114,6 +151,7 @@ def normalize_permission_manifest(
             "allow_root": _bool_value(raw_shell.get("allow_root"), bool(defaults["shell"]["allow_root"])),
             "allow_destructive": _bool_value(raw_shell.get("allow_destructive"), bool(defaults["shell"]["allow_destructive"])),
         },
+        "desktop": _normalize_desktop_permissions(raw_desktop, defaults=defaults.get("desktop", {})),
     }
     return manifest
 
@@ -188,6 +226,10 @@ def summarize_permission_manifest(manifest: dict) -> dict:
         "shell_allowed": bool(shell.get("allow", False)),
         "network_allowed": bool(network.get("allow", False)),
         "network_domains": _string_list(network.get("domains")),
+        "desktop_allowed": bool((manifest.get("desktop", {}) or {}).get("allow", False)),
+        "desktop_apps": _string_list((manifest.get("desktop", {}) or {}).get("apps")),
+        "desktop_access_mode": _normalize_access_mode((manifest.get("desktop", {}) or {}).get("access_mode"), "sandbox"),
+        "desktop_warn_on_full_access": bool((manifest.get("desktop", {}) or {}).get("warn_on_full_access", True)),
     }
 
 
@@ -211,6 +253,16 @@ def permission_manifest_items(manifest: dict) -> list[str]:
     if summary.get("network_allowed"):
         domains = summary.get("network_domains", []) or []
         items.append("Network domains: " + (", ".join(domains) if domains else "any"))
+    if summary.get("desktop_allowed"):
+        desktop_apps = summary.get("desktop_apps", []) or []
+        desktop_mode = str(summary.get("desktop_access_mode", "sandbox") or "sandbox")
+        items.append(
+            "Desktop automation: "
+            + ("full local access" if desktop_mode == "full_access" else "sandbox preview")
+            + (" for " + ", ".join(desktop_apps) if desktop_apps else "")
+        )
+        if desktop_mode == "full_access" and summary.get("desktop_warn_on_full_access"):
+            items.append("Warning: full access can launch or hand off to native applications outside the OS sandbox")
     if not items:
         items.append("No elevated permissions declared")
     return items

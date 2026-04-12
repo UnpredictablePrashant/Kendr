@@ -1940,6 +1940,131 @@ def _start_standalone_run_background(run_id: str, payload: dict) -> None:
     t.start()
 
 
+def _llm_chunk_text(chunk: object) -> str:
+    content = getattr(chunk, "content", chunk)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                txt = item.get("text") or item.get("content") or item.get("value") or ""
+                if txt:
+                    parts.append(str(txt))
+                continue
+            if item is not None:
+                parts.append(str(item))
+        return "".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _start_simple_chat_stream_background(run_id: str, payload: dict) -> None:
+    def _run() -> None:
+        _push_event(run_id, "status", {"status": "running", "message": "Generating response..."})
+        try:
+            from kendr.llm_router import build_llm, get_active_provider, get_model_for_provider
+            from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+            text = str(payload.get("text") or payload.get("message") or "").strip()
+            model_override = str(payload.get("model") or "").strip() or None
+            provider_override = str(payload.get("provider") or "").strip() or None
+            local_paths = payload.get("local_drive_paths") or []
+            if not isinstance(local_paths, list):
+                local_paths = []
+            history = payload.get("history") if isinstance(payload.get("history"), list) else []
+
+            provider = provider_override or get_active_provider()
+            model = model_override or get_model_for_provider(provider)
+            llm = build_llm(provider, model)
+
+            attachment_notes: list[str] = []
+            for raw_path in local_paths[:8]:
+                candidate = normalize_host_path_str(str(raw_path or "").strip())
+                if not candidate:
+                    continue
+                try:
+                    if os.path.isfile(candidate):
+                        with open(candidate, "r", encoding="utf-8", errors="replace") as fh:
+                            excerpt = fh.read(2000)
+                        attachment_notes.append(
+                            f"=== Attached file: {os.path.basename(candidate)} ===\nPath: {candidate}\n{excerpt}"
+                        )
+                    elif os.path.isdir(candidate):
+                        entries = sorted(os.listdir(candidate))[:40]
+                        attachment_notes.append(
+                            f"=== Attached folder: {os.path.basename(candidate)} ===\nPath: {candidate}\nEntries: {entries}"
+                        )
+                except Exception:
+                    attachment_notes.append(f"Attached path: {candidate}")
+
+            system_ctx = (
+                "You are Kendr in simple chat mode. "
+                "Answer directly and helpfully. "
+                "Do not mention agents, orchestration, runs, artifacts, plans, or internal workflows. "
+                "Only provide a plain assistant answer. "
+                "If attached local files or folders are available, use their excerpts or path summaries when relevant."
+            )
+            if attachment_notes:
+                system_ctx += "\n\nAttached local context:\n" + "\n\n".join(attachment_notes)
+
+            messages = [SystemMessage(content=system_ctx)]
+            for item in history[-14:]:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                content = str(item.get("content") or "").strip()
+                if not content:
+                    continue
+                if role == "user":
+                    messages.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    messages.append(AIMessage(content=content))
+            messages.append(HumanMessage(content=text))
+
+            answer_parts: list[str] = []
+            try:
+                for chunk in llm.stream(messages):
+                    delta = _llm_chunk_text(chunk)
+                    if not delta:
+                        continue
+                    answer_parts.append(delta)
+                    _push_event(run_id, "delta", {"delta": delta})
+            except Exception:
+                answer_parts = []
+
+            answer = "".join(answer_parts).strip()
+            if not answer:
+                response = llm.invoke(messages)
+                answer = _llm_chunk_text(response).strip()
+
+            result = {
+                "run_id": run_id,
+                "status": "completed",
+                "provider": provider,
+                "model": model,
+                "answer": answer,
+                "final_output": answer,
+            }
+            with _pending_lock:
+                _pending_runs[run_id] = _pending_run_state(run_id, payload=payload, status="completed", result=result)
+            _push_event(run_id, "result", result)
+            _push_event(run_id, "done", {"run_id": run_id, "status": "completed", "awaiting_user_input": False})
+        except Exception as exc:
+            err = str(exc)
+            with _pending_lock:
+                _pending_runs[run_id] = _pending_run_state(run_id, payload=payload, status="failed", error=err)
+            _push_event(run_id, "error", {"message": err})
+            _push_event(run_id, "done", {"run_id": run_id, "status": "failed"})
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+
 _CHAT_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -2311,6 +2436,7 @@ a:hover { text-decoration: underline; }
     <div class="chat-command-track" id="chatCommandTrack">Ask a question or launch a task. Kendr will show the live task, substeps, commands, and timing as the run progresses.</div>
     <div class="chat-command-modes">
       <div class="chat-command-chip active" id="chatModeChip">Chat</div>
+      <div class="chat-command-chip" id="chatExecutionChip">Adaptive</div>
       <div class="chat-command-chip" id="chatResearchChip">Auto</div>
       <div class="chat-command-chip" id="chatShellChip">Shell Off</div>
       <div class="chat-command-chip" id="chatSecurityChip" style="display:none">Security Off</div>
@@ -2333,6 +2459,8 @@ a:hover { text-decoration: underline; }
   </div>
   <div class="input-area">
     <div class="mode-row">
+      <button class="mode-pill" id="modeDirectToolsBtn" onclick="setExecutionMode('direct_tools')">Direct Tools</button>
+      <button class="mode-pill" id="modePlanModeBtn" onclick="setExecutionMode('plan')">Plan Mode</button>
       <button class="mode-pill active" id="modeAutoBtn" onclick="setResearchMode('auto')">Auto</button>
       <button class="mode-pill" id="modeDeepResearchBtn" onclick="setResearchMode('deep_research')">Deep Research</button>
       <button class="mode-pill" id="modeSecurityBtn" onclick="setSecurityMode(!securityMode)" title="Security Assessment — requires explicit authorization before any scan runs">&#x1F6E1; Security</button>
@@ -2554,6 +2682,8 @@ let _loadRunToken = 0;
 let shellModeActive = false;
 let securityMode = false;
 let researchMode = 'auto';
+let executionMode = (localStorage.getItem('kendr_execution_mode') || 'adaptive').toLowerCase();
+if (!['direct_tools', 'plan', 'adaptive'].includes(executionMode)) executionMode = 'adaptive';
 let deepResearchUploadedRoots = [];
 let deepResearchLocalPaths = [];
 let deepResearchPanelCollapsed = (localStorage.getItem('kendr_deep_research_collapsed') || '0') === '1';
@@ -2735,6 +2865,7 @@ function _renderChatInspector() {
   const cmdEl = document.getElementById('chatInspectorCommand');
   const trackEl = document.getElementById('chatCommandTrack');
   const shellChip = document.getElementById('chatShellChip');
+  const executionChip = document.getElementById('chatExecutionChip');
   const modeChip = document.getElementById('chatResearchChip');
   const chatChip = document.getElementById('chatModeChip');
   if (runTitle) runTitle.textContent = _chatRunState.title || 'No active run';
@@ -2751,7 +2882,8 @@ function _renderChatInspector() {
     }
   }
   if (statusEl) statusEl.textContent = _chatStatusLabel(_chatRunState.status);
-  if (modeEl) modeEl.textContent = researchMode === 'deep_research' ? 'Deep Research' : 'Auto';
+  const execLabel = executionMode === 'plan' ? 'Plan Mode' : (executionMode === 'adaptive' ? 'Adaptive' : 'Direct Tools');
+  if (modeEl) modeEl.textContent = execLabel + ' · ' + (researchMode === 'deep_research' ? 'Deep Research' : 'Auto');
   if (runIdEl) {
     const workflowText = _chatRunState.workflowId || _chatRunState.runId || '-';
     const attemptText = _chatRunState.attemptId && _chatRunState.attemptId !== workflowText ? ' / ' + _chatRunState.attemptId : '';
@@ -2784,6 +2916,10 @@ function _renderChatInspector() {
   if (modeChip) {
     modeChip.textContent = researchMode === 'deep_research' ? 'Deep Research' : 'Auto';
     modeChip.classList.toggle('active', researchMode === 'deep_research');
+  }
+  if (executionChip) {
+    executionChip.textContent = execLabel;
+    executionChip.classList.toggle('active', executionMode === 'direct_tools' || executionMode === 'plan');
   }
   const secChip = document.getElementById('chatSecurityChip');
   if (secChip) {
@@ -2826,6 +2962,17 @@ function setResearchMode(mode) {
     toggleDeepResearchWebSearch();
     renderDeepResearchSourceSummary();
   }
+  _renderChatInspector();
+}
+
+function setExecutionMode(mode) {
+  const normalized = String(mode || 'direct_tools').toLowerCase();
+  executionMode = normalized === 'plan' ? 'plan' : (normalized === 'adaptive' ? 'adaptive' : 'direct_tools');
+  localStorage.setItem('kendr_execution_mode', executionMode);
+  const directBtn = document.getElementById('modeDirectToolsBtn');
+  const planBtn = document.getElementById('modePlanModeBtn');
+  if (directBtn) directBtn.classList.toggle('active', executionMode === 'direct_tools');
+  if (planBtn) planBtn.classList.toggle('active', executionMode === 'plan');
   _renderChatInspector();
 }
 
@@ -4992,6 +5139,13 @@ async function sendMessage() {
       attempt_id: runId,
       working_directory: workingDir
     };
+    payload.execution_mode = executionMode;
+    if (executionMode === 'plan') {
+      payload.planner_mode = 'always';
+      payload.auto_approve_plan = false;
+    } else if (executionMode === 'direct_tools') {
+      payload.planner_mode = 'never';
+    }
     if (researchMode === 'deep_research') {
       const webSearchEnabled = !!((document.getElementById('drWebSearch') || {}).checked);
       const localPaths = _allDeepResearchLocalPaths();
@@ -5081,6 +5235,7 @@ checkGateway();
 loadRuns();
 loadProjContext();
 setResearchMode('auto');
+setExecutionMode(executionMode);
 renderDeepResearchSourceSummary();
 _renderChatInspector();
 _setChatComposerState();
@@ -12178,13 +12333,14 @@ strong { color: var(--text); }
         if project_build_mode:
             payload["project_build_mode"] = True
         for key in ("project_id", "project_name", "project_stack", "stack", "project_root",
-                    "github_repo", "auto_approve", "skip_test_agent", "skip_devops_agent",
+                    "github_repo", "auto_approve", "auto_approve_plan", "skip_test_agent", "skip_devops_agent",
                     "shell_auto_approve", "privileged_mode", "privileged_approved",
                     "privileged_approval_note", "privileged_approval_mode",
                     "privileged_require_approvals", "privileged_read_only",
                     "privileged_allow_root", "privileged_allow_destructive",
                     "privileged_enable_backup", "privileged_allowed_paths", "privileged_allowed_domains",
                     "workflow_type", "deep_research_mode",
+                    "execution_mode", "planner_mode",
                     "long_document_mode", "long_document_pages", "long_document_title",
                     "research_output_formats", "research_citation_style",
                     "research_enable_plagiarism_check", "research_web_search_enabled", "research_date_range",
@@ -12361,6 +12517,7 @@ strong { color: var(--text); }
                         resume_payload[key] = bool(body.get(key))
                 for key in (
                     "provider", "model", "project_id", "project_root", "project_name", "workflow_type",
+                    "execution_mode", "planner_mode", "auto_approve_plan",
                     "shell_auto_approve", "privileged_mode", "privileged_approved", "privileged_approval_note",
                     "privileged_approval_mode", "privileged_require_approvals", "privileged_read_only",
                     "privileged_allow_root", "privileged_allow_destructive", "privileged_enable_backup",
@@ -13245,15 +13402,37 @@ strong { color: var(--text); }
             self._json(400, {"error": "missing_text"})
             return
 
+        stream = bool(body.get("stream"))
+        if stream:
+            run_id = str(body.get("run_id") or "").strip() or f"ui-{uuid.uuid4().hex[:8]}"
+            payload = dict(body)
+            payload["run_id"] = run_id
+            payload["text"] = text
+            q: "queue.Queue[dict]" = queue.Queue()
+            with _pending_lock:
+                _run_event_queues[run_id] = q
+                _pending_runs[run_id] = _pending_run_state(run_id, payload=payload, status="running")
+            _start_simple_chat_stream_background(run_id, payload)
+            self._json(
+                200,
+                {
+                    "run_id": run_id,
+                    "streaming": True,
+                    "status": "started",
+                },
+            )
+            return
+
         model_override = str(body.get("model") or "").strip() or None
         provider_override = str(body.get("provider") or "").strip() or None
         local_paths = body.get("local_drive_paths") or []
         if not isinstance(local_paths, list):
             local_paths = []
+        history = body.get("history") if isinstance(body.get("history"), list) else []
 
         try:
             from kendr.llm_router import build_llm, get_active_provider, get_model_for_provider
-            from langchain_core.messages import HumanMessage, SystemMessage
+            from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
             provider = provider_override or get_active_provider()
             model = model_override or get_model_for_provider(provider)
@@ -13289,7 +13468,19 @@ strong { color: var(--text); }
             if attachment_notes:
                 system_ctx += "\n\nAttached local context:\n" + "\n\n".join(attachment_notes)
 
-            messages = [SystemMessage(content=system_ctx), HumanMessage(content=text)]
+            messages = [SystemMessage(content=system_ctx)]
+            for item in history[-14:]:
+                if not isinstance(item, dict):
+                    continue
+                role = str(item.get("role") or "").strip().lower()
+                content = str(item.get("content") or "").strip()
+                if not content:
+                    continue
+                if role == "user":
+                    messages.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    messages.append(AIMessage(content=content))
+            messages.append(HumanMessage(content=text))
             response = llm.invoke(messages)
             answer = response.content if hasattr(response, "content") else str(response)
             self._json(200, {"answer": answer, "provider": provider, "model": model})

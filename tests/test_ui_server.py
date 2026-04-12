@@ -1687,6 +1687,7 @@ class TestDeepResearchChatPayload(unittest.TestCase):
             "project_root": "/tmp/demo",
             "project_name": "Demo",
             "run_id": "ui-project-run",
+            "execution_mode": "plan",
             "shell_auto_approve": True,
             "privileged_allow_destructive": True,
             "privileged_allowed_paths": ["/tmp/demo"],
@@ -1701,7 +1702,16 @@ class TestDeepResearchChatPayload(unittest.TestCase):
         ):
             handler._handle_chat(body)
 
-        handler._json.assert_called_once_with(200, {"run_id": "ui-project-run", "streaming": True, "status": "started"})
+        handler._json.assert_called_once_with(
+            200,
+            {
+                "run_id": "ui-project-run",
+                "workflow_id": "ui-project-run",
+                "attempt_id": "ui-project-run",
+                "streaming": True,
+                "status": "started",
+            },
+        )
         persist_user.assert_called_once()
         forwarded = start_run.call_args.args[1]
         self.assertEqual(forwarded["channel"], "project_ui")
@@ -1710,6 +1720,7 @@ class TestDeepResearchChatPayload(unittest.TestCase):
         self.assertEqual(forwarded["project_root"], "/tmp/demo")
         self.assertEqual(forwarded["working_directory"], "/tmp/demo")
         self.assertEqual(forwarded["project_name"], "Demo")
+        self.assertEqual(forwarded["execution_mode"], "plan")
         self.assertTrue(forwarded["shell_auto_approve"])
         self.assertTrue(forwarded["privileged_allow_destructive"])
         self.assertEqual(forwarded["privileged_allowed_paths"], ["/tmp/demo"])

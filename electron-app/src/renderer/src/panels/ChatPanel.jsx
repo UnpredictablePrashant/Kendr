@@ -74,6 +74,13 @@ function chatReducer(s, a) {
   switch (a.type) {
     case 'ADD_MSG':     return { ...s, messages: [...s.messages, a.msg] }
     case 'UPD_MSG':     return { ...s, messages: s.messages.map(m => m.id === a.id ? { ...m, ...a.patch } : m) }
+    case 'APPEND_MSG_CONTENT':
+      return {
+        ...s,
+        messages: s.messages.map(m => (
+          m.id === a.id ? { ...m, content: `${m.content || ''}${a.delta || ''}` } : m
+        )),
+      }
     case 'ADD_STEP': {
       const msgs = s.messages.map(m => {
         if (m.id !== a.msgId) return m
@@ -166,6 +173,21 @@ function modeLabel(mode) {
   if (mode === 'agent') return 'Agent'
   if (mode === 'research') return 'Deep Research'
   return 'Chat'
+}
+
+function buildSimpleHistory(messages, maxTurns = 12) {
+  const safe = Array.isArray(messages) ? messages : []
+  return safe
+    .filter(m => (
+      (m?.role === 'user' || m?.role === 'assistant')
+      && String(m?.content || '').trim()
+      && !['thinking', 'streaming'].includes(String(m?.status || ''))
+    ))
+    .slice(-maxTurns)
+    .map(m => ({
+      role: m.role,
+      content: String(m.content || '').trim(),
+    }))
 }
 
 function formatDuration(totalSeconds) {
@@ -411,6 +433,8 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       }
 
       if (isSimpleStudioChat && !isResume) {
+        body.history = buildSimpleHistory(chat.messages, 14)
+        body.stream = true
         const resp = await fetch(endpoint, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -420,12 +444,23 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         if (!resp.ok) {
           refreshModelInventory(true)
           dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: data.error || data.detail || resp.statusText, status: 'error', runId: null } })
+          dispatch({ type: 'SET_STREAMING', val: false })
+          appDispatch({ type: 'SET_STREAMING', streaming: false })
+          return
+        }
+
+        if (data.streaming) {
+          const effectiveRunId = data.run_id || runId
+          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { runId: effectiveRunId, status: 'thinking' } })
+          dispatch({ type: 'SET_RUN', id: effectiveRunId })
+          openStream(effectiveRunId, asstMsgId)
+          return
         } else {
           dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: data.answer || '', status: 'done', runId: null, artifacts: [] } })
+          dispatch({ type: 'SET_STREAMING', val: false })
+          appDispatch({ type: 'SET_STREAMING', streaming: false })
+          return
         }
-        dispatch({ type: 'SET_STREAMING', val: false })
-        appDispatch({ type: 'SET_STREAMING', streaming: false })
-        return
       }
 
       const resp = await fetch(endpoint, {
@@ -494,6 +529,15 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             startedAt:     step.started_at || '',
           }
         })
+        dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: 'streaming' } })
+      } catch (_) {}
+    })
+
+    es.addEventListener('delta', e => {
+      try {
+        const d = JSON.parse(e.data)
+        if (!d.delta) return
+        dispatch({ type: 'APPEND_MSG_CONTENT', id: asstMsgId, delta: String(d.delta) })
         dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { status: 'streaming' } })
       } catch (_) {}
     })
@@ -1134,8 +1178,13 @@ function AssistantMessage({ msg }) {
         {/* Final content */}
         {msg.content && msg.status !== 'error' && (
           <div className="kc-content">
-            <MarkdownRenderer content={msg.content} />
-            <button className="kc-copy-btn" onClick={copy}>{copied ? '✓' : '⧉'}</button>
+            <div className="kc-content-actions">
+              <button className="kc-copy-btn" onClick={copy}>{copied ? 'Copied' : 'Copy'}</button>
+            </div>
+            <MarkdownRenderer
+              content={msg.content}
+              isStreaming={['thinking', 'streaming'].includes(String(msg.status || ''))}
+            />
           </div>
         )}
 
@@ -1196,32 +1245,193 @@ function StepCard({ step }) {
 }
 
 // ─── Markdown renderer ────────────────────────────────────────────────────────
-function MarkdownRenderer({ content }) {
-  const parts = []
-  const re = /```(\w*)\n?([\s\S]*?)```/g
-  let last = 0, m
-  while ((m = re.exec(content)) !== null) {
-    if (m.index > last) parts.push({ t: 'text', v: content.slice(last, m.index) })
-    parts.push({ t: 'code', lang: m[1], v: m[2].trimEnd() })
-    last = m.index + m[0].length
+function MarkdownRenderer({ content, isStreaming = false }) {
+  if (isStreaming) {
+    return (
+      <div className="kc-md kc-md--live">
+        <pre className="kc-md-live-text">{String(content || '')}</pre>
+      </div>
+    )
   }
-  if (last < content.length) parts.push({ t: 'text', v: content.slice(last) })
+
+  const blocks = parseMarkdown(content || '')
   return (
     <div className="kc-md">
-      {parts.map((p, i) =>
-        p.t === 'code' ? <CodeBlock key={i} lang={p.lang} code={p.v} /> : <InlineText key={i} text={p.v} />
-      )}
+      {blocks.map((b, i) => (
+        <MarkdownBlock key={`${b.type}-${i}`} block={b} />
+      ))}
     </div>
   )
 }
 
+function MarkdownBlock({ block }) {
+  if (block.type === 'code') return <CodeBlock lang={block.lang} code={block.code} />
+  if (block.type === 'heading') {
+    const HeadingTag = `h${Math.min(6, Math.max(1, Number(block.level) || 1))}`
+    return (
+      <HeadingTag className={`kc-md-heading kc-md-heading--h${block.level}`}>
+        <InlineText text={block.text} />
+      </HeadingTag>
+    )
+  }
+  if (block.type === 'ol') {
+    return (
+      <ol className="kc-md-list kc-md-list--ol" start={block.start || 1}>
+        {block.items.map((item, idx) => (
+          <li key={idx}><InlineText text={item} /></li>
+        ))}
+      </ol>
+    )
+  }
+  if (block.type === 'ul') {
+    return (
+      <ul className="kc-md-list kc-md-list--ul">
+        {block.items.map((item, idx) => (
+          <li key={idx}><InlineText text={item} /></li>
+        ))}
+      </ul>
+    )
+  }
+  if (block.type === 'quote') {
+    return (
+      <blockquote className="kc-md-quote">
+        {block.lines.map((line, idx) => (
+          <p key={idx}><InlineText text={line} /></p>
+        ))}
+      </blockquote>
+    )
+  }
+  return (
+    <p className="kc-md-paragraph">
+      <InlineText text={block.text} />
+    </p>
+  )
+}
+
+function parseMarkdown(content) {
+  const lines = String(content || '').replace(/\r\n/g, '\n').split('\n')
+  const blocks = []
+  let i = 0
+
+  const isBlockStart = (line) => (
+    /^```/.test(line)
+    || /^(#{1,6})\s+/.test(line)
+    || /^>\s?/.test(line)
+    || /^\d+\.\s+/.test(line)
+    || /^[-*]\s+/.test(line)
+  )
+
+  while (i < lines.length) {
+    const line = lines[i]
+
+    if (!line.trim()) { i += 1; continue }
+
+    if (/^```/.test(line)) {
+      const lang = line.replace(/^```/, '').trim()
+      i += 1
+      const codeLines = []
+      while (i < lines.length && !/^```/.test(lines[i])) {
+        codeLines.push(lines[i])
+        i += 1
+      }
+      if (i < lines.length && /^```/.test(lines[i])) i += 1
+      blocks.push({ type: 'code', lang, code: codeLines.join('\n').trimEnd() })
+      continue
+    }
+
+    const headingMatch = line.match(/^(#{1,6})\s+(.+)$/)
+    if (headingMatch) {
+      blocks.push({ type: 'heading', level: headingMatch[1].length, text: headingMatch[2] })
+      i += 1
+      continue
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quoteLines = []
+      while (i < lines.length && /^>\s?/.test(lines[i])) {
+        quoteLines.push(lines[i].replace(/^>\s?/, ''))
+        i += 1
+      }
+      blocks.push({ type: 'quote', lines: quoteLines })
+      continue
+    }
+
+    const ordered = line.match(/^(\d+)\.\s+(.+)$/)
+    if (ordered) {
+      const items = []
+      const start = Number(ordered[1]) || 1
+      while (i < lines.length) {
+        const m = lines[i].match(/^\d+\.\s+(.+)$/)
+        if (!m) break
+        items.push(m[1])
+        i += 1
+      }
+      blocks.push({ type: 'ol', start, items })
+      continue
+    }
+
+    if (/^[-*]\s+/.test(line)) {
+      const items = []
+      while (i < lines.length) {
+        const m = lines[i].match(/^[-*]\s+(.+)$/)
+        if (!m) break
+        items.push(m[1])
+        i += 1
+      }
+      blocks.push({ type: 'ul', items })
+      continue
+    }
+
+    const para = []
+    while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) {
+      para.push(lines[i].trim())
+      i += 1
+    }
+    blocks.push({ type: 'paragraph', text: para.join(' ') })
+  }
+
+  return blocks
+}
+
 function InlineText({ text }) {
-  const html = text
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/`([^`]+)`/g, '<code class="kc-inline-code">$1</code>')
-    .replace(/\n/g, '<br/>')
-  return <span dangerouslySetInnerHTML={{ __html: html }} />
+  const src = String(text || '')
+  const nodes = []
+  const re = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`|\[[^\]]+\]\((https?:\/\/[^\s)]+)\))/g
+  let last = 0
+  let match
+  while ((match = re.exec(src)) !== null) {
+    if (match.index > last) {
+      nodes.push(src.slice(last, match.index))
+    }
+    const token = match[0]
+    if (token.startsWith('**') && token.endsWith('**')) {
+      nodes.push(<strong key={`b-${match.index}`}>{token.slice(2, -2)}</strong>)
+    } else if (token.startsWith('*') && token.endsWith('*')) {
+      nodes.push(<em key={`i-${match.index}`}>{token.slice(1, -1)}</em>)
+    } else if (token.startsWith('`') && token.endsWith('`')) {
+      nodes.push(<code key={`c-${match.index}`} className="kc-inline-code">{token.slice(1, -1)}</code>)
+    } else {
+      const linkMatch = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/)
+      if (linkMatch) {
+        nodes.push(
+          <a
+            key={`a-${match.index}`}
+            href={linkMatch[2]}
+            target="_blank"
+            rel="noreferrer"
+            className="kc-md-link"
+          >
+            {linkMatch[1]}
+          </a>
+        )
+      } else {
+        nodes.push(token)
+      }
+    }
+    last = match.index + token.length
+  }
+  if (last < src.length) nodes.push(src.slice(last))
+  return <>{nodes}</>
 }
 
 function CodeBlock({ lang, code }) {

@@ -13,11 +13,13 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import traceback
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from kendr import desktop_automation_broker, extension_sandbox
 from kendr.extension_permissions import (
     merge_permissions_into_metadata,
     normalize_approval,
@@ -60,19 +62,27 @@ def get_marketplace(q: str = "", category: str = "") -> dict:
         installed_row = installed_rows.get(slug)
         core_row = _build_core_skill_row(slug)
         effective_row = resolve_runtime_skill(skill_id=str(installed_row.get("skill_id", ""))) if installed_row else core_row
+        if isinstance(effective_row, dict):
+            effective_row = _attach_skill_surface(effective_row) or effective_row
         item["is_core"] = bool(item.get("is_core", False))
         item["is_installed"] = installed_row is not None or core_row is not None
         item["skill_id"] = effective_row["skill_id"] if effective_row else None
-        item["permission_manifest"] = permission_manifest_from_metadata(
-            effective_row.get("metadata", {}) if isinstance(effective_row, dict) else {},
-            skill_type="catalog",
-            catalog_id=slug,
-            cwd=_default_execution_cwd(),
+        item["permission_manifest"] = (
+            effective_row.get("permission_manifest", {})
+            if isinstance(effective_row, dict)
+            else permission_manifest_from_metadata({}, skill_type="catalog", catalog_id=slug, cwd=_default_execution_cwd())
         )
+        item["sandbox"] = (
+            effective_row.get("sandbox", extension_sandbox.describe_skill_sandbox(skill_type="catalog", catalog_id=slug))
+            if isinstance(effective_row, dict)
+            else extension_sandbox.describe_skill_sandbox(skill_type="catalog", catalog_id=slug)
+        )
+        if isinstance(effective_row, dict) and isinstance(effective_row.get("desktop_automation"), dict):
+            item["desktop_automation"] = effective_row["desktop_automation"]
 
     # Append custom (python/prompt) skills that are installed
     custom = [
-        r for r in list_user_skills()
+        _attach_skill_surface(r) or r for r in list_user_skills()
         if r["skill_type"] in ("python", "prompt")
     ]
 
@@ -87,6 +97,7 @@ def get_marketplace(q: str = "", category: str = "") -> dict:
         "custom": custom,
         "categories": catalog_categories(),
         "installed_count": len(installed_rows) + core_count + len([c for c in custom if c["is_installed"]]),
+        "sandbox_runtime": extension_sandbox.describe_runtime_support(),
     }
 
 
@@ -112,6 +123,28 @@ def _catalog_metadata(entry, *, existing_metadata: dict | None = None) -> dict:
         catalog_id=entry.id,
         cwd=_default_execution_cwd(),
     )
+
+
+def _attach_skill_surface(row: dict | None) -> dict | None:
+    if not isinstance(row, dict):
+        return None
+    enriched = dict(row)
+    skill_type = str(enriched.get("skill_type", "") or "").strip()
+    catalog_id = str(enriched.get("catalog_id", "") or "").strip()
+    permission_manifest = permission_manifest_from_metadata(
+        enriched.get("metadata", {}) if isinstance(enriched.get("metadata"), dict) else {},
+        skill_type=skill_type,
+        catalog_id=catalog_id,
+        cwd=_default_execution_cwd(),
+    )
+    enriched["permission_manifest"] = permission_manifest
+    enriched["sandbox"] = extension_sandbox.describe_skill_sandbox(
+        skill_type=skill_type,
+        catalog_id=catalog_id,
+    )
+    if skill_type == "catalog" and catalog_id == "desktop-automation":
+        enriched["desktop_automation"] = desktop_automation_broker.describe_capability()
+    return enriched
 
 
 def _build_core_skill_row(catalog_id: str) -> dict | None:
@@ -142,7 +175,7 @@ def resolve_runtime_skill(*, skill_id: str = "", slug: str = "") -> dict | None:
     catalog_id = ""
     if skill_id:
         if skill_id.startswith("core:"):
-            return _build_core_skill_row(skill_id.split("core:", 1)[1].strip())
+            return _attach_skill_surface(_build_core_skill_row(skill_id.split("core:", 1)[1].strip()))
         row = get_user_skill(skill_id=skill_id)
     elif slug:
         row = get_user_skill(slug=slug)
@@ -155,9 +188,9 @@ def resolve_runtime_skill(*, skill_id: str = "", slug: str = "") -> dict | None:
                     return _build_core_skill_row(catalog_id)
                 row = dict(row)
                 row["metadata"] = _catalog_metadata(entry, existing_metadata=row.get("metadata", {}))
-        return row
+        return _attach_skill_surface(row)
     if slug:
-        return _build_core_skill_row(slug)
+        return _attach_skill_surface(_build_core_skill_row(slug))
     return None
 
 
@@ -174,7 +207,7 @@ def list_runtime_skills() -> list[dict]:
         if bool(getattr(entry, "core", False)) and catalog_id not in by_slug:
             core_row = _build_core_skill_row(catalog_id)
             if core_row:
-                by_slug[catalog_id] = core_row
+                by_slug[catalog_id] = _attach_skill_surface(core_row) or core_row
     return sorted(by_slug.values(), key=lambda item: str(item.get("name", item.get("slug", ""))).lower())
 
 
@@ -327,6 +360,12 @@ def _utc_now() -> str:
 def _default_execution_cwd() -> str:
     preferred = str(os.getenv("KENDR_WORKING_DIR", "")).strip()
     return preferred or os.getcwd()
+
+
+def _contextualize_permission_manifest(row: dict, manifest: dict, inputs: dict) -> dict:
+    if str(row.get("skill_type", "") or "").strip() == "catalog" and str(row.get("catalog_id", "") or "").strip() == "desktop-automation":
+        return desktop_automation_broker.contextualize_manifest(manifest, inputs)
+    return manifest
 
 
 def _record_permission_event(skill_label: str, *, action: str, status: str, detail: dict) -> None:
@@ -619,31 +658,64 @@ def _run_extension_host(mode: str, payload: dict, *, timeout: int) -> dict:
     injected_env = _extension_host_injected_env(host_payload)
     if injected_env:
         host_payload["injected_env"] = injected_env
+    base_env = _extension_host_env()
+    sandbox_info = {
+        "mode": "process_isolated_only",
+        "provider": "none",
+        "required": False,
+        "available": False,
+        "reason": "",
+    }
     process: subprocess.Popen[str] | None = None
-    try:
-        process = subprocess.Popen(
-            [sys.executable, "-m", "kendr.extension_host", mode],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=_extension_host_env(),
-            **_extension_host_popen_kwargs(),
+    with tempfile.TemporaryDirectory(prefix="kendr-extension-launch-") as launch_root:
+        launch = extension_sandbox.prepare_extension_host_launch(
+            mode=mode,
+            payload=host_payload,
+            base_command=[sys.executable, "-m", "kendr.extension_host", mode],
+            base_env=base_env,
+            launch_root=launch_root,
         )
-        stdout, stderr = process.communicate(
-            input=json.dumps(host_payload, ensure_ascii=False),
-            timeout=max(1, timeout) + 2,
-        )
-    except subprocess.TimeoutExpired:
-        if process is not None:
-            _terminate_extension_host(process)
+        sandbox_info = dict(launch.sandbox or {})
+        if launch.blocked_error:
+            return {
+                "output": None,
+                "stdout": "",
+                "stderr": "",
+                "success": False,
+                "error": launch.blocked_error,
+                "sandbox": sandbox_info,
+            }
         try:
-            stdout, stderr = process.communicate(timeout=2) if process is not None else ("", "")
+            process = subprocess.Popen(
+                launch.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=launch.env,
+                **_extension_host_popen_kwargs(),
+            )
+            stdout, stderr = process.communicate(
+                input=json.dumps(host_payload, ensure_ascii=False),
+                timeout=max(1, timeout) + 2,
+            )
+        except subprocess.TimeoutExpired:
+            if process is not None:
+                _terminate_extension_host(process)
+            try:
+                stdout, stderr = process.communicate(timeout=2) if process is not None else ("", "")
+            except Exception:
+                stdout, stderr = "", ""
+            return {
+                "output": None,
+                "stdout": stdout,
+                "stderr": stderr,
+                "success": False,
+                "error": f"Extension host timed out after {timeout}s",
+                "sandbox": sandbox_info,
+            }
         except Exception:
-            stdout, stderr = "", ""
-        return {"output": None, "stdout": stdout, "stderr": stderr, "success": False, "error": f"Extension host timed out after {timeout}s"}
-    except Exception:
-        return {"output": None, "stdout": "", "stderr": "", "success": False, "error": traceback.format_exc()}
+            return {"output": None, "stdout": "", "stderr": "", "success": False, "error": traceback.format_exc(), "sandbox": sandbox_info}
 
     raw_output = stdout.strip()
     if process.returncode != 0:
@@ -653,6 +725,7 @@ def _run_extension_host(mode: str, payload: dict, *, timeout: int) -> dict:
             "stderr": stderr,
             "success": False,
             "error": stderr or f"Extension host exited with code {process.returncode}",
+            "sandbox": sandbox_info,
         }
     try:
         payload_out = json.loads(raw_output or "{}")
@@ -663,13 +736,18 @@ def _run_extension_host(mode: str, payload: dict, *, timeout: int) -> dict:
             "stderr": stderr,
             "success": False,
             "error": "Extension host returned invalid JSON",
+            "sandbox": sandbox_info,
         }
-    return payload_out if isinstance(payload_out, dict) else {
+    if isinstance(payload_out, dict):
+        payload_out.setdefault("sandbox", sandbox_info)
+        return payload_out
+    return {
         "output": None,
         "stdout": raw_output,
         "stderr": stderr,
         "success": False,
         "error": "Extension host returned an invalid payload",
+        "sandbox": sandbox_info,
     }
 
 
@@ -779,6 +857,7 @@ def test_skill(skill_id: str, inputs: dict, *, approval: dict | None = None, ses
         catalog_id=str(row.get("catalog_id", "") or ""),
         cwd=_default_execution_cwd(),
     )
+    permission_manifest = _contextualize_permission_manifest(row, permission_manifest, safe_inputs)
     skill_label = f"skill:{row.get('slug', row.get('skill_id', 'unknown'))}"
     try:
         resolved_approval, _grant = _resolve_skill_execution_approval(
@@ -829,6 +908,7 @@ def _catalog_handlers() -> dict[str, Any]:
     """Return a dict of catalog_id → handler function (lazily built)."""
     return {
         "web-search": _handle_web_search,
+        "desktop-automation": _handle_desktop_automation,
         "code-executor": _handle_code_executor,
         "pdf-reader": _handle_pdf_reader,
         "shell-command": _handle_shell_command,
@@ -865,6 +945,63 @@ def _handle_web_search(inputs: dict, *, permission_manifest: dict | None = None,
         raise RuntimeError(str(result.get("error", "Web search execution failed")))
     output = result.get("output")
     return output if isinstance(output, dict) else {"query": query, "results": []}
+
+
+def _handle_desktop_automation(inputs: dict, *, permission_manifest: dict | None = None, approval: dict | None = None) -> dict:
+    access_mode = desktop_automation_broker.normalize_access_mode(str(inputs.get("access_mode", "sandbox") or "sandbox"))
+    timeout = max(5, int(inputs.get("timeout", 10) or 10))
+    result = _run_extension_host(
+        "desktop-automation",
+        {
+            "inputs": inputs,
+            "timeout": timeout,
+            "permissions": permission_manifest or {},
+            "approval": normalize_approval(approval),
+        },
+        timeout=timeout,
+    )
+    if not result.get("success"):
+        _record_permission_event(
+            "catalog:desktop-automation",
+            action="desktop_automation_execution",
+            status="blocked" if "approval" in str(result.get("error", "")).lower() else "error",
+            detail={
+                "access_mode": access_mode,
+                "app": str(inputs.get("app", "") or "").strip(),
+                "action": str(inputs.get("action", "") or "").strip(),
+                "error": str(result.get("error", "") or ""),
+                "permissions": summarize_permission_manifest(permission_manifest or {}),
+                "sandbox": result.get("sandbox", {}),
+            },
+        )
+        raise RuntimeError(str(result.get("error", "Desktop automation execution failed")))
+    output = result.get("output")
+    if access_mode == "full_access":
+        _record_permission_event(
+            "catalog:desktop-automation",
+            action="desktop_automation_execution",
+            status="approved",
+            detail={
+                "access_mode": access_mode,
+                "app": str(inputs.get("app", "") or "").strip(),
+                "action": str(inputs.get("action", "") or "").strip(),
+                "approval": normalize_approval(approval),
+                "permissions": summarize_permission_manifest(permission_manifest or {}),
+                "sandbox": result.get("sandbox", {}),
+            },
+        )
+    else:
+        _record_permission_event(
+            "catalog:desktop-automation",
+            action="desktop_automation_preview",
+            status="ok",
+            detail={
+                "app": str(inputs.get("app", "") or "").strip(),
+                "action": str(inputs.get("action", "") or "").strip(),
+                "sandbox": result.get("sandbox", {}),
+            },
+        )
+    return output if isinstance(output, dict) else {"access_mode": access_mode, "dispatched": False, "preview_only": access_mode != "full_access"}
 
 
 def _handle_code_executor(inputs: dict, *, permission_manifest: dict | None = None, approval: dict | None = None) -> dict:

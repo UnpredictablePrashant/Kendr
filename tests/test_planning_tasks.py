@@ -176,6 +176,48 @@ class PlanningTaskTests(unittest.TestCase):
         self.assertIn("model 'gpt-4o-mini'", message)
         self.assertIn("Connection error", message)
 
+    def test_planner_agent_blocks_security_flow_when_plan_json_is_invalid(self):
+        state = {
+            "user_query": "Scan https://example.com for vulnerabilities",
+            "current_objective": "Scan https://example.com for vulnerabilities",
+            "available_agents": [
+                "security_scope_guard_agent",
+                "recon_agent",
+                "scanner_agent",
+                "security_report_agent",
+                "worker_agent",
+            ],
+            "security_authorized": True,
+            "security_target_url": "https://example.com",
+            "security_authorization_note": "SEC-123 approved by owner",
+        }
+
+        with (
+            patch("tasks.planning_tasks.begin_agent_session", return_value=("", state["user_query"], "")),
+            patch("tasks.planning_tasks.log_task_update"),
+            patch("tasks.planning_tasks.write_text_file"),
+            patch("tasks.planning_tasks.update_planning_file"),
+            patch("tasks.planning_tasks.publish_agent_output", side_effect=lambda s, *_args, **_kwargs: s),
+            patch("tasks.planning_tasks.model_selection_for_agent", return_value={"provider": "openai", "model": "gpt-4o-mini", "source": "OPENAI_MODEL_GENERAL"}),
+            patch("tasks.planning_tasks.provider_status", return_value={"provider": "openai", "ready": True, "note": "", "base_url": "", "model": "gpt-4o-mini"}),
+            patch("tasks.planning_tasks.llm.invoke", return_value="not-json-at-all"),
+        ):
+            result = planner_agent(state)
+
+        self.assertTrue(result["plan_needs_clarification"])
+        self.assertEqual(result["pending_user_input_kind"], "clarification")
+        self.assertEqual(result["plan_approval_status"], "clarification_needed")
+        self.assertEqual(result["plan_steps"], [])
+        self.assertIn("security request", result["pending_user_question"].lower())
+        self.assertIn("security_scope_guard_agent", result["pending_user_question"])
+        self.assertNotIn("worker_agent", result["pending_user_question"])
+
+    def test_normalize_plan_data_keeps_non_security_fallback_behavior(self):
+        plan_data = normalize_plan_data({}, "Build a fundraising report.")
+
+        self.assertEqual(len(plan_data["execution_steps"]), 1)
+        self.assertEqual(plan_data["execution_steps"][0]["agent"], "worker_agent")
+
     def test_runtime_model_override_changes_agent_model_selection(self):
         with runtime_model_override(provider="anthropic", model="claude-sonnet-test"):
             selection = model_selection_for_agent("planner_agent")

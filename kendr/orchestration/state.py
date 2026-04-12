@@ -70,8 +70,14 @@ class RuntimeState(TypedDict, total=False):
     quality_gate_passed: bool
     quality_gate_report: str
     adaptive_agent_selection: bool
+    direct_tool_loop_attempted: bool
+    direct_tool_trace: list[dict[str, Any]]
+    direct_tool_last_result: dict[str, Any]
+    direct_tool_fallback_reason: str
+    direct_tool_native_fallback_reason: str
     planner_policy_mode: str
     reviewer_policy_mode: str
+    execution_mode: str
     planner_score_threshold: int
     reviewer_score_threshold: int
     review_pending_reason: str
@@ -79,6 +85,9 @@ class RuntimeState(TypedDict, total=False):
     review_policy_last: dict[str, Any]
     test_agent_status: str
     security_authorized: bool
+    github_write_authorized: bool
+    github_local_git_authorized: bool
+    github_remote_git_authorized: bool
     security_target_url: str
     security_authorization_note: str
     security_scan_profile: str
@@ -218,6 +227,7 @@ class ResumeStateOverrides(TypedDict, total=False):
     security_target_url: str
     security_authorization_note: str
     security_scan_profile: str
+    execution_mode: str
 
 
 def state_awaiting_user_input(state: Mapping[str, Any]) -> bool:

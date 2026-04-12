@@ -86,6 +86,64 @@ CATALOG: tuple[CatalogSkill, ...] = (
     ),
 
     CatalogSkill(
+        id="desktop-automation",
+        name="Desktop Automation",
+        description="Broker desktop app actions with a safe sandbox preview mode and an explicitly approved full-access mode for native app launch hand-offs.",
+        category="Recommended",
+        icon="🖥️",
+        tags=("desktop", "native-apps", "automation", "local-first"),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list_apps", "open_app", "open_chat", "open_document", "open_url"],
+                    "default": "list_apps",
+                },
+                "app": {
+                    "type": "string",
+                    "enum": ["generic", "whatsapp", "telegram", "microsoft_365"],
+                    "default": "generic",
+                },
+                "access_mode": {
+                    "type": "string",
+                    "enum": ["sandbox", "full_access"],
+                    "default": "sandbox",
+                },
+                "app_name": {"type": "string", "description": "Native app name for generic open_app actions."},
+                "office_app": {"type": "string", "description": "Office app for Microsoft 365: outlook, word, excel, powerpoint, teams."},
+                "phone_number": {"type": "string", "description": "Phone number for WhatsApp chat launch."},
+                "handle": {"type": "string", "description": "Telegram handle for chat launch."},
+                "message": {"type": "string", "description": "Optional chat draft message."},
+                "document_path": {"type": "string", "description": "Local document path for open_document."},
+                "url": {"type": "string", "description": "URL for open_url actions."},
+            },
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "access_mode": {"type": "string"},
+                "preview_only": {"type": "boolean"},
+                "dispatched": {"type": "boolean"},
+                "plan": {"type": "object"},
+                "supported_apps": {"type": "array"},
+            },
+        },
+        example_input={"action": "open_chat", "app": "telegram", "handle": "OpenAI", "message": "Hi from Kendr", "access_mode": "sandbox"},
+        example_output='{"access_mode": "sandbox", "preview_only": true, "dispatched": false, "plan": {"summary": "Open Telegram target OpenAI"}}',
+        core=True,
+        default_permissions={
+            "requires_approval": False,
+            "desktop": {
+                "allow": True,
+                "apps": ["generic", "whatsapp", "telegram", "microsoft_365"],
+                "access_mode": "sandbox",
+                "warn_on_full_access": True,
+            },
+        },
+    ),
+
+    CatalogSkill(
         id="code-executor",
         name="Code Executor",
         description="Execute Python code snippets safely and return the output. Useful for calculations, data transforms, and quick scripts.",

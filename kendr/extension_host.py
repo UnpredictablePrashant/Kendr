@@ -16,8 +16,9 @@ from urllib import error as urllib_error
 from urllib import parse as urllib_parse
 from urllib import request as urllib_request
 
+from kendr.command_policy import classify_command, ensure_command_allowed
+from kendr.desktop_automation_broker import execute_request as execute_desktop_automation_request
 from kendr.extension_permissions import ensure_manifest_approval, normalize_permission_manifest, normalize_approval
-from tasks.privileged_control import classify_command, ensure_command_allowed
 
 def _json_safe(value):
     try:
@@ -546,6 +547,27 @@ def _run_web_search(query: str, num_results: int, *, permissions: dict | None = 
     return {"query": str(query or "").strip(), "results": results}
 
 
+def _run_desktop_automation(
+    inputs: dict,
+    *,
+    timeout_seconds: int,
+    permissions: dict | None = None,
+    approval: dict | None = None,
+) -> dict:
+    manifest = normalize_permission_manifest(permissions, skill_type="catalog", catalog_id="desktop-automation")
+    desktop_manifest = manifest.get("desktop", {}) if isinstance(manifest.get("desktop"), dict) else {}
+    if not desktop_manifest.get("allow", False):
+        raise PermissionError("Desktop automation is disabled by the permission manifest.")
+    access_mode = str(desktop_manifest.get("access_mode", "sandbox") or "sandbox").strip().lower()
+    if access_mode == "full_access":
+        ensure_manifest_approval(manifest, approval, capability="Desktop automation full-access mode")
+    return execute_desktop_automation_request(
+        inputs if isinstance(inputs, dict) else {},
+        access_mode=access_mode,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(argv if argv is not None else sys.argv[1:])
     mode = args[0] if args else ""
@@ -627,6 +649,24 @@ def main(argv: list[str] | None = None) -> int:
                         permissions=payload.get("permissions") if isinstance(payload.get("permissions"), dict) else None,
                         approval=normalize_approval(payload.get("approval") if isinstance(payload.get("approval"), dict) else None),
                         capability="API caller skill",
+                    ),
+                    "stdout": "",
+                    "stderr": "",
+                    "success": True,
+                    "error": None,
+                }
+            except PermissionError as exc:
+                result = {"output": None, "stdout": "", "stderr": "", "success": False, "error": str(exc)}
+            except Exception:
+                result = {"output": None, "stdout": "", "stderr": "", "success": False, "error": traceback.format_exc()}
+        elif mode == "desktop-automation":
+            try:
+                result = {
+                    "output": _run_desktop_automation(
+                        payload.get("inputs", {}) if isinstance(payload.get("inputs"), dict) else {},
+                        timeout_seconds=max(1, int(payload.get("timeout", 10) or 10)),
+                        permissions=payload.get("permissions") if isinstance(payload.get("permissions"), dict) else None,
+                        approval=normalize_approval(payload.get("approval") if isinstance(payload.get("approval"), dict) else None),
                     ),
                     "stdout": "",
                     "stderr": "",

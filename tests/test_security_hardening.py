@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from kendr import extension_sandbox
 from kendr.persistence.approval_store import (
     consume_approval_grant,
     create_approval_grant,
@@ -21,7 +22,21 @@ from kendr.persistence.setup_store import (
     set_setup_provider_tokens,
     upsert_setup_config_value,
 )
-from kendr.skill_manager import _run_python_skill, execute_skill_by_slug, get_marketplace, grant_skill_approval, test_skill
+from kendr.skill_manager import _run_python_skill, execute_skill_by_slug, get_marketplace, grant_skill_approval, resolve_runtime_skill, test_skill
+
+
+def _process_only_sandbox_launch(*, base_command, base_env, **_kwargs):
+    return extension_sandbox.SandboxLaunch(
+        command=list(base_command),
+        env=dict(base_env),
+        sandbox={
+            "mode": "process_isolated_only",
+            "provider": "test",
+            "required": False,
+            "available": False,
+            "reason": "Unit test bypass",
+        },
+    )
 
 
 class SecretStorageTests(unittest.TestCase):
@@ -141,6 +156,14 @@ class ApprovalGrantStoreTests(unittest.TestCase):
 
 
 class ExtensionHostIsolationTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch(
+            "kendr.skill_manager.extension_sandbox.prepare_extension_host_launch",
+            side_effect=_process_only_sandbox_launch,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_python_skills_run_out_of_process(self):
         os.environ.pop("KENDR_CHILD_ONLY", None)
         result = _run_python_skill(
@@ -331,6 +354,46 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         self.assertEqual(host.call_args.args[0], "web-search")
         self.assertEqual(payload["permissions"]["network"]["domains"], ["api.duckduckgo.com"])
 
+    def test_desktop_automation_core_skill_runs_in_sandbox_preview_without_approval(self):
+        with patch("kendr.skill_manager.get_user_skill", return_value=None):
+            with patch(
+                "kendr.skill_manager._run_extension_host",
+                return_value={
+                    "success": True,
+                    "output": {"access_mode": "sandbox", "preview_only": True, "dispatched": False},
+                    "stdout": "",
+                    "stderr": "",
+                    "error": None,
+                    "sandbox": {"mode": "configurable", "provider": "desktop_automation_broker"},
+                },
+            ) as host:
+                result = execute_skill_by_slug(
+                    "desktop-automation",
+                    {"action": "list_apps", "app": "generic", "access_mode": "sandbox"},
+                )
+
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertTrue(result["output"]["preview_only"])
+        payload = host.call_args.args[1]
+        self.assertEqual(host.call_args.args[0], "desktop-automation")
+        self.assertEqual(payload["permissions"]["desktop"]["access_mode"], "sandbox")
+        self.assertFalse(payload["permissions"]["requires_approval"])
+
+    def test_desktop_automation_full_access_requires_explicit_approval(self):
+        with patch("kendr.skill_manager.get_user_skill", return_value=None):
+            result = execute_skill_by_slug(
+                "desktop-automation",
+                {"action": "open_app", "app": "telegram", "access_mode": "full_access"},
+            )
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result.get("error_type"), "approval_required")
+        self.assertEqual(result.get("pending_user_input_kind"), "skill_approval")
+        self.assertEqual(
+            result.get("approval_request", {}).get("metadata", {}).get("skill_slug"),
+            "desktop-automation",
+        )
+
     def test_marketplace_marks_web_search_as_core_installed(self):
         with patch("kendr.skill_manager.list_user_skills", return_value=[]):
             marketplace = get_marketplace()
@@ -339,6 +402,25 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         self.assertTrue(web_search["is_core"])
         self.assertTrue(web_search["is_installed"])
         self.assertEqual(web_search["skill_id"], "core:web-search")
+        self.assertIn("sandbox", web_search)
+
+    def test_marketplace_exposes_desktop_automation_capability_metadata(self):
+        with patch("kendr.skill_manager.list_user_skills", return_value=[]):
+            marketplace = get_marketplace()
+
+        desktop = next(item for item in marketplace["catalog"] if item["id"] == "desktop-automation")
+        self.assertTrue(desktop["is_core"])
+        self.assertTrue(desktop["is_installed"])
+        self.assertIn("desktop_automation", desktop)
+        self.assertEqual(desktop["desktop_automation"]["default_access_mode"], "sandbox")
+
+    def test_marketplace_includes_sandbox_runtime_summary(self):
+        with patch("kendr.skill_manager.list_user_skills", return_value=[]):
+            marketplace = get_marketplace()
+
+        self.assertIn("sandbox_runtime", marketplace)
+        self.assertEqual(marketplace["sandbox_runtime"]["provider"], "bubblewrap")
+        self.assertIn("install_hint", marketplace["sandbox_runtime"])
 
     def test_marketplace_uses_catalog_permissions_for_installed_core_skill(self):
         stale_installed = {
@@ -370,6 +452,24 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         self.assertEqual(web_search["skill_id"], "installed-web-search")
         self.assertTrue(web_search["permission_manifest"]["network"]["allow"])
         self.assertEqual(web_search["permission_manifest"]["network"]["domains"], ["api.duckduckgo.com"])
+
+    def test_resolve_runtime_skill_attaches_sandbox_metadata(self):
+        skill_row = {
+            "skill_id": "skill-8",
+            "slug": "custom-prompt",
+            "name": "Custom Prompt",
+            "skill_type": "prompt",
+            "catalog_id": "",
+            "metadata": {},
+            "is_installed": True,
+        }
+        with patch("kendr.skill_manager.get_user_skill", return_value=skill_row):
+            resolved = resolve_runtime_skill(skill_id="skill-8")
+
+        self.assertIsNotNone(resolved)
+        self.assertIn("permission_manifest", resolved)
+        self.assertIn("sandbox", resolved)
+        self.assertEqual(resolved["sandbox"]["mode"], "in_process")
 
     def test_python_skill_returns_structured_approval_request(self):
         skill_row = {

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useApp } from '../contexts/AppContext'
 import MCPPanel from './MCPPanel'
 import SkillsPanel from './SkillsPanel'
@@ -127,7 +127,7 @@ function ConnectorOverview({ onNavigate }) {
 function ConnectorSection({ label, items, emptyAction, onNavigate }) {
   const [expanded, setExpanded] = useState(true)
   return (
-    <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 10, overflow: 'hidden' }}>
+    <div style={{ background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 10, overflow: 'visible' }}>
       <div
         style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 16px', cursor: 'pointer', userSelect: 'none' }}
         onClick={() => setExpanded(e => !e)}
@@ -169,6 +169,21 @@ function ConnectorSection({ label, items, emptyAction, onNavigate }) {
 }
 
 function ConnectorCard({ connector: c }) {
+  const [showDetails, setShowDetails] = useState(false)
+  const [popoverPos, setPopoverPos] = useState({ top: 0, right: 0 })
+  const btnRef = useRef(null)
+
+  const handleInfoClick = () => {
+    if (!showDetails && btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect()
+      setPopoverPos({
+        top: rect.bottom + 6,
+        right: window.innerWidth - rect.right,
+      })
+    }
+    setShowDetails(v => !v)
+  }
+
   const statusColor = {
     ready:           '#27ae60',
     needs_config:    '#e6a700',
@@ -183,32 +198,61 @@ function ConnectorCard({ connector: c }) {
     disabled:        '— Disabled',
   }[c.status] || c.status
 
+  const compactDescription = String(c.description || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const fullDescription = String(c.description || '').trim()
+
   return (
-    <div style={{
-      background: 'var(--bg)',
+    <div className="ih-connector-card" style={{
       border: `1px solid ${c.status === 'ready' ? 'var(--border)' : '#e6a70044'}`,
-      borderRadius: 8,
-      padding: '10px 12px',
-      display: 'flex',
-      flexDirection: 'column',
-      gap: 4,
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+      <div className="ih-connector-card-head">
         <span style={{ fontSize: 18 }}>{c.icon || '•'}</span>
-        <span style={{ fontWeight: 600, fontSize: 13, flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+        <span className="ih-connector-card-title">
           {c.display_name}
         </span>
-        <span style={{ fontSize: 11, color: statusColor, fontWeight: 500, flexShrink: 0 }}>{statusLabel}</span>
+        <button
+          ref={btnRef}
+          className="ih-connector-card-info-btn"
+          title="View full details"
+          onClick={handleInfoClick}
+        >
+          i
+        </button>
+        <span className="ih-connector-card-status" style={{ color: statusColor }}>{statusLabel}</span>
       </div>
-      <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}>{c.description}</div>
+      <div className="ih-connector-card-desc" title={compactDescription}>
+        {compactDescription}
+      </div>
       {c.missing_config?.length > 0 && (
-        <div style={{ fontSize: 11, color: '#e6a700', marginTop: 2 }}>
+        <div className="ih-connector-card-missing">
           Missing: {c.missing_config.join(', ')}
         </div>
       )}
       {c.required_inputs?.length > 0 && (
-        <div style={{ fontSize: 11, color: 'var(--text-muted)', fontFamily: 'monospace', marginTop: 2 }}>
+        <div className="ih-connector-card-inputs" title={c.required_inputs.join(', ')}>
           inputs: {c.required_inputs.join(', ')}
+        </div>
+      )}
+      {showDetails && (
+        <div className="ih-connector-card-popover" style={{ top: popoverPos.top, right: popoverPos.right }}>
+          <div className="ih-connector-card-popover-header">
+            <span>Connector Details</span>
+            <button className="ih-connector-card-popover-close" onClick={() => setShowDetails(false)}>✕</button>
+          </div>
+          <div className="ih-connector-card-popover-row"><strong>Name:</strong> {c.display_name || c.agent_name || '-'}</div>
+          <div className="ih-connector-card-popover-row"><strong>Status:</strong> {statusLabel}</div>
+          <div className="ih-connector-card-popover-row"><strong>Type:</strong> {c.type || '-'}</div>
+          <div className="ih-connector-card-popover-row"><strong>Agent:</strong> {c.agent_name || '-'}</div>
+          <div className="ih-connector-card-popover-row"><strong>Description:</strong> {fullDescription || '-'}</div>
+          <div className="ih-connector-card-popover-row">
+            <strong>Inputs:</strong> {c.required_inputs?.length ? c.required_inputs.join(', ') : '-'}
+          </div>
+          <div className="ih-connector-card-popover-row">
+            <strong>Missing Config:</strong> {c.missing_config?.length ? c.missing_config.join(', ') : '-'}
+          </div>
         </div>
       )}
     </div>
@@ -217,12 +261,35 @@ function ConnectorCard({ connector: c }) {
 
 // ─── Service integrations tab ────────────────────────────────────────────────
 
+function resolveSetupComponentId(integrationId) {
+  const key = String(integrationId || '').trim().toLowerCase()
+  const alias = {
+    gmail: 'google_workspace',
+    google_drive: 'google_workspace',
+    microsoft_365: 'microsoft_graph',
+    microsoft365: 'microsoft_graph',
+    microsoft: 'microsoft_graph',
+  }[key]
+  return alias || key
+}
+
+function integrationIdFromConnector(integration) {
+  const explicit = String(integration?.integration_id || integration?.id || '').trim()
+  if (explicit) return explicit
+  const agentName = String(integration?.agent_name || '').trim()
+  if (agentName.startsWith('integration:')) return agentName.slice('integration:'.length)
+  return ''
+}
+
 function IntegrationsPanel() {
-  const { state } = useApp()
+  const { state, dispatch } = useApp()
   const base = state.backendUrl || 'http://127.0.0.1:2151'
   const [integrations, setIntegrations] = useState([])
   const [loading, setLoading] = useState(true)
   const [err, setErr]         = useState(null)
+  const [providerKeys, setProviderKeys] = useState({})
+  const [keysSaved, setKeysSaved] = useState(false)
+  const [keysSaving, setKeysSaving] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true); setErr(null)
@@ -236,6 +303,26 @@ function IntegrationsPanel() {
   }, [base])
 
   useEffect(() => { load() }, [load])
+  useEffect(() => { setProviderKeys(state.settings || {}) }, [state.settings])
+
+  const saveProviderKeys = async () => {
+    const api = window.kendrAPI
+    if (!api?.settings) return
+    const providerSettingKeys = ['anthropicKey', 'openaiKey', 'openaiOrgId', 'googleKey', 'xaiKey']
+    const shouldRestartBackend = providerSettingKeys.some(key => (state.settings?.[key] || '') !== (providerKeys?.[key] || ''))
+    setKeysSaving(true)
+    try {
+      for (const [k, v] of Object.entries(providerKeys || {})) {
+        if (typeof v === 'string') await api.settings.set(k, v)
+      }
+      dispatch({ type: 'SET_SETTINGS', settings: providerKeys })
+      if (shouldRestartBackend && state.backendStatus === 'running') await api.backend?.restart()
+      setKeysSaved(true)
+      setTimeout(() => setKeysSaved(false), 1800)
+    } finally {
+      setKeysSaving(false)
+    }
+  }
 
   if (loading) return <div className="pp-loading">Loading service integrations…</div>
 
@@ -249,91 +336,273 @@ function IntegrationsPanel() {
         <button className="pp-btn pp-btn--ghost" onClick={load}>↺ Refresh</button>
       </div>
 
-      {err && (
-        <div className="pp-error-banner">⚠ {err} <button onClick={() => setErr(null)}>✕</button></div>
-      )}
+      <div className="pp-skills-body">
+        {err && (
+          <div className="pp-error-banner">⚠ {err} <button onClick={() => setErr(null)}>✕</button></div>
+        )}
 
-      {integrations.length === 0 ? (
-        <div className="pp-empty">
-          <div className="pp-empty-icon">🧩</div>
-          <div className="pp-empty-title">No service integrations found</div>
-          <div className="pp-empty-sub">Service integrations are exposed by the Kendr backend. Make sure the gateway is running.</div>
-        </div>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-          {/* Group by status */}
-          {['ready', 'needs_config'].map(status => {
-            const group = integrations.filter(p => p.status === status)
-            if (!group.length) return null
-            return (
-              <div key={status}>
-                <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                  {status === 'ready' ? '✓ Configured' : '⚙ Needs Configuration'}
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 12 }}>
-                  {group.map(p => <IntegrationCard key={p.agent_name} integration={p} />)}
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      )}
+        <div className="pp-add-card" style={{ maxWidth: 700 }}>
+          <div className="pp-add-title">Model & API Keys</div>
+          <div className="pp-form-grid" style={{ gridTemplateColumns: '170px 1fr' }}>
+            <label className="pp-form-label">Anthropic API Key</label>
+            <input className="pp-input" type="password" placeholder="sk-ant-…" value={providerKeys.anthropicKey || ''} onChange={e => setProviderKeys(v => ({ ...v, anthropicKey: e.target.value }))} />
 
-      <div style={{ marginTop: 24, padding: '14px 16px', background: 'var(--bg-secondary)', border: '1px solid var(--border)', borderRadius: 10, fontSize: 13, color: 'var(--text-muted)' }}>
-        💡 To configure an integration, set the required environment variables in{' '}
-        <strong>Settings → API Keys</strong>, then restart the backend.
+            <label className="pp-form-label">OpenAI API Key</label>
+            <input className="pp-input" type="password" placeholder="sk-…" value={providerKeys.openaiKey || ''} onChange={e => setProviderKeys(v => ({ ...v, openaiKey: e.target.value }))} />
+
+            <label className="pp-form-label">OpenAI Org ID</label>
+            <input className="pp-input" placeholder="org-…" value={providerKeys.openaiOrgId || ''} onChange={e => setProviderKeys(v => ({ ...v, openaiOrgId: e.target.value }))} />
+
+            <label className="pp-form-label">Google API Key</label>
+            <input className="pp-input" type="password" placeholder="AIza…" value={providerKeys.googleKey || ''} onChange={e => setProviderKeys(v => ({ ...v, googleKey: e.target.value }))} />
+
+            <label className="pp-form-label">xAI API Key</label>
+            <input className="pp-input" type="password" placeholder="xai-…" value={providerKeys.xaiKey || ''} onChange={e => setProviderKeys(v => ({ ...v, xaiKey: e.target.value }))} />
+
+            <label className="pp-form-label">HuggingFace Token</label>
+            <input className="pp-input" type="password" placeholder="hf_…" value={providerKeys.hfToken || ''} onChange={e => setProviderKeys(v => ({ ...v, hfToken: e.target.value }))} />
+
+            <label className="pp-form-label">Tavily Key</label>
+            <input className="pp-input" type="password" placeholder="tvly-…" value={providerKeys.tavilyKey || ''} onChange={e => setProviderKeys(v => ({ ...v, tavilyKey: e.target.value }))} />
+
+            <label className="pp-form-label">Brave Key</label>
+            <input className="pp-input" type="password" value={providerKeys.braveKey || ''} onChange={e => setProviderKeys(v => ({ ...v, braveKey: e.target.value }))} />
+
+            <label className="pp-form-label">Serper Key</label>
+            <input className="pp-input" type="password" value={providerKeys.serperKey || ''} onChange={e => setProviderKeys(v => ({ ...v, serperKey: e.target.value }))} />
+          </div>
+          <div className="pp-form-actions" style={{ marginTop: 10 }}>
+            <button className="pp-btn pp-btn--primary" onClick={saveProviderKeys} disabled={keysSaving}>
+              {keysSaving ? 'Saving…' : 'Save API Keys'}
+            </button>
+            {keysSaved && <span className="pp-form-label" style={{ marginBottom: 0 }}>Saved</span>}
+          </div>
+        </div>
+
+        {integrations.length === 0 ? (
+          <div className="pp-empty">
+            <div className="pp-empty-icon">🧩</div>
+            <div className="pp-empty-title">No service integrations found</div>
+            <div className="pp-empty-sub">Service integrations are exposed by the Kendr backend. Make sure the gateway is running.</div>
+          </div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            {['ready', 'needs_config'].map(status => {
+              const group = integrations.filter(p => p.status === status)
+              if (!group.length) return null
+              return (
+                <div key={status}>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-muted)', marginBottom: 8, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                    {status === 'ready' ? '✓ Configured' : '⚙ Needs Configuration'}
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 12 }}>
+                    {group.map(p => (
+                      <IntegrationCard
+                        key={p.agent_name}
+                        integration={p}
+                        base={base}
+                        onSaved={load}
+                      />
+                    ))}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
       </div>
     </div>
   )
 }
 
-function IntegrationCard({ integration: p }) {
+function IntegrationCard({ integration: p, base, onSaved }) {
   const configured = p.status === 'ready'
+  const [expanded, setExpanded] = useState(false)
+  const [formLoading, setFormLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [err, setErr] = useState(null)
+  const [fields, setFields] = useState(null)
+  const [values, setValues] = useState({})
+  const [componentId, setComponentId] = useState('')
+  const [oauthPath, setOauthPath] = useState(null)
+  const [hint, setHint] = useState(null)
+
+  const openForm = async () => {
+    if (expanded) { setExpanded(false); return }
+    setExpanded(true)
+    if (fields !== null) { setFormLoading(false); return }
+    setFormLoading(true)
+    setErr(null)
+
+    const rawId = integrationIdFromConnector(p)
+    const cid = resolveSetupComponentId(rawId)
+    setComponentId(cid)
+
+    let loaded = false
+    if (cid) {
+      try {
+        const r = await fetch(`${base}/api/setup/component/${encodeURIComponent(cid)}`)
+        const data = await r.json().catch(() => ({}))
+        if (r.ok && !data.error && data.component?.fields?.length) {
+          const raw = (data.raw_values && typeof data.raw_values === 'object') ? data.raw_values : {}
+          const initVals = {}
+          for (const f of data.component.fields) {
+            const k = String(f.key || '').trim()
+            if (k) initVals[k] = String(raw[k] ?? '')
+          }
+          setFields(data.component.fields)
+          setValues(initVals)
+          setOauthPath(data.component.oauth_start_path || null)
+          setHint(data.component.description || data.component.setup_hint || null)
+          loaded = true
+        }
+      } catch (_) { /* fall through to fallback */ }
+    }
+
+    if (!loaded) {
+      // Fallback: render inputs for each missing_config key
+      const missing = p.missing_config || []
+      setFields(missing.map(k => ({ key: k, label: k, secret: true, required: true })))
+      setValues(Object.fromEntries(missing.map(k => [k, ''])))
+    }
+
+    setFormLoading(false)
+  }
+
+  const save = async () => {
+    setSaving(true)
+    setErr(null)
+    try {
+      const r = await fetch(`${base}/api/setup/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ component_id: componentId || integrationIdFromConnector(p), values }),
+      })
+      const data = await r.json().catch(() => ({}))
+      if (!r.ok || data.error) throw new Error(data.error || r.statusText)
+      setSaved(true)
+      setTimeout(() => setSaved(false), 1800)
+      await onSaved?.()
+      setExpanded(false)
+      setFields(null)
+    } catch (e) {
+      setErr(e.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
     <div style={{
       background: 'var(--bg-secondary)',
-      border: `1px solid ${configured ? 'var(--border)' : '#e6a70033'}`,
+      border: `1px solid ${configured ? 'var(--border)' : expanded ? '#e6a70066' : '#e6a70033'}`,
       borderRadius: 10,
-      padding: '14px 16px',
       display: 'flex',
       flexDirection: 'column',
-      gap: 8,
+      overflow: 'hidden',
     }}>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-        <span style={{ fontSize: 24, lineHeight: 1 }}>{p.icon}</span>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontWeight: 600, fontSize: 14 }}>{p.display_name}</div>
-          <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.category}</div>
+      {/* Card header */}
+      <div style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 24, lineHeight: 1 }}>{p.icon}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontWeight: 600, fontSize: 14 }}>{p.display_name}</div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{p.category}</div>
+          </div>
+          <span style={{
+            fontSize: 11, padding: '2px 8px', borderRadius: 4, flexShrink: 0,
+            background: configured ? '#27ae6015' : '#e6a70015',
+            color: configured ? '#27ae60' : '#e6a700',
+            border: `1px solid ${configured ? '#27ae6044' : '#e6a70044'}`,
+            fontWeight: 600,
+          }}>
+            {configured ? '✓ Ready' : '⚙ Setup needed'}
+          </span>
         </div>
-        <span style={{
-          fontSize: 11, padding: '2px 8px', borderRadius: 4,
-          background: configured ? '#27ae6015' : '#e6a70015',
-          color: configured ? '#27ae60' : '#e6a700',
-          border: `1px solid ${configured ? '#27ae6044' : '#e6a70044'}`,
-          fontWeight: 600,
-        }}>
-          {configured ? '✓ Ready' : '⚙ Setup needed'}
-        </span>
+
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}>
+          {p.description}
+        </div>
+
+        {p.missing_config?.length > 0 && !expanded && (
+          <div style={{ fontSize: 11, color: '#e6a700', fontFamily: 'var(--font-mono)' }}>
+            Missing: {p.missing_config.join(', ')}
+          </div>
+        )}
+
+        {p.metadata?.required_env_vars?.length > 0 && configured && (
+          <div style={{ fontSize: 11, color: '#27ae60' }}>
+            ✓ {p.metadata.required_env_vars.length} credential{p.metadata.required_env_vars.length !== 1 ? 's' : ''} configured
+          </div>
+        )}
+
+        <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+          <button className="pp-btn pp-btn--ghost" style={{ fontSize: 12 }} onClick={openForm}>
+            {expanded ? 'Cancel' : configured ? 'Manage Credentials' : 'Set Up →'}
+          </button>
+        </div>
       </div>
 
-      <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}>
-        {p.description}
-      </div>
+      {/* Inline setup form */}
+      {expanded && (
+        <div style={{ borderTop: '2px solid #e6a700', background: 'var(--bg)', padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {formLoading ? (
+            <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>Loading configuration…</div>
+          ) : (
+            <>
+              <div style={{ fontSize: 12, fontWeight: 700, color: '#e6a700' }}>Configure credentials</div>
+              {hint && (
+                <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.4 }}>{hint}</div>
+              )}
 
-      {p.missing_config?.length > 0 && (
-        <div style={{ background: '#e6a70010', border: '1px solid #e6a70033', borderRadius: 6, padding: '8px 10px', fontSize: 12 }}>
-          <div style={{ fontWeight: 600, color: '#e6a700', marginBottom: 4 }}>Required environment variables:</div>
-          {p.missing_config.map(v => (
-            <div key={v} style={{ fontFamily: 'monospace', fontSize: 11, color: 'var(--text-muted)', marginTop: 2 }}>
-              • {v}
-            </div>
-          ))}
-        </div>
-      )}
+              {fields?.length === 0 && (
+                <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>No credentials required for this integration.</div>
+              )}
 
-      {p.metadata?.required_env_vars?.length > 0 && configured && (
-        <div style={{ fontSize: 11, color: '#27ae60', display: 'flex', alignItems: 'center', gap: 4 }}>
-          ✓ {p.metadata.required_env_vars.length} credential{p.metadata.required_env_vars.length !== 1 ? 's' : ''} configured
+              {fields?.map(field => {
+                const k = String(field.key || '').trim()
+                if (!k) return null
+                return (
+                  <div key={k} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                    <label style={{ fontSize: 11, color: 'var(--text-muted)', fontWeight: 600 }}>
+                      {field.label || k}{field.required ? ' *' : ''}
+                    </label>
+                    <input
+                      className="pp-input"
+                      type={field.secret ? 'password' : 'text'}
+                      placeholder={field.placeholder || field.default || ''}
+                      value={values[k] || ''}
+                      onChange={e => setValues(v => ({ ...v, [k]: e.target.value }))}
+                    />
+                    {field.hint && (
+                      <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{field.hint}</div>
+                    )}
+                  </div>
+                )
+              })}
+
+              {oauthPath && (
+                <button
+                  className="pp-btn pp-btn--ghost"
+                  style={{ alignSelf: 'flex-start', fontSize: 12 }}
+                  onClick={() => window.open(`${base}${oauthPath}`, '_blank', 'noopener')}
+                >
+                  Start OAuth →
+                </button>
+              )}
+
+              {err && <div style={{ fontSize: 12, color: '#e74c3c' }}>⚠ {err}</div>}
+
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 2 }}>
+                {saved && <span style={{ fontSize: 12, color: '#27ae60', alignSelf: 'center' }}>Saved</span>}
+                <button className="pp-btn pp-btn--ghost" style={{ fontSize: 12 }} onClick={() => setExpanded(false)}>Cancel</button>
+                <button className="pp-btn pp-btn--primary" style={{ fontSize: 12 }} onClick={save} disabled={saving}>
+                  {saving ? 'Saving…' : 'Save'}
+                </button>
+              </div>
+            </>
+          )}
         </div>
       )}
     </div>

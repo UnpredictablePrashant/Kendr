@@ -5,10 +5,18 @@ from typing import Any
 from kendr.llm_router import provider_status
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.file_memory import update_planning_file
+from tasks.security_policy import is_security_assessment_query
 from tasks.utils import OUTPUT_DIR, llm, log_task_update, logger, model_selection_for_agent, normalize_llm_text, write_text_file
 
 
 NON_EXECUTABLE_PLAN_AGENTS = {"planner_agent"}
+_SECURITY_PLAN_AGENT_PREFERENCE = [
+    "security_scope_guard_agent",
+    "recon_agent",
+    "scanner_agent",
+    "security_report_agent",
+    "security_scanner_agent",
+]
 
 
 def _planner_provider_snapshot() -> dict[str, str]:
@@ -69,6 +77,33 @@ def _strip_code_fences(text: str) -> str:
         if len(lines) >= 2:
             return "\n".join(lines[1:-1]).strip()
     return stripped
+
+
+def _is_security_planning_request(state: dict[str, Any], objective: str) -> bool:
+    if bool(state.get("security_authorized", False)):
+        return True
+    if str(state.get("security_target_url", "")).strip():
+        return True
+    return is_security_assessment_query(objective)
+
+
+def _plan_payload_usable(raw_plan: Any) -> tuple[bool, str]:
+    if not isinstance(raw_plan, dict):
+        return False, "Planner returned a non-object response."
+    raw_steps = raw_plan.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        return False, "Planner response did not include a non-empty `steps` list."
+    if not any(isinstance(item, dict) for item in raw_steps):
+        return False, "Planner response `steps` list did not contain any valid step objects."
+    return True, ""
+
+
+def _security_plan_agent_suggestions(state: dict[str, Any]) -> list[str]:
+    available = set(state.get("available_agents", []) or [])
+    picks = [name for name in _SECURITY_PLAN_AGENT_PREFERENCE if name in available]
+    if picks:
+        return picks
+    return _SECURITY_PLAN_AGENT_PREFERENCE[:4]
 
 
 def _as_str_list(value: Any) -> list[str]:
@@ -487,12 +522,35 @@ Return ONLY valid JSON in this exact schema (no extra fields, no markdown, no ex
     except Exception as exc:
         raise RuntimeError(_planner_error_message(exc, provider_snapshot)) from exc
     raw_plan = normalize_llm_text(response.content if hasattr(response, "content") else response)
+    parse_error = ""
     try:
         parsed_plan = json.loads(_strip_code_fences(raw_plan))
-    except Exception:
+    except Exception as exc:
+        parse_error = str(exc).strip() or "Invalid JSON returned by planner model."
         parsed_plan = {}
 
-    plan_data = normalize_plan_data(parsed_plan, user_query)
+    security_planning_requested = _is_security_planning_request(state, user_query)
+    plan_usable, unusable_reason = _plan_payload_usable(parsed_plan)
+    if security_planning_requested and (bool(parse_error) or not plan_usable):
+        suggested_agents = _security_plan_agent_suggestions(state)
+        suggested_text = ", ".join(suggested_agents)
+        parser_reason = parse_error or unusable_reason or "Planner response was not usable."
+        questions = [
+            f"Planner output was invalid for a security request ({parser_reason}).",
+            f"Suggested agent route: {suggested_text}.",
+            "Reply `approve` to regenerate the plan with strict security routing, or provide the exact agent sequence to enforce.",
+        ]
+        plan_data = {
+            "needs_clarification": True,
+            "clarification_questions": questions,
+            "summary": "Security intent detected, but planner output was invalid. Execution is blocked to avoid unsafe fallback routing.",
+            "steps": [],
+            "execution_steps": [],
+            "model_assignments": [],
+        }
+    else:
+        plan_data = normalize_plan_data(parsed_plan, user_query)
+
     plan_md = plan_as_markdown(plan_data)
     questions = plan_data.get("clarification_questions", [])
     plan_version = int(state.get("plan_version", 0) or 0) + 1

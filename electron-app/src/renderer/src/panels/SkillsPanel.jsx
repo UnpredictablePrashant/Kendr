@@ -12,6 +12,153 @@ function groupBy(arr, key) {
   }, {})
 }
 
+function sandboxPresentation(sandbox) {
+  const mode = String(sandbox?.mode || '').trim().toLowerCase()
+  if (mode === 'bubblewrap') return { label: 'Sandboxed', tone: 'ok' }
+  if (mode === 'blocked') return { label: 'Blocked', tone: 'err' }
+  if (mode === 'process_isolated_only') return { label: 'Process only', tone: 'warn' }
+  if (mode === 'configurable') return { label: 'Configurable', tone: 'warn' }
+  if (mode === 'full_access') return { label: 'Full access', tone: 'err' }
+  if (mode === 'in_process') return { label: 'No sandbox', tone: 'muted' }
+  return { label: 'Unknown', tone: 'muted' }
+}
+
+function badgeStyle(tone) {
+  if (tone === 'ok') return { background: '#27ae6018', color: '#27ae60', border: '1px solid #27ae6044' }
+  if (tone === 'warn') return { background: '#f39c1218', color: '#d68910', border: '1px solid #f39c1244' }
+  if (tone === 'err') return { background: '#e74c3c18', color: '#e74c3c', border: '1px solid #e74c3c44' }
+  return { background: 'var(--bg)', color: 'var(--text-muted)', border: '1px solid var(--border)' }
+}
+
+function SandboxBadge({ sandbox }) {
+  const visual = sandboxPresentation(sandbox)
+  return (
+    <span style={{ fontSize: 11, padding: '1px 7px', borderRadius: 4, fontWeight: 600, ...badgeStyle(visual.tone) }}>
+      {visual.label}
+    </span>
+  )
+}
+
+function SandboxDetail({ sandbox, compact = false }) {
+  if (!sandbox) return null
+  const reason = String(sandbox.reason || '').trim()
+  const installHint = String(sandbox.install_hint || '').trim()
+  const mode = String(sandbox.mode || '').trim().toLowerCase()
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+        <SandboxBadge sandbox={sandbox} />
+        {sandbox.provider && sandbox.provider !== 'none' && (
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{sandbox.provider}</span>
+        )}
+      </div>
+      {!compact && reason && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.45 }}>{reason}</div>
+      )}
+      {!compact && installHint && (mode === 'blocked' || mode === 'process_isolated_only') && (
+        <div style={{ fontSize: 11, color: 'var(--text-muted)', lineHeight: 1.45 }}>{installHint}</div>
+      )}
+    </div>
+  )
+}
+
+function RuntimeSandboxBanner({ runtime }) {
+  if (!runtime || runtime.available) return null
+  return (
+    <div
+      style={{
+        background: 'rgba(243,156,18,.10)',
+        border: '1px solid rgba(243,156,18,.28)',
+        borderRadius: 10,
+        padding: '12px 14px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 6,
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        <span style={{ fontWeight: 700, fontSize: 13 }}>Sandbox limited</span>
+        <SandboxBadge sandbox={{ mode: runtime.supported ? 'blocked' : 'process_isolated_only' }} />
+      </div>
+      <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+        {runtime.reason || 'Sandbox support is not fully available in this environment.'}
+      </div>
+      {runtime.install_hint && (
+        <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+          {runtime.install_hint}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function _safeJsonParse(value) {
+  try { return JSON.parse(value) } catch { return null }
+}
+
+function _defaultDesktopForm() {
+  return {
+    action: 'list_apps',
+    app: 'generic',
+    access_mode: 'sandbox',
+    app_name: '',
+    office_app: 'outlook',
+    phone_number: '',
+    handle: '',
+    message: '',
+    document_path: '',
+    url: '',
+    timeout: 10,
+  }
+}
+
+function _desktopFormFromInputs(inputs) {
+  const source = (inputs && typeof inputs === 'object') ? inputs : {}
+  return {
+    ..._defaultDesktopForm(),
+    action: String(source.action || 'list_apps'),
+    app: String(source.app || 'generic'),
+    access_mode: String(source.access_mode || 'sandbox'),
+    app_name: String(source.app_name || ''),
+    office_app: String(source.office_app || 'outlook'),
+    phone_number: String(source.phone_number || ''),
+    handle: String(source.handle || ''),
+    message: String(source.message || ''),
+    document_path: String(source.document_path || ''),
+    url: String(source.url || ''),
+    timeout: Number.isFinite(Number(source.timeout)) ? Number(source.timeout) : 10,
+  }
+}
+
+function _desktopInputsFromForm(form) {
+  const source = form || _defaultDesktopForm()
+  const action = String(source.action || 'list_apps')
+  const app = String(source.app || 'generic')
+  const payload = {
+    action,
+    app,
+    access_mode: String(source.access_mode || 'sandbox'),
+  }
+  const timeout = Number(source.timeout)
+  if (Number.isFinite(timeout) && timeout > 0) payload.timeout = timeout
+  if (action === 'open_app') {
+    if (app === 'generic' && String(source.app_name || '').trim()) payload.app_name = String(source.app_name).trim()
+    if (app === 'microsoft_365' && String(source.office_app || '').trim()) payload.office_app = String(source.office_app).trim()
+  }
+  if (action === 'open_chat') {
+    if (app === 'whatsapp' && String(source.phone_number || '').trim()) payload.phone_number = String(source.phone_number).trim()
+    if (app === 'telegram' && String(source.handle || '').trim()) payload.handle = String(source.handle).trim()
+    if (String(source.message || '').trim()) payload.message = String(source.message).trim()
+  }
+  if (action === 'open_document' && String(source.document_path || '').trim()) {
+    payload.document_path = String(source.document_path).trim()
+  }
+  if (action === 'open_url' && String(source.url || '').trim()) {
+    payload.url = String(source.url).trim()
+  }
+  return payload
+}
+
 // ─── root panel ─────────────────────────────────────────────────────────────
 
 export default function SkillsPanel() {
@@ -77,6 +224,7 @@ export default function SkillsPanel() {
   const custom  = data?.custom  || []
   const categories = data?.categories || []
   const installedCount = data?.installed_count ?? 0
+  const sandboxRuntime = data?.sandbox_runtime || null
 
   // Filter logic
   const filteredCatalog = catalog.filter(s => {
@@ -108,6 +256,11 @@ export default function SkillsPanel() {
           {installedCount > 0 && (
             <span className="pp-badge pp-badge--ok">{installedCount} installed</span>
           )}
+          {sandboxRuntime && (
+            <span className={`pp-badge ${sandboxRuntime.available ? 'pp-badge--ok' : 'pp-badge--warn'}`}>
+              {sandboxRuntime.available ? 'Sandbox ready' : 'Sandbox limited'}
+            </span>
+          )}
           <button className="pp-btn pp-btn--ghost" onClick={load}>↺ Refresh</button>
           <button
             className="pp-btn pp-btn--primary"
@@ -125,6 +278,8 @@ export default function SkillsPanel() {
           <button onClick={() => setErr(null)}>✕</button>
         </div>
       )}
+
+      <RuntimeSandboxBanner runtime={sandboxRuntime} />
 
       {/* ── Tabs + Search ── */}
       <div className="pp-filters" style={{ gap: 8 }}>
@@ -331,6 +486,8 @@ function CatalogSkillCard({ skill, busy, onInstall, onUninstall, onTest }) {
           ⚙ Requires: {skill.requires_config.join(', ')}
         </div>
       )}
+
+      <SandboxDetail sandbox={skill.sandbox} compact />
     </div>
   )
 }
@@ -377,6 +534,7 @@ function CustomSkillCard({ skill, onTest, onDelete }) {
           ))}
         </div>
       )}
+      <SandboxDetail sandbox={skill.sandbox} compact />
     </div>
   )
 }
@@ -525,6 +683,7 @@ function CreateSkillModal({ base, onClose, onCreated }) {
 
 function TestSkillModal({ base, skill, onClose }) {
   const skillId = skill.skill_id || skill.id
+  const isDesktopAutomationSkill = String(skill?.catalog_id || skill?.slug || '').trim() === 'desktop-automation'
   const approvalSessionIdRef = useRef(`skill-test-${String(skillId || 'skill').replace(/[^a-z0-9_-]+/ig, '-')}-${Date.now().toString(36)}`)
   const approvalSessionId = approvalSessionIdRef.current
   const [inputJson, setInputJson] = useState(() => {
@@ -549,6 +708,10 @@ function TestSkillModal({ base, skill, onClose }) {
   const [approvalErr, setApprovalErr] = useState(null)
   const [grants, setGrants] = useState([])
   const [revokeBusy, setRevokeBusy] = useState('')
+  const [desktopForm, setDesktopForm] = useState(() => {
+    const parsed = _safeJsonParse(inputJson)
+    return _desktopFormFromInputs(parsed || {})
+  })
 
   const loadApprovals = useCallback(async () => {
     try {
@@ -562,6 +725,21 @@ function TestSkillModal({ base, skill, onClose }) {
   useEffect(() => {
     loadApprovals()
   }, [loadApprovals])
+
+  useEffect(() => {
+    if (!isDesktopAutomationSkill) return
+    const parsed = _safeJsonParse(inputJson)
+    if (!parsed || typeof parsed !== 'object') return
+    setDesktopForm(_desktopFormFromInputs(parsed))
+  }, [inputJson, isDesktopAutomationSkill])
+
+  const setDesktopField = useCallback((field, value) => {
+    setDesktopForm((prev) => {
+      const next = { ...prev, [field]: value }
+      setInputJson(JSON.stringify(_desktopInputsFromForm(next), null, 2))
+      return next
+    })
+  }, [])
 
   const run = useCallback(async () => {
     setBusy(true)
@@ -647,6 +825,9 @@ function TestSkillModal({ base, skill, onClose }) {
     : ['once', 'session', 'always']
   const isApprovalPending = approvalRequest?.error_type === 'approval_required'
   const activeGrants = grants.filter((grant) => String(grant.status || '').toLowerCase() === 'active')
+  const effectiveSandbox = result?.sandbox || skill?.sandbox || null
+  const desktopAutomation = skill?.desktop_automation || null
+  const desktopApps = Array.isArray(desktopAutomation?.supported_apps) ? desktopAutomation.supported_apps : []
 
   return (
     <ModalOverlay onClose={onClose}>
@@ -666,15 +847,130 @@ function TestSkillModal({ base, skill, onClose }) {
           )}
         </div>
 
+        {desktopAutomation && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, background: 'rgba(52,152,219,.08)', border: '1px solid rgba(52,152,219,.22)', borderRadius: 10, padding: 12 }}>
+            <div style={{ fontWeight: 600, fontSize: 13 }}>Desktop automation modes</div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              {desktopAutomation.sandbox_notice}
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.5 }}>
+              {desktopAutomation.full_access_warning}
+            </div>
+            {Array.isArray(desktopAutomation.supported_apps) && desktopAutomation.supported_apps.length > 0 && (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {desktopAutomation.supported_apps.map((app) => (
+                  <span key={app.id} className="pp-badge pp-badge--info">{app.name}</span>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {effectiveSandbox && (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8, background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 10, padding: 12 }}>
+            <div style={{ fontWeight: 600, fontSize: 13 }}>Execution boundary</div>
+            <SandboxDetail sandbox={effectiveSandbox} />
+          </div>
+        )}
+
         <FormField label="Inputs (JSON)">
           <textarea
             value={inputJson}
-            onChange={e => setInputJson(e.target.value)}
+            onChange={e => {
+              const next = e.target.value
+              setInputJson(next)
+              if (isDesktopAutomationSkill) {
+                const parsed = _safeJsonParse(next)
+                if (parsed && typeof parsed === 'object') setDesktopForm(_desktopFormFromInputs(parsed))
+              }
+            }}
             rows={6}
             className="modal-input"
             style={{ fontFamily: 'monospace', fontSize: 12, resize: 'vertical' }}
           />
         </FormField>
+
+        {isDesktopAutomationSkill && (
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+            <FormField label="Access mode">
+              <select className="modal-input" value={desktopForm.access_mode} onChange={e => setDesktopField('access_mode', e.target.value)}>
+                <option value="sandbox">sandbox (preview only)</option>
+                <option value="full_access">full_access (native dispatch)</option>
+              </select>
+            </FormField>
+            <FormField label="Action">
+              <select className="modal-input" value={desktopForm.action} onChange={e => setDesktopField('action', e.target.value)}>
+                <option value="list_apps">list_apps</option>
+                <option value="open_app">open_app</option>
+                <option value="open_chat">open_chat</option>
+                <option value="open_document">open_document</option>
+                <option value="open_url">open_url</option>
+              </select>
+            </FormField>
+            <FormField label="App">
+              <select className="modal-input" value={desktopForm.app} onChange={e => setDesktopField('app', e.target.value)}>
+                {(desktopApps.length ? desktopApps : [
+                  { id: 'generic', name: 'Generic Native App' },
+                  { id: 'whatsapp', name: 'WhatsApp' },
+                  { id: 'telegram', name: 'Telegram' },
+                  { id: 'microsoft_365', name: 'Microsoft 365' },
+                ]).map((app) => (
+                  <option key={app.id} value={app.id}>{app.id}</option>
+                ))}
+              </select>
+            </FormField>
+            <FormField label="Timeout (s)">
+              <input
+                className="modal-input"
+                type="number"
+                min={1}
+                value={desktopForm.timeout}
+                onChange={e => setDesktopField('timeout', Number(e.target.value || 10))}
+              />
+            </FormField>
+            {desktopForm.action === 'open_app' && desktopForm.app === 'generic' && (
+              <FormField label="App name">
+                <input className="modal-input" value={desktopForm.app_name} onChange={e => setDesktopField('app_name', e.target.value)} placeholder="Telegram Desktop" />
+              </FormField>
+            )}
+            {desktopForm.action === 'open_app' && desktopForm.app === 'microsoft_365' && (
+              <FormField label="Office app">
+                <select className="modal-input" value={desktopForm.office_app} onChange={e => setDesktopField('office_app', e.target.value)}>
+                  <option value="outlook">outlook</option>
+                  <option value="word">word</option>
+                  <option value="excel">excel</option>
+                  <option value="powerpoint">powerpoint</option>
+                  <option value="teams">teams</option>
+                </select>
+              </FormField>
+            )}
+            {desktopForm.action === 'open_chat' && desktopForm.app === 'whatsapp' && (
+              <FormField label="Phone number">
+                <input className="modal-input" value={desktopForm.phone_number} onChange={e => setDesktopField('phone_number', e.target.value)} placeholder="+14155550123" />
+              </FormField>
+            )}
+            {desktopForm.action === 'open_chat' && desktopForm.app === 'telegram' && (
+              <FormField label="Telegram handle">
+                <input className="modal-input" value={desktopForm.handle} onChange={e => setDesktopField('handle', e.target.value)} placeholder="OpenAI" />
+              </FormField>
+            )}
+            {desktopForm.action === 'open_chat' && (
+              <FormField label="Message">
+                <input className="modal-input" value={desktopForm.message} onChange={e => setDesktopField('message', e.target.value)} placeholder="Optional message draft" />
+              </FormField>
+            )}
+            {desktopForm.action === 'open_document' && (
+              <FormField label="Document path">
+                <input className="modal-input" value={desktopForm.document_path} onChange={e => setDesktopField('document_path', e.target.value)} placeholder="/path/to/file.docx" />
+              </FormField>
+            )}
+            {desktopForm.action === 'open_url' && (
+              <FormField label="URL">
+                <input className="modal-input" value={desktopForm.url} onChange={e => setDesktopField('url', e.target.value)} placeholder="https://example.com" />
+              </FormField>
+            )}
+          </div>
+        )}
 
         <button
           onClick={run}
@@ -792,6 +1088,11 @@ function TestSkillModal({ base, skill, onClose }) {
               }}>
                 {result.success ? '✓ success' : '✕ failed'}
               </span>
+              {typeof result.output?.preview_only === 'boolean' && (
+                <span className={`pp-badge ${result.output.preview_only ? 'pp-badge--warn' : 'pp-badge--ok'}`}>
+                  {result.output.preview_only ? 'preview only' : 'dispatched'}
+                </span>
+              )}
             </div>
             {result.stdout && (
               <pre style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6, padding: 10, fontSize: 12, overflowX: 'auto', maxHeight: 200, margin: 0 }}>
@@ -801,6 +1102,11 @@ function TestSkillModal({ base, skill, onClose }) {
             {result.error && (
               <pre style={{ background: '#e74c3c0a', border: '1px solid #e74c3c44', borderRadius: 6, padding: 10, fontSize: 12, color: '#e74c3c', overflowX: 'auto', maxHeight: 150, margin: 0 }}>
                 {result.error}
+              </pre>
+            )}
+            {result.output && typeof result.output === 'object' && (
+              <pre style={{ background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 6, padding: 10, fontSize: 12, overflowX: 'auto', maxHeight: 220, margin: 0 }}>
+                {JSON.stringify(result.output, null, 2)}
               </pre>
             )}
           </div>

@@ -1140,6 +1140,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "skip_reviews",
             "max_step_revisions",
             "adaptive_agent_selection",
+            "execution_mode",
             "planner_policy_mode",
             "reviewer_policy_mode",
             "planner_mode",
