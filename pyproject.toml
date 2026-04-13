@@ -39,7 +39,7 @@ dependencies = [
   "charset-normalizer>=3,<4",
   "beautifulsoup4>=4.12",
   # Document handling
-  "pypdf>=4.0",
+  "pypdf>=6.10.0",
   "python-docx>=1.1",
   # Environment and config
   "python-dotenv>=1.0",
