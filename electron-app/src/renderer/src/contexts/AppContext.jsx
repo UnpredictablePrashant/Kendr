@@ -59,6 +59,7 @@ const initialState = {
 
   // Runs
   runs: [],
+  activityFeed: [],
 
   // Git
   gitStatus: null,
@@ -144,6 +145,25 @@ function reducer(state, action) {
     case 'SET_STREAMING': return { ...state, streaming: action.streaming }
     case 'SET_ACTIVE_RUN': return { ...state, activeRunId: action.runId }
     case 'SET_RUNS': return { ...state, runs: action.runs }
+    case 'UPSERT_ACTIVITY_ENTRY': {
+      const entry = action.entry
+      if (!entry?.id) return state
+      const existing = state.activityFeed.filter((item) => item.id !== entry.id)
+      return {
+        ...state,
+        activityFeed: [entry, ...existing].slice(0, 40),
+      }
+    }
+    case 'REMOVE_ACTIVITY_ENTRIES': {
+      const ids = new Set(Array.isArray(action.ids) ? action.ids : [])
+      if (!ids.size) return state
+      return {
+        ...state,
+        activityFeed: state.activityFeed.filter((item) => !ids.has(item.id)),
+      }
+    }
+    case 'CLEAR_ACTIVITY_FEED':
+      return { ...state, activityFeed: [] }
 
     case 'SET_GIT_STATUS': return { ...state, gitStatus: action.status, gitBranch: action.branch || state.gitBranch }
     case 'TOGGLE_COMMAND_PALETTE': return { ...state, commandPaletteOpen: !state.commandPaletteOpen }

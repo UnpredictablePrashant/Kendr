@@ -167,10 +167,10 @@ export default function ProjectWorkspace() {
               <button className={`pw-tool-btn ${showBottom && bottomTab === 'terminal' ? 'active' : ''}`} title="Terminal (Ctrl+`)" onClick={() => toggleBottom('terminal')}>
                 <TermIcon />
               </button>
-              <button className={`pw-tool-btn ${showBottom && bottomTab === 'run' ? 'active' : ''}`} title="Run Panel" onClick={() => toggleBottom('run')}>
+              <button className={`pw-tool-btn ${showBottom && bottomTab === 'run' ? 'active' : ''}`} title="Activity Panel" onClick={() => toggleBottom('run')}>
                 <RunIcon />
               </button>
-              <button className={`pw-tool-btn ${state.composerOpen ? 'active' : ''}`} title="Agent Panel (Ctrl+Shift+A)" onClick={() => dispatch({ type: 'TOGGLE_COMPOSER' })}>
+              <button className={`pw-tool-btn ${state.composerOpen ? 'active' : ''}`} title="Workflow Panel (Ctrl+Shift+A)" onClick={() => dispatch({ type: 'TOGGLE_COMPOSER' })}>
                 <ComposerIcon />
               </button>
             </div>
@@ -233,7 +233,7 @@ export default function ProjectWorkspace() {
           <div className="pw-bottom" style={{ height: bottomH }}>
             <div className="pw-bottom-header">
               <button className={`pw-bottom-tab ${bottomTab === 'terminal' ? 'active' : ''}`} onClick={() => setBottomTab('terminal')}>Terminal</button>
-              <button className={`pw-bottom-tab ${bottomTab === 'run' ? 'active' : ''}`} onClick={() => setBottomTab('run')}>Run</button>
+              <button className={`pw-bottom-tab ${bottomTab === 'run' ? 'active' : ''}`} onClick={() => setBottomTab('run')}>Activity</button>
               <div className="pw-bottom-spacer" />
               <button className="pw-bottom-close" onClick={() => setShowBottom(false)}>✕</button>
             </div>

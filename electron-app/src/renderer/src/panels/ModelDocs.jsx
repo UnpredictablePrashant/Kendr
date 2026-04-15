@@ -46,6 +46,9 @@ export default function ModelDocs() {
   }, [apiBase])
 
   const rows = useMemo(() => {
+    const comparisonRows = Array.isArray(inventory?.comparison_rows) ? inventory.comparison_rows : []
+    if (comparisonRows.length) return comparisonRows
+
     const providers = Array.isArray(inventory?.providers) ? inventory.providers : []
     return providers.filter(provider => provider.has_key || provider.provider === 'ollama')
   }, [inventory])
@@ -206,7 +209,7 @@ export default function ModelDocs() {
               <thead>
                 <tr>
                   <th>Provider</th>
-                  <th>Configured Model</th>
+                  <th>Model</th>
                   <th>Status</th>
                   <th>Context</th>
                   <th>Tool Calling</th>
@@ -220,39 +223,39 @@ export default function ModelDocs() {
                 </tr>
               </thead>
               <tbody>
-                {rows.map((provider) => {
-                  const badges = provider.model_badges || {}
-                  const latest = Object.keys(badges).find(model => badges[model]?.includes('latest')) || '—'
-                  const best = Object.keys(badges).find(model => badges[model]?.includes('best')) || '—'
-                  const cheapest = Object.keys(badges).find(model => badges[model]?.includes('cheapest')) || '—'
-                  const capabilities = provider.model_capabilities || {}
-                  const status = provider.model_fetch_error
-                    ? `Error: ${provider.model_fetch_error}`
-                    : provider.ready
-                      ? 'Ready'
-                      : provider.note || 'Not ready'
-
+                {rows.map((row, index) => {
+                  const capabilities = row.model_capabilities || row.capabilities || {}
+                  const providerLabel = row.provider || row.model_family || row.source_provider || '—'
+                  const sourceProvider = row.source_provider && row.source_provider !== providerLabel ? row.source_provider : ''
+                  const status = row.status || (row.model_fetch_error ? `Error: ${row.model_fetch_error}` : 'Ready')
                   return (
-                    <tr key={provider.provider}>
-                      <td>{provider.provider}</td>
+                    <tr key={`${providerLabel}:${row.model || row.provider}:${index}`}>
                       <td>
                         <div className="md-model-cell">
-                          <span>{provider.model || '—'}</span>
-                          {provider.model_badges?.[provider.model]?.map(badge => (
-                            <span key={`${provider.provider}:${provider.model}:${badge}`} className={`md-chip ${badge}`}>{badge}</span>
+                          <span>{providerLabel}</span>
+                          {sourceProvider && <span className="md-chip">{sourceProvider}</span>}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="md-model-cell">
+                          <span>{row.model || '—'}</span>
+                          {row.selected && <span className="md-chip best">active</span>}
+                          {!row.selected && row.configured && <span className="md-chip latest">configured</span>}
+                          {(row.model_badges || []).map(badge => (
+                            <span key={`${providerLabel}:${row.model}:${badge}`} className={`md-chip ${badge}`}>{badge}</span>
                           ))}
                         </div>
                       </td>
-                      <td className={provider.model_fetch_error ? 'md-error-text' : ''}>{status}</td>
-                      <td>{provider.context_window ? `${provider.context_window.toLocaleString()} tokens` : '—'}</td>
+                      <td className={row.model_fetch_error ? 'md-error-text' : ''}>{status}</td>
+                      <td>{row.context_window ? `${row.context_window.toLocaleString()} tokens` : '—'}</td>
                       <td>{capabilityLabel(capabilities.tool_calling)}</td>
-                      <td>{capabilityLabel(provider.agent_capable)}</td>
+                      <td>{capabilityLabel(row.agent_capable)}</td>
                       <td>{capabilityLabel(capabilities.vision)}</td>
                       <td>{capabilityLabel(capabilities.structured_output)}</td>
                       <td>{capabilityLabel(capabilities.reasoning)}</td>
-                      <td>{latest}</td>
-                      <td>{best}</td>
-                      <td>{cheapest}</td>
+                      <td>{row.suggested_latest || '—'}</td>
+                      <td>{row.suggested_best || '—'}</td>
+                      <td>{row.suggested_cheapest || '—'}</td>
                     </tr>
                   )
                 })}

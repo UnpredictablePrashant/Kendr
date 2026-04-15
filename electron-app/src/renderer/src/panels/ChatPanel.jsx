@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo, useReducer } from 'react'
 import { useApp } from '../contexts/AppContext'
 import { basename, resolveAgentCapability, resolveContextWindow, resolveSelectedModel } from '../lib/modelSelection'
+import { buildActivityEntry, isPlanApprovalScope, isSkillApproval, shouldMirrorActivityMessage, summarizeRunArtifacts } from '../lib/runPresentation'
 
 // ─── Chat history persistence ────────────────────────────────────────────────
 const CHAT_HISTORY_KEY = 'kendr_chat_history_v1'
@@ -69,7 +70,7 @@ const initChat = {
   messages: [],          // [{id,role,content,steps,status,runId,artifacts,progress,ts}]
   streaming: false,
   activeRunId: null,
-  mode: 'chat',          // chat | agent | research | security
+  mode: 'chat',          // chat | plan | agent | research | security
   awaitingContext: null, // {runId,workflowId,prompt,kind}
 }
 
@@ -136,6 +137,8 @@ function buildPayload(text, chatId, runId, projectRoot, mode, dr, attachments = 
   const localPaths = Array.isArray(attachments) ? attachments.map(item => item.path).filter(Boolean) : []
   const normalizedText = mode === 'agent'
     ? `Handle this in agent mode. Do the detailed work, think step by step, use attached local files/folders if relevant, and return a concise final answer.\n\nUser request: ${text}`
+    : mode === 'plan'
+      ? `Use planning mode. Create a concrete execution plan first, keep it concise, ask for approval before implementation, and wait for the user before making changes.\n\nUser request: ${text}`
     : text
   const base = {
     text: normalizedText,
@@ -146,11 +149,14 @@ function buildPayload(text, chatId, runId, projectRoot, mode, dr, attachments = 
     working_directory: studioMode ? undefined : (projectRoot || undefined),
     use_mcp:           useMcp,
   }
-  if (mode === 'agent') {
+  if (mode === 'agent' || mode === 'plan') {
     return {
       ...base,
       local_drive_paths: localPaths.length ? localPaths : undefined,
       local_drive_recursive: localPaths.length ? true : undefined,
+      execution_mode: mode === 'plan' ? 'plan' : undefined,
+      planner_mode: mode === 'plan' ? 'always' : undefined,
+      auto_approve_plan: mode === 'plan' ? false : undefined,
     }
   }
   if (mode !== 'research') {
@@ -198,6 +204,7 @@ function buildPayload(text, chatId, runId, projectRoot, mode, dr, attachments = 
 }
 
 function modeLabel(mode) {
+  if (mode === 'plan') return 'Plan'
   if (mode === 'agent') return 'Agent'
   if (mode === 'research') return 'Deep Research'
   return 'Chat'
@@ -276,6 +283,11 @@ function latestChecklistMessage(messages) {
     if (msg?.role === 'assistant' && Array.isArray(msg?.checklist) && msg.checklist.length) return msg
   }
   return null
+}
+
+function shouldInlineAwaitingContext(ctx) {
+  if (!ctx || typeof ctx !== 'object') return false
+  return !isSkillApproval(ctx.kind, ctx.approvalRequest)
 }
 
 function buildSimpleHistory(messages, maxTurns = 12) {
@@ -482,7 +494,7 @@ const DR_DEFAULTS = {
 
 // ─── Component ───────────────────────────────────────────────────────────────
 export default function ChatPanel({ fullWidth = false, hideHeader = false, studioMode = false }) {
-  const { state: appState, dispatch: appDispatch, refreshModelInventory } = useApp()
+  const { state: appState, dispatch: appDispatch, openFile, refreshModelInventory } = useApp()
   const api = window.kendrAPI
   const [chat, dispatch] = useReducer(chatReducer, undefined, () => ({ ...initChat, messages: loadHistory() }))
   const [input, setInput] = useState('')
@@ -502,6 +514,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   const inputRef = useRef(null)
   const esRef = useRef(null)
   const resumeAttemptedRunRef = useRef('')
+  const mirroredActivityIdsRef = useRef([])
   const apiBase = appState.backendUrl || 'http://127.0.0.1:2151'
   const updateDr = (patch) => setDr(s => ({ ...s, ...patch }))
   const selectedModelMeta = resolveSelectedModel(appState.selectedModel)
@@ -536,6 +549,13 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   const contextPct = Math.min(100, Math.round((estimatedContextTokens / Math.max(contextLimit, 1)) * 100))
   const stickyChecklistMsg = useMemo(() => latestChecklistMessage(chat.messages), [chat.messages])
   const stickyChecklist = Array.isArray(stickyChecklistMsg?.checklist) ? stickyChecklistMsg.checklist : []
+  const inlineAwaiting = shouldInlineAwaitingContext(chat.awaitingContext)
+  const openArtifact = useCallback(async (item) => {
+    const filePath = String(item?.path || '').trim()
+    if (!filePath) return
+    appDispatch({ type: 'SET_VIEW', view: 'developer' })
+    await openFile(filePath)
+  }, [appDispatch, openFile])
 
   // Close the SSE stream when the panel unmounts (e.g. explicit new-chat remount)
   useEffect(() => {
@@ -547,7 +567,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   }, [appState.activeRunId])
 
   useEffect(() => {
-    if (chat.mode === 'agent' && !selectedModelAgentCapable) {
+    if ((chat.mode === 'agent' || chat.mode === 'plan') && !selectedModelAgentCapable) {
       dispatch({ type: 'SET_MODE', mode: 'chat' })
     }
   }, [chat.mode, selectedModelAgentCapable])
@@ -555,6 +575,22 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chat.messages])
+
+  useEffect(() => {
+    const entries = chat.messages
+      .filter(shouldMirrorActivityMessage)
+      .map((msg) => buildActivityEntry(msg, { id: `studio:${msg.id}`, source: studioMode ? 'studio' : 'chat' }))
+      .filter(Boolean)
+    const nextIds = new Set(entries.map((entry) => entry.id))
+    for (const entry of entries) {
+      appDispatch({ type: 'UPSERT_ACTIVITY_ENTRY', entry })
+    }
+    const removedIds = mirroredActivityIdsRef.current.filter((id) => !nextIds.has(id))
+    if (removedIds.length) {
+      appDispatch({ type: 'REMOVE_ACTIVITY_ENTRIES', ids: removedIds })
+    }
+    mirroredActivityIdsRef.current = Array.from(nextIds)
+  }, [chat.messages, appDispatch, studioMode])
 
   // Persist chat history continuously so an active run survives panel remounts.
   useEffect(() => {
@@ -668,7 +704,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
 
   // Auto-enable MCP when switching to agent mode; keep state when switching away
   useEffect(() => {
-    if (chat.mode === 'agent') setMcpEnabled(true)
+    if (chat.mode === 'agent' || chat.mode === 'plan') setMcpEnabled(true)
   }, [chat.mode])
 
   // Fetch enabled MCP server count and check for undiscovered servers
@@ -766,8 +802,10 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
 
     const runId = `ui-${Date.now().toString(36)}`
     const userMsgId = `u-${runId}`
-    const resumeMessageId = String(chat.awaitingContext?.messageId || '').trim()
-    const asstMsgId = isResume && resumeMessageId ? resumeMessageId : `a-${runId}`
+    const currentAwaitingContext = chat.awaitingContext || null
+    const resumeMessageId = String(currentAwaitingContext?.messageId || '').trim()
+    const preserveAwaitingBubble = isResume && resumeMessageId && shouldInlineAwaitingContext(currentAwaitingContext)
+    const asstMsgId = isResume && resumeMessageId && !preserveAwaitingBubble ? resumeMessageId : `a-${runId}`
 
     const currentMode = chat.mode
     const currentModeLabel = modeLabel(currentMode)
@@ -790,7 +828,24 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     dispatch({ type: 'CLEAR_AWAITING' })
     setAttachments([])
 
-    if (isResume && resumeMessageId) {
+    if (preserveAwaitingBubble && resumeMessageId) {
+      const normalizedReply = msg.toLowerCase()
+      const approvalState = normalizedReply === 'approve'
+        ? 'approved'
+        : normalizedReply === 'cancel'
+          ? 'rejected'
+          : 'suggested'
+      dispatch({
+        type: 'UPD_MSG',
+        id: resumeMessageId,
+        patch: {
+          status: 'done',
+          approvalState,
+        },
+      })
+    }
+
+    if (isResume && resumeMessageId && !preserveAwaitingBubble) {
       dispatch({
         type: 'UPD_MSG',
         id: asstMsgId,
@@ -802,6 +857,9 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           mode: currentMode,
           modeLabel: currentModeLabel,
           statusText: 'Continuing approved plan...',
+          approvalScope: '',
+          approvalKind: '',
+          approvalRequest: null,
         },
       })
     } else {
@@ -819,6 +877,9 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           runStartedAt: new Date().toISOString(),
           mode: currentMode,
           modeLabel: currentModeLabel,
+          approvalScope: '',
+          approvalKind: '',
+          approvalRequest: null,
           ts: new Date(),
         }
       })
@@ -827,16 +888,16 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     appDispatch({ type: 'SET_STREAMING', streaming: true })
 
     try {
-      const endpoint = isResume && chat.awaitingContext
+      const endpoint = isResume && currentAwaitingContext
         ? `${apiBase}/api/chat/resume`
         : isSimpleStudioChat
           ? `${apiBase}/api/chat/simple`
           : `${apiBase}/api/chat`
 
-      const body = isResume && chat.awaitingContext
+      const body = isResume && currentAwaitingContext
         ? {
-            run_id:      chat.awaitingContext.runId,
-            workflow_id: chat.awaitingContext.workflowId,
+            run_id:      currentAwaitingContext.runId,
+            workflow_id: currentAwaitingContext.workflowId,
             text:        msg,
             channel:     'webchat',
           }
@@ -1039,9 +1100,34 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
               approvalRequest: d.approval_request || null,
             }
           })
-          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: output, status: 'awaiting', artifacts: d.artifact_files || [], checklist } })
+          dispatch({
+            type: 'UPD_MSG',
+            id: asstMsgId,
+            patch: {
+              content: output,
+              status: 'awaiting',
+              artifacts: d.artifact_files || [],
+              checklist,
+              approvalScope: d.approval_pending_scope || '',
+              approvalKind: d.pending_user_input_kind || '',
+              approvalRequest: d.approval_request || null,
+              approvalState: 'pending',
+            },
+          })
         } else {
-          dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: output, status: 'done', artifacts: d.artifact_files || [], checklist: extractChecklist(d) } })
+          dispatch({
+            type: 'UPD_MSG',
+            id: asstMsgId,
+            patch: {
+              content: output,
+              status: 'done',
+              artifacts: d.artifact_files || [],
+              checklist: extractChecklist(d),
+              approvalScope: '',
+              approvalKind: '',
+              approvalRequest: null,
+            },
+          })
         }
       } catch (_) {}
     })
@@ -1268,6 +1354,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   }, [])
   const MODES = [
     { id: 'chat',     label: '💬 Chat' },
+    { id: 'plan',     label: '🗺 Plan' },
     { id: 'agent',    label: '✨ Agent' },
     { id: 'research', label: '🔬 Deep Research' },
   ]
@@ -1301,14 +1388,18 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
 
       {/* ── Mode pills ── */}
       <div className="kc-mode-bar">
-        {MODES.map(m => (
-          <button
-            key={m.id}
-            className={`kc-mode-pill ${chat.mode === m.id ? 'kc-mode-pill--active' : ''} ${m.id === 'agent' && !selectedModelAgentCapable ? 'kc-mode-pill--disabled' : ''}`}
-            onClick={() => { if (m.id === 'agent' && !selectedModelAgentCapable) return; dispatch({ type: 'SET_MODE', mode: m.id }) }}
-            title={m.id === 'agent' && !selectedModelAgentCapable ? 'Selected model cannot run as agent.' : ''}
-          >{m.label}</button>
-        ))}
+        {MODES.map((m) => {
+          const requiresAgent = m.id === 'agent' || m.id === 'plan'
+          const disabled = requiresAgent && !selectedModelAgentCapable
+          return (
+            <button
+              key={m.id}
+              className={`kc-mode-pill ${chat.mode === m.id ? 'kc-mode-pill--active' : ''} ${disabled ? 'kc-mode-pill--disabled' : ''}`}
+              onClick={() => { if (disabled) return; dispatch({ type: 'SET_MODE', mode: m.id }) }}
+              title={disabled ? 'Selected model cannot run planning or agent workflows.' : ''}
+            >{m.label}</button>
+          )
+        })}
       </div>
 
       {/* ── Deep Research Panel ── */}
@@ -1323,13 +1414,13 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         {chat.messages.map(msg =>
           msg.role === 'user'
             ? <UserMessage key={msg.id} msg={msg} />
-            : <AssistantMessage key={msg.id} msg={msg} />
+            : <AssistantMessage key={msg.id} msg={msg} onQuickReply={(reply) => send(reply, true)} onSendSuggestion={(reply) => send(reply, true)} onOpenArtifact={openArtifact} />
         )}
         <div ref={messagesEndRef} />
       </div>
 
       {/* ── Agent approval modal ── */}
-      {chat.awaitingContext && (
+      {chat.awaitingContext && !inlineAwaiting && (
         <AgentApprovalModal
           ctx={chat.awaitingContext}
           value={resumeInput}
@@ -1377,7 +1468,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           <div className="kc-attach-actions">
             <button className="kc-attach-btn" onClick={attachFiles}>+ Files</button>
             {studioMode && <button className="kc-attach-btn" onClick={attachFolder}>+ Folder</button>}
-            {chat.mode === 'agent' ? (
+            {chat.mode === 'agent' || chat.mode === 'plan' ? (
               <span
                 className={`kc-mcp-indicator${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-indicator--warn' : ''}`}
                 title={mcpUndiscovered > 0
@@ -1439,6 +1530,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             className="kc-input"
             placeholder={
               chat.mode === 'research'  ? 'Describe the deep research task, scope, and output you want…'  :
+              chat.mode === 'plan'      ? 'Ask for a plan first. Kendr will outline steps and wait before implementation… (Ctrl+Enter)' :
               chat.mode === 'security'  ? 'Describe the target and scope…'     :
               chat.mode === 'agent'     ? 'Ask the agent to investigate, reason step by step, and do the detailed work… (Ctrl+Enter)' :
               'Ask a direct question… (Ctrl+Enter)'
@@ -1458,6 +1550,12 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           >
             {chat.streaming ? <StopIcon /> : <SendIcon />}
           </button>
+        </div>
+        <div className="kc-flow-strip">
+          <span className={`kc-flow-chip kc-flow-chip--${chat.mode}`}>{chat.mode === 'plan' ? 'Plan first' : chat.mode === 'agent' ? 'Agent run' : chat.mode === 'research' ? 'Research flow' : 'Quick answer'}</span>
+          {!studioMode && appState.projectRoot && <span className="kc-flow-chip">Workspace · {basename(appState.projectRoot)}</span>}
+          <span className="kc-flow-chip">{selectedModelMeta.model ? selectedModelMeta.label : 'Backend auto'}</span>
+          {chat.mode === 'plan' && <span className="kc-flow-chip kc-flow-chip--muted">waits before implement</span>}
         </div>
       </div>
     </div>
@@ -1633,6 +1731,7 @@ function WelcomeScreen({ onSuggest }) {
   const SUGGESTIONS = [
     'Summarize the attached files for me',
     'Explain this topic simply',
+    'Make a plan before implementing this task',
     'Investigate this problem step by step',
     'Run a security assessment',
     'Write a detailed technical report',
@@ -1642,7 +1741,7 @@ function WelcomeScreen({ onSuggest }) {
     <div className="kc-welcome">
       <div className="kc-welcome-logo">⚡</div>
       <h2 className="kc-welcome-title">Kendr Studio</h2>
-      <p className="kc-welcome-sub">Use Chat for direct answers. Use Agent when you want the assistant to do the detailed work and reason through the task.</p>
+      <p className="kc-welcome-sub">Use Chat for quick answers. Use Plan to outline the work first. Use Agent when you want Kendr to do the detailed work.</p>
       <div className="kc-suggestions">
         {SUGGESTIONS.map(s => (
           <button key={s} className="kc-suggest" onClick={() => onSuggest(s)}>{s}</button>
@@ -1697,7 +1796,7 @@ function UserMessage({ msg }) {
 }
 
 // ─── Assistant message ────────────────────────────────────────────────────────
-function AssistantMessage({ msg }) {
+function AssistantMessage({ msg, onQuickReply, onSendSuggestion, onOpenArtifact }) {
   const [copied, setCopied] = useState(false)
   const [nowMs, setNowMs] = useState(Date.now())
   const copy = () => { navigator.clipboard.writeText(msg.content); setCopied(true); setTimeout(() => setCopied(false), 1500) }
@@ -1712,6 +1811,12 @@ function AssistantMessage({ msg }) {
   const shellCard = shellCardFromProgress(progress)
   const visibleProgress = progress.filter((item) => !isShellProgressItem(item))
   const checklist = Array.isArray(msg.checklist) ? msg.checklist : []
+  const activityCards = summarizeRunArtifacts(visibleProgress, msg.artifacts)
+  const inlineApprovalVisible = msg.status === 'awaiting' && !isSkillApproval(msg.approvalKind, msg.approvalRequest)
+  const planCardVisible = checklist.length > 0 && (
+    msg.mode === 'plan'
+    || isPlanApprovalScope(msg.approvalScope, msg.approvalKind, msg.approvalRequest)
+  )
   const blockerChips = inferExecutionBlockers({ msg, shellCard, progress: visibleProgress, checklist })
   const progressSummary = (() => {
     if (!visibleProgress.length) return ''
@@ -1789,6 +1894,10 @@ function AssistantMessage({ msg }) {
           </div>
         )}
 
+        {activityCards.length > 0 && (
+          <RunArtifactCards cards={activityCards} onOpenItem={onOpenArtifact} />
+        )}
+
         {/* Codex-style worklog */}
         {msg.runId && (['thinking', 'streaming', 'awaiting'].includes(String(msg.status || '')) || visibleProgress.length > 0) && (
           <div className="kc-worklog">
@@ -1812,12 +1921,25 @@ function AssistantMessage({ msg }) {
           </div>
         )}
 
-        {checklist.length > 0 && (
+        {planCardVisible ? (
+          <PlanSummaryCard
+            msg={msg}
+            checklist={checklist}
+            onQuickReply={onQuickReply}
+            onSendSuggestion={onSendSuggestion}
+          />
+        ) : inlineApprovalVisible ? (
+          <InlineAwaitingCard
+            msg={msg}
+            onQuickReply={onQuickReply}
+            onSendSuggestion={onSendSuggestion}
+          />
+        ) : checklist.length > 0 ? (
           <ChecklistCard checklist={checklist} />
-        )}
+        ) : null}
 
         {/* Final content */}
-        {msg.content && msg.status !== 'error' && (
+        {msg.content && msg.status !== 'error' && !inlineApprovalVisible && (
           <div className="kc-content">
             <div className="kc-content-actions">
               <button className="kc-copy-btn" onClick={copy}>{copied ? 'Copied' : 'Copy'}</button>
@@ -1835,12 +1957,234 @@ function AssistantMessage({ msg }) {
         )}
 
         {/* Awaiting */}
-        {msg.status === 'awaiting' && (
+        {msg.status === 'awaiting' && !inlineApprovalVisible && (
           <div className="kc-awaiting-note">⏳ Waiting for your reply above…</div>
         )}
 
         <div className="kc-bubble-ts">{formatTs(msg.ts)}</div>
       </div>
+    </div>
+  )
+}
+
+function RunArtifactCards({ cards, onOpenItem }) {
+  return (
+    <div className="kc-activity-grid">
+      {cards.map((card) => (
+        <div key={`${card.kind}-${card.title}`} className={`kc-activity-card kc-activity-card--${card.kind}`}>
+          <div className="kc-activity-card-head">
+            <div>
+              <div className="kc-activity-card-kind">{card.kind}</div>
+              <div className="kc-activity-card-title">{card.title}</div>
+            </div>
+            {card.kind === 'edit' && Array.isArray(card.items) && card.items.some((item) => item?.path) && (
+              <button className="kc-activity-card-action" onClick={() => onOpenItem?.(card.items.find((item) => item?.path))}>
+                Review
+              </button>
+            )}
+          </div>
+          {Array.isArray(card.items) && card.items.length > 0 && (
+            <div className="kc-activity-card-items">
+              {card.items.slice(0, 3).map((item) => (
+                item?.path ? (
+                  <button key={`${item.path}-${item.label}`} className="kc-activity-card-item kc-activity-card-item--action" onClick={() => onOpenItem?.(item)}>
+                    {item.label}
+                  </button>
+                ) : (
+                  <span key={item.label} className="kc-activity-card-item">{item.label}</span>
+                )
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function PlanSummaryCard({ msg, checklist, onQuickReply, onSendSuggestion }) {
+  const [showSuggest, setShowSuggest] = useState(false)
+  const [draft, setDraft] = useState('')
+  const approvalRequest = (msg.approvalRequest && typeof msg.approvalRequest === 'object') ? msg.approvalRequest : {}
+  const approvalActions = (approvalRequest.actions && typeof approvalRequest.actions === 'object') ? approvalRequest.actions : {}
+  const rawSummary = String(approvalRequest.summary || msg.content || '').trim()
+  const summary = rawSummary.length > 520 ? `${rawSummary.slice(0, 520).trim()}…` : rawSummary
+  const approvalState = String(msg.approvalState || '').trim().toLowerCase()
+  const awaiting = msg.status === 'awaiting'
+  const stateLabel = awaiting
+    ? 'Plan Ready'
+    : approvalState === 'approved'
+      ? 'Plan Approved'
+      : approvalState === 'rejected'
+        ? 'Plan Rejected'
+        : approvalState === 'suggested'
+          ? 'Plan Updated'
+          : 'Plan'
+
+  return (
+    <div className="kc-plan-card">
+      <div className="kc-plan-card-head">
+        <div>
+          <div className="kc-plan-card-label">{stateLabel}</div>
+          <div className="kc-plan-card-meta">{checklist.length} task{checklist.length === 1 ? '' : 's'}</div>
+        </div>
+        {approvalState && approvalState !== 'pending' && (
+          <span className={`kc-plan-card-badge kc-plan-card-badge--${approvalState}`}>{approvalState}</span>
+        )}
+      </div>
+      {summary && <div className="kc-plan-card-summary">{summary}</div>}
+      <div className="kc-plan-card-list">
+        {checklist.map((item) => (
+          <ChecklistItem key={`plan-${item.step}-${item.title}`} item={item} compact />
+        ))}
+      </div>
+      {awaiting && (
+        <>
+          <div className="kc-plan-card-actions">
+            <button className="kc-plan-card-btn kc-plan-card-btn--approve" onClick={() => onQuickReply?.('approve')}>
+              {approvalActions.accept_label || 'Implement'}
+            </button>
+            <button
+              className={`kc-plan-card-btn kc-plan-card-btn--ghost${showSuggest ? ' kc-plan-card-btn--active' : ''}`}
+              onClick={() => setShowSuggest((value) => !value)}
+            >
+              {approvalActions.suggest_label || 'Change Plan'}
+            </button>
+            <button className="kc-plan-card-btn kc-plan-card-btn--reject" onClick={() => onQuickReply?.('cancel')}>
+              {approvalActions.reject_label || 'Reject'}
+            </button>
+          </div>
+          {showSuggest && (
+            <div className="kc-plan-card-suggest">
+              <textarea
+                className="kc-plan-card-input"
+                rows={3}
+                placeholder="Say what should change in the plan…"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+              />
+              <button
+                className="kc-plan-card-btn kc-plan-card-btn--approve"
+                onClick={() => {
+                  if (!draft.trim()) return
+                  onSendSuggestion?.(draft)
+                  setDraft('')
+                  setShowSuggest(false)
+                }}
+                disabled={!draft.trim()}
+              >
+                Send
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+function InlineAwaitingCard({ msg, onQuickReply, onSendSuggestion }) {
+  const [showSuggest, setShowSuggest] = useState(false)
+  const [draft, setDraft] = useState('')
+  const approvalRequest = (msg.approvalRequest && typeof msg.approvalRequest === 'object') ? msg.approvalRequest : {}
+  const approvalActions = (approvalRequest.actions && typeof approvalRequest.actions === 'object') ? approvalRequest.actions : {}
+  const title = approvalRequest.title || 'Waiting for input'
+  const summary = String(approvalRequest.summary || msg.content || '').trim()
+  const sections = Array.isArray(approvalRequest.sections) ? approvalRequest.sections : []
+  const hasQuickActions = !!(approvalActions.accept_label || approvalActions.reject_label || approvalActions.suggest_label || msg.approvalScope)
+
+  return (
+    <div className="kc-inline-approval">
+      <div className="kc-inline-approval-head">
+        <div className="kc-inline-approval-title">{title}</div>
+        <div className="kc-inline-approval-status">awaiting</div>
+      </div>
+      {summary && (
+        <div className="kc-inline-approval-summary">
+          <MarkdownRenderer content={summary} />
+        </div>
+      )}
+      {sections.length > 0 && (
+        <div className="kc-inline-approval-sections">
+          {sections.map((section, index) => (
+            <div key={`${section.title || 'section'}-${index}`} className="kc-inline-approval-section">
+              {section.title && <div className="kc-inline-approval-section-title">{section.title}</div>}
+              {Array.isArray(section.items) && section.items.length > 0 && (
+                <ul className="kc-inline-approval-list">
+                  {section.items.map((item, itemIndex) => (
+                    <li key={`${index}-${itemIndex}`}>{item}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {approvalRequest.help_text && (
+        <div className="kc-inline-approval-help">{approvalRequest.help_text}</div>
+      )}
+      {hasQuickActions ? (
+        <>
+          <div className="kc-inline-approval-actions">
+            <button className="kc-plan-card-btn kc-plan-card-btn--approve" onClick={() => onQuickReply?.('approve')}>
+              {approvalActions.accept_label || 'Approve'}
+            </button>
+            <button
+              className={`kc-plan-card-btn kc-plan-card-btn--ghost${showSuggest ? ' kc-plan-card-btn--active' : ''}`}
+              onClick={() => setShowSuggest((value) => !value)}
+            >
+              {approvalActions.suggest_label || 'Reply'}
+            </button>
+            <button className="kc-plan-card-btn kc-plan-card-btn--reject" onClick={() => onQuickReply?.('cancel')}>
+              {approvalActions.reject_label || 'Reject'}
+            </button>
+          </div>
+          {showSuggest && (
+            <div className="kc-plan-card-suggest">
+              <textarea
+                className="kc-plan-card-input"
+                rows={3}
+                placeholder="Type your reply…"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+              />
+              <button
+                className="kc-plan-card-btn kc-plan-card-btn--approve"
+                onClick={() => {
+                  if (!draft.trim()) return
+                  onSendSuggestion?.(draft)
+                  setDraft('')
+                  setShowSuggest(false)
+                }}
+                disabled={!draft.trim()}
+              >
+                Send
+              </button>
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="kc-plan-card-suggest">
+          <textarea
+            className="kc-plan-card-input"
+            rows={3}
+            placeholder="Type your reply…"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <button
+            className="kc-plan-card-btn kc-plan-card-btn--approve"
+            onClick={() => {
+              if (!draft.trim()) return
+              onSendSuggestion?.(draft)
+              setDraft('')
+            }}
+            disabled={!draft.trim()}
+          >
+            Send reply
+          </button>
+        </div>
+      )}
     </div>
   )
 }

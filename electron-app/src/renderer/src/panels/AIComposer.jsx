@@ -2,6 +2,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { DiffEditor } from '@monaco-editor/react'
 import { useApp } from '../contexts/AppContext'
 import { basename, resolveSelectedModel } from '../lib/modelSelection'
+import { buildActivityEntry, extractChecklist, isPlanApprovalScope, isSkillApproval, shouldMirrorActivityMessage, summarizeRunArtifacts } from '../lib/runPresentation'
 
 const LANG_MAP = {
   js:'javascript', jsx:'javascript', ts:'typescript', tsx:'typescript',
@@ -28,11 +29,12 @@ function stepIcon(step) {
 }
 
 export default function AIComposer({ editorInstanceRef }) {
-  const { state: app, dispatch: appDispatch, refreshModelInventory } = useApp()
-  const [mode, setMode]             = useState('agent')  // agent | chat | edit
+  const { state: app, dispatch: appDispatch, openFile, refreshModelInventory } = useApp()
+  const [mode, setMode]             = useState('agent')  // agent | plan | chat | edit
   const [messages, setMessages]     = useState([])
   const [input, setInput]           = useState('')
   const [streaming, setStreaming]   = useState(false)
+  const [awaitingContext, setAwaitingContext] = useState(null)
   const [attachedFiles, setAttachedFiles] = useState([])
   const [mentionAnchor, setMentionAnchor] = useState(null)
   const [applyDiff, setApplyDiff]   = useState(null)
@@ -44,6 +46,7 @@ export default function AIComposer({ editorInstanceRef }) {
   const threadEndRef = useRef(null)
   const inputRef    = useRef(null)
   const chatId      = useRef(`comp-${Date.now()}`).current
+  const mirroredActivityIdsRef = useRef([])
 
   const apiBase   = app.backendUrl || 'http://127.0.0.1:2151'
   const activeTab = app.openTabs.find(t => t.path === app.activeTabPath)
@@ -58,6 +61,22 @@ export default function AIComposer({ editorInstanceRef }) {
   useEffect(() => {
     threadEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  useEffect(() => {
+    const entries = messages
+      .filter(shouldMirrorActivityMessage)
+      .map((msg) => buildActivityEntry(msg, { id: `project:${msg.id}`, source: 'project' }))
+      .filter(Boolean)
+    const nextIds = new Set(entries.map((entry) => entry.id))
+    for (const entry of entries) {
+      appDispatch({ type: 'UPSERT_ACTIVITY_ENTRY', entry })
+    }
+    const removedIds = mirroredActivityIdsRef.current.filter((id) => !nextIds.has(id))
+    if (removedIds.length) {
+      appDispatch({ type: 'REMOVE_ACTIVITY_ENTRIES', ids: removedIds })
+    }
+    mirroredActivityIdsRef.current = Array.from(nextIds)
+  }, [messages, appDispatch])
 
   // Listen for Ctrl+K → edit mode; inline widget submit
   useEffect(() => {
@@ -95,25 +114,38 @@ export default function AIComposer({ editorInstanceRef }) {
   }, [])
 
   // ── SSE helper ──────────────────────────────────────────────────────────────
-  const runSSE = useCallback(async ({ text, chatIdOverride, onStep, onResult, onDone, onError }) => {
+  const runSSE = useCallback(async ({ text, chatIdOverride, requestMode = 'agent', resumeContext = null, onStep, onActivity, onResult, onAwaiting, onDone, onError }) => {
     const runId = `comp-${Date.now().toString(36)}`
     const isProjectAgent = !!app.projectRoot
     const selected = resolveSelectedModel(app.selectedModel)
-    let resp
-    try {
-      resp = await fetch(`${apiBase}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+    const endpoint = resumeContext ? `${apiBase}/api/chat/resume` : `${apiBase}/api/chat`
+    const payload = resumeContext
+      ? {
+          run_id: resumeContext.runId,
+          workflow_id: resumeContext.workflowId,
+          text,
+          channel: isProjectAgent ? 'project_ui' : 'webchat',
+        }
+      : {
           text,
           channel: isProjectAgent ? 'project_ui' : 'webchat',
           sender_id: isProjectAgent ? 'project_ui_user' : 'composer',
-          chat_id: chatIdOverride || chatId, run_id: runId,
+          chat_id: chatIdOverride || chatId,
+          run_id: runId,
           working_directory: app.projectRoot || undefined,
           project_root: app.projectRoot || undefined,
           provider: selected.provider || undefined,
           model: selected.model || undefined,
-        }),
+          execution_mode: requestMode === 'plan' ? 'plan' : undefined,
+          planner_mode: requestMode === 'plan' ? 'always' : undefined,
+          auto_approve_plan: requestMode === 'plan' ? false : undefined,
+        }
+    let resp
+    try {
+      resp = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
       })
     } catch (e) { refreshModelInventory(true); onError?.(`Network error: ${e.message}`); return }
     if (!resp.ok) { refreshModelInventory(true); onError?.(`Backend error: ${resp.statusText}`); return }
@@ -125,6 +157,26 @@ export default function AIComposer({ editorInstanceRef }) {
     esRef.current = es
     let lastResult = ''
     let stepCount = 0
+    let awaiting = false
+    let failed = false
+
+    es.addEventListener('activity', e => {
+      try {
+        const data = JSON.parse(e.data)
+        onActivity?.({
+          id: data.id || `activity-${Date.now()}`,
+          title: data.title || data.kind || 'Activity',
+          detail: data.detail || data.command || '',
+          kind: data.kind || 'activity',
+          status: data.status || 'running',
+          command: data.command || '',
+          cwd: data.cwd || '',
+          actor: data.actor || '',
+          durationLabel: data.duration_label || '',
+          exitCode: data.exit_code,
+        })
+      } catch {}
+    })
 
     es.addEventListener('step', e => {
       try {
@@ -143,19 +195,58 @@ export default function AIComposer({ editorInstanceRef }) {
       try {
         const d = JSON.parse(e.data)
         lastResult = d.final_output || d.output || d.draft_response || d.response || ''
-        onResult?.(lastResult)
+        awaiting = !!(
+          d.awaiting_user_input
+          || d.plan_waiting_for_approval
+          || d.plan_needs_clarification
+          || d.pending_user_input_kind
+          || d.approval_pending_scope
+          || d.pending_user_question
+          || (d.approval_request && Object.keys(d.approval_request).length > 0)
+        )
+        if (awaiting) {
+          onAwaiting?.({
+            output: lastResult,
+            checklist: extractChecklist(d),
+            runId: d.run_id || effectiveId,
+            workflowId: d.workflow_id || effectiveId,
+            prompt: d.pending_user_question || lastResult || 'Waiting for your input.',
+            kind: d.pending_user_input_kind || '',
+            scope: d.approval_pending_scope || '',
+            approvalRequest: d.approval_request || null,
+          })
+        } else {
+          onResult?.(lastResult)
+        }
       } catch {}
     })
-    es.addEventListener('done', () => { es.close(); onDone?.(lastResult) })
+    es.addEventListener('done', () => {
+      if (failed) return
+      es.close()
+      onDone?.({ output: lastResult, awaiting })
+    })
     es.addEventListener('error', e => {
+      if (failed) return
+      failed = true
       refreshModelInventory(true)
       try { const d = JSON.parse(e.data); onError?.(d.message || 'Run failed') } catch {}
-      es.close(); onDone?.(lastResult)
+      es.close()
     })
-    es.onerror = () => { refreshModelInventory(true); es.close(); onDone?.(lastResult) }
+    es.onerror = () => {
+      if (failed) return
+      failed = true
+      refreshModelInventory(true)
+      onError?.('Run failed')
+      es.close()
+    }
   }, [apiBase, chatId, app.projectRoot, app.selectedModel, refreshModelInventory])
 
   const stopStream = () => esRef.current?.close()
+  const openArtifact = useCallback(async (item) => {
+    const filePath = String(item?.path || '').trim()
+    if (!filePath) return
+    await openFile(filePath)
+  }, [openFile])
 
   const buildContextPrompt = useCallback((userText) => {
     let ctx = userText
@@ -167,6 +258,14 @@ export default function AIComposer({ editorInstanceRef }) {
         '- Keep progress updates and final answers concise, direct, and action-oriented.\n' +
         '- If you propose code changes, prefer complete code blocks with filenames when that helps apply them cleanly.\n' +
         '- Use the current project and file context instead of answering generically.\n\n' +
+        userText
+    } else if (mode === 'plan') {
+      ctx =
+        '[IDE plan mode]\n' +
+        '- Inspect project context before acting.\n' +
+        '- Produce a concise implementation plan first.\n' +
+        '- Wait for approval before writing code.\n' +
+        '- Keep the plan actionable and sequenced.\n\n' +
         userText
     }
     if (activeTab) {
@@ -212,21 +311,47 @@ export default function AIComposer({ editorInstanceRef }) {
   })()
 
   // ── SEND ────────────────────────────────────────────────────────────────────
-  const send = useCallback(async () => {
-    const text = input.trim()
+  const send = useCallback(async (textOverride = '', isResume = false) => {
+    const text = String(textOverride || input).trim()
     if (!text || streaming) return
     setInput('')
     setMentionAnchor(null)
-    const msgId = `a-${Date.now()}`
-    setMessages(m => [
-      ...m,
-      { id: `u-${Date.now()}`, role: 'user', content: text },
-      { id: msgId, role: 'assistant', content: '', steps: [], status: 'thinking' },
-    ])
+    const resumeMessageId = String(awaitingContext?.messageId || '').trim()
+    const preserveInlineBubble = isResume && resumeMessageId && !isSkillApproval(awaitingContext?.kind, awaitingContext?.approvalRequest)
+    const msgId = isResume && resumeMessageId && !preserveInlineBubble ? resumeMessageId : `a-${Date.now()}`
+    setMessages((messages) => {
+      let next = [...messages, { id: `u-${Date.now()}`, role: 'user', content: text }]
+      if (preserveInlineBubble && resumeMessageId) {
+        const normalizedReply = text.toLowerCase()
+        const approvalState = normalizedReply === 'approve'
+          ? 'approved'
+          : normalizedReply === 'cancel'
+            ? 'rejected'
+            : 'suggested'
+        next = next.map((message) => (
+          message.id === resumeMessageId
+            ? { ...message, status: 'done', approvalState }
+            : message
+        ))
+      }
+      if (isResume && resumeMessageId && !preserveInlineBubble) {
+        next = next.map((message) => (
+          message.id === msgId
+            ? { ...message, content: '', steps: [], progress: [], checklist: [], status: 'thinking', approvalRequest: null, approvalScope: '', approvalKind: '' }
+            : message
+        ))
+      } else {
+        next.push({ id: msgId, role: 'assistant', content: '', steps: [], progress: [], checklist: [], status: 'thinking', mode, approvalRequest: null, approvalScope: '', approvalKind: '' })
+      }
+      return next
+    })
     setStreaming(true)
+    setAwaitingContext(null)
     try {
       await runSSE({
-        text: buildContextPrompt(text),
+        text: isResume ? text : buildContextPrompt(text),
+        requestMode: mode,
+        resumeContext: isResume ? awaitingContext : null,
         onStep: (step) => setMessages(m => m.map(msg => {
           if (msg.id !== msgId) return msg
           const steps = [...(msg.steps || [])]
@@ -234,16 +359,43 @@ export default function AIComposer({ editorInstanceRef }) {
           if (idx >= 0) steps[idx] = step; else steps.push(step)
           return { ...msg, steps }
         })),
+        onActivity: (item) => setMessages((messages) => messages.map((message) => {
+          if (message.id !== msgId) return message
+          const prev = Array.isArray(message.progress) ? message.progress : []
+          return { ...message, progress: [item, ...prev].slice(0, 16) }
+        })),
         onResult: (out) => setMessages(m => m.map(msg =>
           msg.id === msgId ? { ...msg, content: out, status: 'streaming' } : msg
         )),
-        onDone: (out) => {
+        onAwaiting: (data) => {
+          setAwaitingContext({ ...data, messageId: msgId })
+          setMessages((messages) => messages.map((message) => (
+            message.id === msgId
+              ? {
+                  ...message,
+                  content: data.output,
+                  checklist: data.checklist,
+                  status: 'awaiting',
+                  approvalRequest: data.approvalRequest || null,
+                  approvalScope: data.scope || '',
+                  approvalKind: data.kind || '',
+                  approvalState: 'pending',
+                }
+              : message
+          )))
+        },
+        onDone: ({ output, awaiting }) => {
+          if (awaiting) {
+            setStreaming(false)
+            return
+          }
           setMessages(m => m.map(msg =>
-            msg.id === msgId ? { ...msg, content: out || msg.content, status: 'done' } : msg
+            msg.id === msgId ? { ...msg, content: output || msg.content, status: 'done' } : msg
           ))
           setStreaming(false)
         },
         onError: (err) => {
+          setAwaitingContext(null)
           setMessages(m => m.map(msg =>
             msg.id === msgId ? { ...msg, content: err, status: 'error' } : msg
           ))
@@ -256,7 +408,7 @@ export default function AIComposer({ editorInstanceRef }) {
       ))
       setStreaming(false)
     }
-  }, [input, streaming, runSSE, buildContextPrompt])
+  }, [input, streaming, runSSE, buildContextPrompt, mode, awaitingContext])
 
   // ── EDIT ────────────────────────────────────────────────────────────────────
   const sendEdit = useCallback(async () => {
@@ -284,9 +436,9 @@ Return ONLY the complete modified code in a single code block. No explanation.`
       await runSSE({
         text: fullPrompt,
         chatIdOverride: `edit-${chatId}`,
-        onDone: (result) => {
+        onDone: ({ output }) => {
           setEditStreaming(false)
-          setEditDiff({ original: codeToEdit, modified: extractCode(result), lang })
+          setEditDiff({ original: codeToEdit, modified: extractCode(output || ''), lang })
           setEditPhase('diff')
         },
         onError: () => { setEditStreaming(false); setEditPhase('input') },
@@ -405,7 +557,7 @@ Return ONLY the complete modified code in a single code block. No explanation.`
           {/* Header */}
           <div className="ac-header">
             <div className="ac-mode-tabs">
-              {[['agent','Agent'],['chat','Chat'],['edit','Edit']].map(([id, label]) => (
+              {[['agent','Agent'],['plan','Plan'],['chat','Chat'],['edit','Edit']].map(([id, label]) => (
                 <button key={id}
                   className={`ac-mode-tab ${mode === id ? 'active' : ''}`}
                   onClick={() => { setMode(id); if (id === 'edit') setEditPhase('input') }}>
@@ -423,12 +575,12 @@ Return ONLY the complete modified code in a single code block. No explanation.`
             <div className="ac-header-right">
               {streaming && <span className="ac-live-dot" />}
               <button className="ac-header-btn" title="New conversation"
-                onClick={() => { setMessages([]); setAttachedFiles([]) }}>⊘</button>
+                onClick={() => { setMessages([]); setAttachedFiles([]); setAwaitingContext(null) }}>⊘</button>
             </div>
           </div>
 
-          {/* ── Agent / Chat ── */}
-          {(mode === 'agent' || mode === 'chat') && (
+          {/* ── Agent / Plan / Chat ── */}
+          {(mode === 'agent' || mode === 'plan' || mode === 'chat') && (
             <>
               {(activeTab || attachedFiles.length > 0) && (
                 <div className="ac-context-bar">
@@ -448,18 +600,22 @@ Return ONLY the complete modified code in a single code block. No explanation.`
               <div className="ac-thread">
                 {messages.length === 0 && (
                   <div className="ac-empty">
-                    <div className="ac-empty-icon">{mode === 'agent' ? '✨' : '💬'}</div>
-                    <div className="ac-empty-title">{mode === 'agent' ? 'Agent' : 'Chat'}</div>
+                    <div className="ac-empty-icon">{mode === 'agent' ? '✨' : mode === 'plan' ? '🗺️' : '💬'}</div>
+                    <div className="ac-empty-title">{mode === 'agent' ? 'Agent' : mode === 'plan' ? 'Plan' : 'Chat'}</div>
                     <div className="ac-empty-sub">
                       {mode === 'agent'
                         ? 'The agent works against the current project like an IDE coding assistant. It can inspect files, run tasks, and prepare code edits with project context.'
-                        : 'Ask questions about code, get explanations, or request suggestions.'}
+                        : mode === 'plan'
+                          ? 'Plan mode inspects the project, proposes the work, and waits before implementation.'
+                          : 'Ask questions about code, get explanations, or request suggestions.'}
                     </div>
                     {activeTab && (
                       <div className="ac-chips">
-                        {(mode === 'agent'
+                        {((mode === 'agent'
                           ? ['Refactor this file', 'Find and fix bugs', 'Add TypeScript types', 'Write unit tests']
-                          : ['Explain this code', 'What does this do?', 'How can I improve this?', 'Find potential issues']
+                          : mode === 'plan'
+                            ? ['Plan a refactor for this file', 'Plan the bug fix work', 'Outline implementation steps', 'Break this task into milestones']
+                            : ['Explain this code', 'What does this do?', 'How can I improve this?', 'Find potential issues'])
                         ).map(s => (
                           <button key={s} className="ac-chip" onClick={() => { setInput(s); inputRef.current?.focus() }}>{s}</button>
                         ))}
@@ -477,6 +633,21 @@ Return ONLY the complete modified code in a single code block. No explanation.`
                         {msg.steps?.length > 0 && (
                           <AgentSteps steps={msg.steps} live={streaming && msg.status !== 'done' && msg.status !== 'error'} />
                         )}
+                        <ComposerActivityCards progress={msg.progress} artifacts={msg.artifacts} onOpenItem={openArtifact} />
+                        {msg.checklist?.length > 0 && (msg.mode === 'plan' || isPlanApprovalScope(msg.approvalScope, msg.approvalKind, msg.approvalRequest)) && (
+                          <ComposerPlanCard
+                            msg={msg}
+                            onQuickReply={(reply) => send(reply, true)}
+                            onSendSuggestion={(reply) => send(reply, true)}
+                          />
+                        )}
+                        {msg.status === 'awaiting' && !isSkillApproval(msg.approvalKind, msg.approvalRequest) && !(msg.checklist?.length > 0 && (msg.mode === 'plan' || isPlanApprovalScope(msg.approvalScope, msg.approvalKind, msg.approvalRequest))) && (
+                          <ComposerAwaitingCard
+                            msg={msg}
+                            onQuickReply={(reply) => send(reply, true)}
+                            onSendSuggestion={(reply) => send(reply, true)}
+                          />
+                        )}
                         {msg.status === 'thinking' && !msg.steps?.length ? (
                           <div className="ac-thinking-row">
                             <span className="ac-thinking"><span /><span /><span /></span>
@@ -484,7 +655,7 @@ Return ONLY the complete modified code in a single code block. No explanation.`
                           </div>
                         ) : msg.status === 'error' ? (
                           <div className="ac-error-msg">⚠ {msg.content}</div>
-                        ) : msg.content ? (
+                        ) : msg.content && !(msg.status === 'awaiting' && !isSkillApproval(msg.approvalKind, msg.approvalRequest)) && !(msg.checklist?.length > 0 && (msg.mode === 'plan' || isPlanApprovalScope(msg.approvalScope, msg.approvalKind, msg.approvalRequest))) ? (
                           <AgentResponse content={msg.content} onApply={mode === 'agent' ? handleApplyBlock : null} />
                         ) : null}
                       </div>
@@ -516,7 +687,9 @@ Return ONLY the complete modified code in a single code block. No explanation.`
                   className="ac-input"
                   placeholder={mode === 'agent'
                     ? 'Ask the project agent to inspect, edit, debug, or explain code… (@ to mention files, Ctrl+Enter to send)'
-                    : 'Ask about code… (Ctrl+Enter to send)'}
+                    : mode === 'plan'
+                      ? 'Ask for a plan first. Kendr will inspect the project and wait before changing code… (Ctrl+Enter)'
+                      : 'Ask about code… (Ctrl+Enter to send)'}
                   value={input}
                   onChange={handleInputChange}
                   onKeyDown={handleKey}
@@ -525,6 +698,10 @@ Return ONLY the complete modified code in a single code block. No explanation.`
                 />
                 <div className="ac-input-footer">
                   <span className="ac-input-hint">Ctrl+Enter</span>
+                  <div className="ac-flow-strip">
+                    <span className={`ac-flow-chip ac-flow-chip--${mode}`}>{mode === 'plan' ? 'Plan first' : mode === 'agent' ? 'Project run' : 'Chat'}</span>
+                    {activeTab && <span className="ac-flow-chip">{activeTab.name}</span>}
+                  </div>
                   <button
                     className={`ac-send-btn ${streaming ? 'stop' : ''}`}
                     onClick={streaming ? () => { stopStream(); setStreaming(false) } : send}
@@ -641,6 +818,227 @@ function AgentSteps({ steps, live }) {
               </span>
             </div>
           ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ComposerActivityCards({ progress, artifacts, onOpenItem }) {
+  const cards = summarizeRunArtifacts(progress, artifacts)
+  if (!cards.length) return null
+  return (
+    <div className="kc-activity-grid">
+      {cards.map((card) => (
+        <div key={`${card.kind}-${card.title}`} className={`kc-activity-card kc-activity-card--${card.kind}`}>
+          <div className="kc-activity-card-head">
+            <div>
+              <div className="kc-activity-card-kind">{card.kind}</div>
+              <div className="kc-activity-card-title">{card.title}</div>
+            </div>
+            {card.kind === 'edit' && Array.isArray(card.items) && card.items.some((item) => item?.path) && (
+              <button className="kc-activity-card-action" onClick={() => onOpenItem?.(card.items.find((item) => item?.path))}>
+                Review
+              </button>
+            )}
+          </div>
+          {Array.isArray(card.items) && card.items.length > 0 && (
+            <div className="kc-activity-card-items">
+              {card.items.slice(0, 3).map((item) => (
+                item?.path ? (
+                  <button key={`${item.path}-${item.label}`} className="kc-activity-card-item kc-activity-card-item--action" onClick={() => onOpenItem?.(item)}>
+                    {item.label}
+                  </button>
+                ) : (
+                  <span key={item.label} className="kc-activity-card-item">{item.label}</span>
+                )
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function ComposerPlanCard({ msg, onQuickReply, onSendSuggestion }) {
+  const [showSuggest, setShowSuggest] = useState(false)
+  const [draft, setDraft] = useState('')
+  const checklist = Array.isArray(msg.checklist) ? msg.checklist : []
+  if (!checklist.length) return null
+  const approvalRequest = (msg.approvalRequest && typeof msg.approvalRequest === 'object') ? msg.approvalRequest : {}
+  const approvalActions = (approvalRequest.actions && typeof approvalRequest.actions === 'object') ? approvalRequest.actions : {}
+  const awaiting = msg.status === 'awaiting'
+  const summary = String(approvalRequest.summary || msg.content || '').trim()
+
+  return (
+    <div className="kc-plan-card">
+      <div className="kc-plan-card-head">
+        <div>
+          <div className="kc-plan-card-label">{awaiting ? 'Plan Ready' : 'Plan'}</div>
+          <div className="kc-plan-card-meta">{checklist.length} task{checklist.length === 1 ? '' : 's'}</div>
+        </div>
+      </div>
+      {summary && <div className="kc-plan-card-summary">{summary}</div>}
+      <div className="kc-plan-card-list">
+        {checklist.map((item) => (
+          <div key={`${item.step}-${item.title}`} className="kc-checklist-item">
+            <div className="kc-checklist-mark">{item.done ? '✓' : item.status === 'running' ? '…' : '·'}</div>
+            <div className="kc-checklist-body">
+              <div className="kc-checklist-row">
+                <span className="kc-checklist-step">{item.step}.</span>
+                <span className="kc-checklist-text">{item.title}</span>
+              </div>
+              {item.detail && <div className="kc-checklist-detail">{item.detail}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+      {awaiting && (
+        <>
+          <div className="kc-plan-card-actions">
+            <button className="kc-plan-card-btn kc-plan-card-btn--approve" onClick={() => onQuickReply?.('approve')}>
+              {approvalActions.accept_label || 'Implement'}
+            </button>
+            <button
+              className={`kc-plan-card-btn kc-plan-card-btn--ghost${showSuggest ? ' kc-plan-card-btn--active' : ''}`}
+              onClick={() => setShowSuggest((value) => !value)}
+            >
+              {approvalActions.suggest_label || 'Change Plan'}
+            </button>
+            <button className="kc-plan-card-btn kc-plan-card-btn--reject" onClick={() => onQuickReply?.('cancel')}>
+              {approvalActions.reject_label || 'Reject'}
+            </button>
+          </div>
+          {showSuggest && (
+            <div className="kc-plan-card-suggest">
+              <textarea
+                className="kc-plan-card-input"
+                rows={3}
+                placeholder="Say what should change in the plan…"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+              />
+              <button
+                className="kc-plan-card-btn kc-plan-card-btn--approve"
+                disabled={!draft.trim()}
+                onClick={() => {
+                  if (!draft.trim()) return
+                  onSendSuggestion?.(draft)
+                  setDraft('')
+                  setShowSuggest(false)
+                }}
+              >
+                Send
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+function ComposerAwaitingCard({ msg, onQuickReply, onSendSuggestion }) {
+  const [showSuggest, setShowSuggest] = useState(false)
+  const [draft, setDraft] = useState('')
+  const approvalRequest = (msg.approvalRequest && typeof msg.approvalRequest === 'object') ? msg.approvalRequest : {}
+  const approvalActions = (approvalRequest.actions && typeof approvalRequest.actions === 'object') ? approvalRequest.actions : {}
+  const title = approvalRequest.title || 'Waiting for input'
+  const summary = String(approvalRequest.summary || msg.content || '').trim()
+  const sections = Array.isArray(approvalRequest.sections) ? approvalRequest.sections : []
+  const hasQuickActions = !!(approvalActions.accept_label || approvalActions.reject_label || approvalActions.suggest_label || msg.approvalScope)
+
+  return (
+    <div className="kc-inline-approval">
+      <div className="kc-inline-approval-head">
+        <div className="kc-inline-approval-title">{title}</div>
+        <div className="kc-inline-approval-status">awaiting</div>
+      </div>
+      {summary && (
+        <div className="kc-inline-approval-summary">
+          <AcText text={summary} />
+        </div>
+      )}
+      {sections.length > 0 && (
+        <div className="kc-inline-approval-sections">
+          {sections.map((section, index) => (
+            <div key={`${section.title || 'section'}-${index}`} className="kc-inline-approval-section">
+              {section.title && <div className="kc-inline-approval-section-title">{section.title}</div>}
+              {Array.isArray(section.items) && section.items.length > 0 && (
+                <ul className="kc-inline-approval-list">
+                  {section.items.map((item, itemIndex) => (
+                    <li key={`${index}-${itemIndex}`}>{item}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {approvalRequest.help_text && (
+        <div className="kc-inline-approval-help">{approvalRequest.help_text}</div>
+      )}
+      {hasQuickActions ? (
+        <>
+          <div className="kc-inline-approval-actions">
+            <button className="kc-plan-card-btn kc-plan-card-btn--approve" onClick={() => onQuickReply?.('approve')}>
+              {approvalActions.accept_label || 'Approve'}
+            </button>
+            <button
+              className={`kc-plan-card-btn kc-plan-card-btn--ghost${showSuggest ? ' kc-plan-card-btn--active' : ''}`}
+              onClick={() => setShowSuggest((value) => !value)}
+            >
+              {approvalActions.suggest_label || 'Reply'}
+            </button>
+            <button className="kc-plan-card-btn kc-plan-card-btn--reject" onClick={() => onQuickReply?.('cancel')}>
+              {approvalActions.reject_label || 'Reject'}
+            </button>
+          </div>
+          {showSuggest && (
+            <div className="kc-plan-card-suggest">
+              <textarea
+                className="kc-plan-card-input"
+                rows={3}
+                placeholder="Type your reply…"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+              />
+              <button
+                className="kc-plan-card-btn kc-plan-card-btn--approve"
+                disabled={!draft.trim()}
+                onClick={() => {
+                  if (!draft.trim()) return
+                  onSendSuggestion?.(draft)
+                  setDraft('')
+                  setShowSuggest(false)
+                }}
+              >
+                Send
+              </button>
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="kc-plan-card-suggest">
+          <textarea
+            className="kc-plan-card-input"
+            rows={3}
+            placeholder="Type your reply…"
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+          />
+          <button
+            className="kc-plan-card-btn kc-plan-card-btn--approve"
+            disabled={!draft.trim()}
+            onClick={() => {
+              if (!draft.trim()) return
+              onSendSuggestion?.(draft)
+              setDraft('')
+            }}
+          >
+            Send reply
+          </button>
         </div>
       )}
     </div>
