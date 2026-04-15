@@ -502,7 +502,7 @@ Use this flow when you want any user to add their own skills and MCP servers:
 
 ```bash
 kendr mcp add "Server A" http://localhost:8000/mcp
-kendr mcp add "Server B" "python mcp_servers/example_fastmcp_server.py" --type stdio
+kendr mcp add "Server B" "python mcp_servers/my_server.py" --type stdio
 kendr mcp discover "Server A"
 kendr mcp discover "Server B"
 ```

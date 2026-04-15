@@ -227,6 +227,28 @@ def update_capability(
     return get_capability(capability_id, db_path=db_path)
 
 
+def delete_capability(capability_id: str, *, db_path: str = DB_PATH) -> bool:
+    initialize_db(db_path)
+    with _connect(db_path) as conn:
+        conn.execute(
+            "DELETE FROM capability_relations WHERE parent_capability_id=? OR child_capability_id=?",
+            (capability_id, capability_id),
+        )
+        conn.execute(
+            "DELETE FROM capability_health_runs WHERE capability_id=?",
+            (capability_id,),
+        )
+        conn.execute(
+            "DELETE FROM capability_audit_events WHERE capability_id=?",
+            (capability_id,),
+        )
+        changed = conn.execute(
+            "DELETE FROM capabilities WHERE capability_id=?",
+            (capability_id,),
+        ).rowcount
+    return changed > 0
+
+
 def set_capability_health(
     capability_id: str,
     *,

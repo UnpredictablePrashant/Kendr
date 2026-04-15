@@ -93,14 +93,8 @@ def extension_host_mode_for_skill(*, skill_type: str = "", catalog_id: str = "")
         return "python-skill"
     if normalized_skill != "catalog":
         return ""
-    if normalized_catalog == "code-executor":
-        return "python-skill"
-    if normalized_catalog == "shell-command":
-        return "shell-command"
     if normalized_catalog == "web-search":
         return "web-search"
-    if normalized_catalog == "api-caller":
-        return "http-request"
     if normalized_catalog == "desktop-automation":
         return "desktop-automation"
     return ""

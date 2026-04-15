@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from kendr import extension_sandbox
+from kendr.skill_catalog import CATALOG_BY_ID
 from kendr.persistence.approval_store import (
     consume_approval_grant,
     create_approval_grant,
@@ -22,7 +23,16 @@ from kendr.persistence.setup_store import (
     set_setup_provider_tokens,
     upsert_setup_config_value,
 )
-from kendr.skill_manager import _run_python_skill, execute_skill_by_slug, get_marketplace, grant_skill_approval, resolve_runtime_skill, test_skill
+from kendr.skill_manager import (
+    _catalog_handlers,
+    _run_python_skill,
+    execute_skill_by_slug,
+    get_marketplace,
+    grant_skill_approval,
+    list_runtime_skills,
+    resolve_runtime_skill,
+    test_skill,
+)
 
 
 def _process_only_sandbox_launch(*, base_command, base_env, **_kwargs):
@@ -217,34 +227,6 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("requires explicit approval", str(result["error"]))
 
-    def test_shell_command_blocks_requested_cwd_outside_manifest_scope(self):
-        with tempfile.TemporaryDirectory() as allowed_root, tempfile.TemporaryDirectory() as blocked_root:
-            skill_row = {
-                "skill_id": "skill-shell-cwd",
-                "slug": "shell-command",
-                "skill_type": "catalog",
-                "catalog_id": "shell-command",
-                "code": "",
-                "metadata": {
-                    "permissions": {
-                        "filesystem": {
-                            "read": [allowed_root],
-                            "write": [allowed_root],
-                        }
-                    }
-                },
-                "is_installed": True,
-            }
-            with patch("kendr.skill_manager.get_user_skill", return_value=skill_row):
-                result = test_skill(
-                    "skill-shell-cwd",
-                    {"command": "pwd", "cwd": blocked_root},
-                    approval={"approved": True, "note": "Attempt blocked cwd"},
-                )
-
-        self.assertFalse(result["success"])
-        self.assertIn("outside the allowed filesystem scope", str(result["error"]))
-
     def test_python_skill_respects_filesystem_permission_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             file_path = Path(tmp) / "fixture.txt"
@@ -297,48 +279,39 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("Read access denied", str(result["error"]))
 
-    def test_shell_command_skill_requires_approval(self):
-        skill_row = {
-            "skill_id": "skill-4",
-            "slug": "shell-command",
-            "skill_type": "catalog",
-            "catalog_id": "shell-command",
-            "code": "",
-            "metadata": {},
-            "is_installed": True,
-        }
-        with patch("kendr.skill_manager.get_user_skill", return_value=skill_row):
-            result = test_skill("skill-4", {"command": "pwd"})
+    def test_file_reader_core_skill_reads_local_text_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file_path = Path(tmp) / "fixture.txt"
+            file_path.write_text("hello world", encoding="utf-8")
+            with patch("kendr.skill_manager.get_user_skill", return_value=None):
+                result = execute_skill_by_slug("file-reader", {"file_path": str(file_path)})
 
-        self.assertFalse(result["success"])
-        self.assertIn("requires explicit approval", str(result["error"]))
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertEqual(result["output"]["text"], "hello world")
 
-    def test_api_caller_blocks_hosts_outside_manifest_scope(self):
-        skill_row = {
-            "skill_id": "skill-5",
-            "slug": "api-caller",
-            "skill_type": "catalog",
-            "catalog_id": "api-caller",
-            "code": "",
-            "metadata": {
-                "permissions": {
-                    "network": {
-                        "allow": True,
-                        "domains": ["allowed.example"],
-                    }
-                }
-            },
-            "is_installed": True,
-        }
-        with patch("kendr.skill_manager.get_user_skill", return_value=skill_row):
-            result = test_skill(
-                "skill-5",
-                {"url": "https://blocked.example/api", "method": "GET"},
-                approval={"approved": True, "note": "API smoke"},
-            )
+    def test_email_digest_returns_setup_guidance_without_connected_provider(self):
+        with patch("kendr.skill_manager.get_user_skill", return_value=None):
+            with (
+                patch("kendr.skill_manager.get_google_access_token", return_value=""),
+                patch("kendr.skill_manager.get_microsoft_graph_access_token", return_value=""),
+            ):
+                result = execute_skill_by_slug("email-digest", {})
 
-        self.assertFalse(result["success"])
-        self.assertIn("outside the allowed domain scope", str(result["error"]))
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertFalse(result["output"]["configured"])
+        self.assertIn("Connect Gmail or Microsoft Graph", result["output"]["summary"])
+
+    def test_calendar_agenda_returns_setup_guidance_without_connected_provider(self):
+        with patch("kendr.skill_manager.get_user_skill", return_value=None):
+            with (
+                patch("kendr.skill_manager.get_google_access_token", return_value=""),
+                patch("kendr.skill_manager.get_microsoft_graph_access_token", return_value=""),
+            ):
+                result = execute_skill_by_slug("calendar-agenda", {"window": "today"})
+
+        self.assertTrue(result["success"], result.get("error"))
+        self.assertFalse(result["output"]["configured"])
+        self.assertIn("Connect Google Calendar or Microsoft Graph", result["output"]["summary"])
 
     def test_web_search_is_available_as_core_skill_without_install(self):
         with patch("kendr.skill_manager.get_user_skill", return_value=None):
@@ -422,10 +395,8 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         self.assertEqual(marketplace["sandbox_runtime"]["provider"], "bubblewrap")
         self.assertIn("install_hint", marketplace["sandbox_runtime"])
 
-    def test_marketplace_hides_unusable_or_unimplemented_catalog_skills(self):
+    def test_marketplace_includes_everyday_catalog_skills(self):
         def _sandbox(*, skill_type="", catalog_id=""):
-            if catalog_id == "shell-command":
-                return {"mode": "blocked"}
             return {"mode": "process_isolated_only"}
 
         with patch("kendr.skill_manager.list_user_skills", return_value=[]):
@@ -435,13 +406,29 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         ids = {item["id"] for item in marketplace["catalog"]}
         self.assertIn("web-search", ids)
         self.assertIn("pdf-reader", ids)
-        self.assertIn("api-caller", ids)
+        self.assertIn("file-reader", ids)
+        self.assertIn("file-finder", ids)
+        self.assertIn("doc-summarizer", ids)
+        self.assertIn("spreadsheet-basic", ids)
+        self.assertIn("email-digest", ids)
+        self.assertIn("calendar-agenda", ids)
+        self.assertIn("meeting-notes", ids)
+        self.assertIn("todo-planner", ids)
+        self.assertIn("travel-helper", ids)
+        self.assertIn("message-draft", ids)
         self.assertNotIn("shell-command", ids)
+        self.assertNotIn("api-caller", ids)
+        self.assertNotIn("code-executor", ids)
         self.assertNotIn("spreadsheet", ids)
         self.assertNotIn("image-analysis", ids)
         self.assertNotIn("data-analysis", ids)
         self.assertNotIn("doc-writer", ids)
         self.assertNotIn("image-gen", ids)
+
+    def test_catalog_handlers_match_catalog_entries(self):
+        handler_ids = set(_catalog_handlers())
+        catalog_ids = set(CATALOG_BY_ID)
+        self.assertEqual(catalog_ids, handler_ids)
 
     def test_marketplace_uses_catalog_permissions_for_installed_core_skill(self):
         stale_installed = {
@@ -473,6 +460,31 @@ class ExtensionHostIsolationTests(unittest.TestCase):
         self.assertEqual(web_search["skill_id"], "installed-web-search")
         self.assertTrue(web_search["permission_manifest"]["network"]["allow"])
         self.assertEqual(web_search["permission_manifest"]["network"]["domains"], ["api.duckduckgo.com"])
+
+    def test_core_catalog_skill_can_be_explicitly_disabled(self):
+        disabled_row = {
+            "skill_id": "installed-web-search",
+            "slug": "web-search",
+            "name": "Web Search",
+            "skill_type": "catalog",
+            "catalog_id": "web-search",
+            "metadata": {},
+            "is_installed": False,
+        }
+
+        with (
+            patch("kendr.skill_manager.get_user_skill", return_value=disabled_row),
+            patch("kendr.skill_manager.list_user_skills", return_value=[disabled_row]),
+        ):
+            marketplace = get_marketplace()
+            runtime_skills = list_runtime_skills()
+            resolved = resolve_runtime_skill(slug="web-search")
+
+        web_search = next(item for item in marketplace["catalog"] if item["id"] == "web-search")
+        self.assertFalse(web_search["is_installed"])
+        self.assertEqual(web_search["skill_id"], "installed-web-search")
+        self.assertIsNone(resolved)
+        self.assertNotIn("web-search", {item["slug"] for item in runtime_skills})
 
     def test_resolve_runtime_skill_attaches_sandbox_metadata(self):
         skill_row = {

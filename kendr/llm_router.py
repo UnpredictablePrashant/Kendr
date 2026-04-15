@@ -138,6 +138,24 @@ _PROVIDER_MODEL_BADGE_CANDIDATES: dict[str, dict[str, list[str]]] = {
     },
 }
 
+_MODEL_FAMILY_RULES: list[tuple[str, str]] = [
+    ("gpt-", PROVIDER_OPENAI),
+    ("o1", PROVIDER_OPENAI),
+    ("o3", PROVIDER_OPENAI),
+    ("o4-", PROVIDER_OPENAI),
+    ("claude", PROVIDER_ANTHROPIC),
+    ("gemini", PROVIDER_GOOGLE),
+    ("grok", PROVIDER_XAI),
+    ("minimax", PROVIDER_MINIMAX),
+    ("qwen", PROVIDER_QWEN),
+    ("glm", PROVIDER_GLM),
+    ("llama", PROVIDER_OLLAMA),
+    ("mistral", PROVIDER_OLLAMA),
+    ("deepseek", PROVIDER_OLLAMA),
+    ("gemma", PROVIDER_OLLAMA),
+    ("phi", PROVIDER_OLLAMA),
+]
+
 _MODEL_CAPABILITY_RULES: list[tuple[str, dict[str, bool]]] = [
     ("gpt-5", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}),
     ("gpt-4o", {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": False}),
@@ -311,6 +329,42 @@ def known_models_for_provider(provider: str) -> list[str]:
     return list(_PROVIDER_RELEASE_MODELS.get(provider, []))
 
 
+def configured_models_for_provider(provider: str) -> list[str]:
+    provider = str(provider or "").strip().lower()
+    if provider == PROVIDER_OPENAI:
+        return _merge_model_choices(
+            [
+                os.getenv("OPENAI_MODEL_GENERAL", "").strip(),
+                os.getenv("OPENAI_MODEL_CODING", "").strip(),
+                os.getenv("OPENAI_CODEX_MODEL", "").strip(),
+                os.getenv("OPENAI_MODEL", "").strip(),
+                os.getenv("OPENAI_VISION_MODEL", "").strip(),
+            ]
+        )
+
+    env = _PROVIDER_MODEL_ENV.get(provider, "")
+    if env:
+        return _merge_model_choices([os.getenv(env, "").strip()])
+    return []
+
+
+def infer_model_family(model: str, provider: str = "") -> str:
+    name = str(model or "").strip().lower()
+    if not name:
+        return str(provider or "").strip().lower()
+
+    for prefix, family in _MODEL_FAMILY_RULES:
+        if name.startswith(prefix):
+            return family
+
+    if "/" in name:
+        family = name.split("/", 1)[0].strip()
+        if family in ALL_PROVIDERS:
+            return family
+
+    return str(provider or "").strip().lower()
+
+
 def _merge_model_choices(*groups: list[str]) -> list[str]:
     merged: list[str] = []
     seen: set[str] = set()
@@ -322,6 +376,16 @@ def _merge_model_choices(*groups: list[str]) -> list[str]:
             seen.add(item)
             merged.append(item)
     return merged
+
+
+def _badge_provider_for_model(provider: str, model: str) -> str:
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider in _PROVIDER_MODEL_BADGE_CANDIDATES:
+        return normalized_provider
+    inferred = infer_model_family(model, normalized_provider)
+    if inferred in _PROVIDER_MODEL_BADGE_CANDIDATES:
+        return inferred
+    return normalized_provider
 
 
 def _get_remote_model_inventory(provider: str) -> tuple[list[str], str]:
@@ -393,12 +457,17 @@ def _sort_model_choices(provider: str, models: list[str]) -> list[str]:
 def _model_badges_for_provider(provider: str, models: list[str]) -> dict[str, list[str]]:
     available = {str(item or "").strip() for item in models if str(item or "").strip()}
     badges: dict[str, list[str]] = {}
+    grouped_available: dict[str, set[str]] = {}
+    for model in available:
+        badge_provider = _badge_provider_for_model(provider, model)
+        grouped_available.setdefault(badge_provider, set()).add(model)
 
-    for badge, candidates in _PROVIDER_MODEL_BADGE_CANDIDATES.get(provider, {}).items():
-        for candidate in candidates:
-            if candidate in available:
-                badges.setdefault(candidate, []).append(badge)
-                break
+    for badge_provider, family_models in grouped_available.items():
+        for badge, candidates in _PROVIDER_MODEL_BADGE_CANDIDATES.get(badge_provider, {}).items():
+            for candidate in candidates:
+                if candidate in family_models:
+                    badges.setdefault(candidate, []).append(badge)
+                    break
 
     return badges
 
@@ -411,12 +480,14 @@ def selectable_models_for_provider(provider: str) -> list[str]:
         models = [str(item.get("name", "")).strip() for item in list_ollama_models()]
         return [name for name in models if name]
     if provider == PROVIDER_CUSTOM:
-        current = get_model_for_provider(provider)
-        return [current] if current else []
+        status = provider_status(provider)
+        selectable = status.get("selectable_models") if isinstance(status, dict) else []
+        return [str(item).strip() for item in (selectable or []) if str(item).strip()]
     if not provider_status(provider).get("ready"):
         return []
     remote, _ = _get_remote_model_inventory(provider)
-    return _sort_model_choices(provider, _merge_model_choices(remote, [get_model_for_provider(provider)], known_models_for_provider(provider)))
+    configured = configured_models_for_provider(provider)
+    return _sort_model_choices(provider, _merge_model_choices(remote, configured, known_models_for_provider(provider)))
 
 
 # ── Ollama health check ───────────────────────────────────────────────────────
@@ -467,11 +538,15 @@ def provider_status(provider: str) -> dict:
             "has_key": True,
             "base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             "model": model,
+            "model_family": PROVIDER_OLLAMA,
+            "configured_models": configured_models_for_provider(provider),
             "local_models": [m.get("name", "") for m in models],
             "selectable_models": selectable,
             "selectable_model_details": [
                 {
                     "name": name,
+                    "family": infer_model_family(name, provider),
+                    "context_window": get_context_window(name),
                     "capabilities": get_model_capabilities(name),
                     "agent_capable": False,
                 }
@@ -483,20 +558,41 @@ def provider_status(provider: str) -> dict:
 
     if provider == PROVIDER_CUSTOM:
         url = os.getenv("CUSTOM_LLM_BASE_URL", "").strip()
+        configured = configured_models_for_provider(provider)
+        remote_models, remote_error = _get_remote_model_inventory(provider) if url else ([], "")
+        selectable = _sort_model_choices(
+            infer_model_family(model, provider),
+            _merge_model_choices(remote_models, configured),
+        ) if url else configured
         return {
             "provider": provider,
             "ready": bool(url),
             "has_key": True,
             "base_url": url,
             "model": model,
-            "selectable_models": [model] if model else [],
+            "model_family": infer_model_family(model, provider),
+            "configured_models": configured,
+            "selectable_models": selectable,
+            "selectable_model_details": [
+                {
+                    "name": item,
+                    "family": infer_model_family(item, provider),
+                    "context_window": get_context_window(item),
+                    "capabilities": get_model_capabilities(item),
+                    "agent_capable": is_agent_capable_model(item, infer_model_family(item, provider)),
+                }
+                for item in selectable
+            ],
+            "model_badges": _model_badges_for_provider(provider, selectable) if url else {},
+            "model_fetch_error": remote_error,
             "note": "Configured" if url else "Set CUSTOM_LLM_BASE_URL",
         }
 
     remote_models, remote_error = _get_remote_model_inventory(provider) if has_key else ([], "")
+    configured = configured_models_for_provider(provider)
     selectable = _sort_model_choices(
         provider,
-        _merge_model_choices(remote_models, [model], known_models_for_provider(provider)),
+        _merge_model_choices(remote_models, configured, known_models_for_provider(provider)),
     ) if has_key else []
 
     return {
@@ -505,14 +601,18 @@ def provider_status(provider: str) -> dict:
         "has_key": has_key,
         "base_url": base_url,
         "model": model,
+        "model_family": infer_model_family(model, provider),
+        "configured_models": configured,
         "model_capabilities": get_model_capabilities(model),
         "agent_capable": is_agent_capable_model(model, provider),
         "selectable_models": selectable,
         "selectable_model_details": [
             {
                 "name": item,
+                "family": infer_model_family(item, provider),
+                "context_window": get_context_window(item),
                 "capabilities": get_model_capabilities(item),
-                "agent_capable": is_agent_capable_model(item, provider),
+                "agent_capable": is_agent_capable_model(item, infer_model_family(item, provider)),
             }
             for item in selectable
         ],

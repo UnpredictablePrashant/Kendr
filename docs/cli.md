@@ -542,6 +542,30 @@ kendr status [--json]
 
 ---
 
+## `kendr update`
+
+Update Kendr to the latest release, or force a fresh reinstall.
+
+```bash
+kendr update [--check] [--pre] [--refresh]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--check` | _(off)_ | Check for updates only; do not install. |
+| `--pre` | _(off)_ | Include pre-release versions when resolving latest. |
+| `--refresh` | _(off)_ | Force reinstall Kendr (`pip --force-reinstall`) for a fresh local rebuild. |
+
+Examples:
+
+```bash
+kendr update --check
+kendr update
+kendr update --refresh
+```
+
+---
+
 ## `kendr daemon`
 
 Run the always-on monitor and heartbeat loop for scheduled tasks and stock/news monitoring.

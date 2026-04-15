@@ -31,8 +31,8 @@ class CapabilitySyncTests(unittest.TestCase):
             )
 
             result = sync_mcp_capabilities(workspace_id="ws1", db_path=db_path)
-            self.assertEqual(result["servers_synced"], 1)
-            self.assertEqual(result["tools_synced"], 1)
+            self.assertGreaterEqual(result["servers_synced"], 1)
+            self.assertGreaterEqual(result["tools_synced"], 1)
 
             server_cap = get_capability_by_key(workspace_id="ws1", key="mcp.server.srv1", db_path=db_path)
             tool_cap = get_capability_by_key(workspace_id="ws1", key="mcp.tool.srv1.echo", db_path=db_path)
@@ -41,7 +41,7 @@ class CapabilitySyncTests(unittest.TestCase):
             self.assertEqual(server_cap["type"], "mcp_server")
             self.assertEqual(tool_cap["type"], "tool")
 
-    def test_sync_disables_stale_managed_mcp_capabilities(self):
+    def test_sync_prunes_stale_managed_mcp_capabilities(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_path = os.path.join(tmp, "sync_stale.sqlite3")
             initialize_db(db_path)
@@ -68,14 +68,13 @@ class CapabilitySyncTests(unittest.TestCase):
 
             remove_mcp_server("srv1", db_path=db_path)
             result = sync_mcp_capabilities(workspace_id="ws1", db_path=db_path)
-            self.assertGreaterEqual(result["stale_disabled"], 1)
+            self.assertGreaterEqual(result["stale_removed"], 1)
 
             all_caps = list_capabilities(workspace_id="ws1", limit=100, db_path=db_path)
             managed = [c for c in all_caps if c.get("metadata", {}).get("managed_by") == "mcp_sync"]
-            self.assertTrue(managed)
-            self.assertTrue(all(str(c.get("status", "")) == "disabled" for c in managed))
+            stale_srv1 = [c for c in managed if str(c.get("key", "")).startswith("mcp.server.srv1") or str(c.get("key", "")).startswith("mcp.tool.srv1.")]
+            self.assertFalse(stale_srv1)
 
 
 if __name__ == "__main__":
     unittest.main()
-

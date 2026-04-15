@@ -94,6 +94,47 @@ class LlmRouterTests(unittest.TestCase):
         self.assertEqual(status["model_badges"].get("gpt-5.4"), ["latest", "best"])
         self.assertEqual(status["model_badges"].get("gpt-5-nano"), ["cheapest"])
 
+    def test_configured_models_for_openai_include_general_coding_and_vision(self):
+        from kendr.llm_router import configured_models_for_provider
+
+        with patch.dict(os.environ, {
+            "OPENAI_MODEL_GENERAL": "gpt-5.4-mini",
+            "OPENAI_MODEL_CODING": "gpt-5.3-codex",
+            "OPENAI_VISION_MODEL": "gpt-4o-mini",
+        }, clear=False):
+            models = configured_models_for_provider("openai")
+
+        self.assertEqual(models, ["gpt-5.4-mini", "gpt-5.3-codex", "gpt-4o-mini"])
+
+    def test_custom_provider_infers_openai_family_and_badges(self):
+        from kendr.llm_router import provider_status
+
+        class _Model:
+            def __init__(self, model_id):
+                self.id = model_id
+
+        class _Models:
+            def list(self):
+                return [_Model("gpt-5.4"), _Model("gpt-5-nano"), _Model("gpt-4o-mini")]
+
+        class _Client:
+            def __init__(self, **kwargs):
+                self.models = _Models()
+
+        with (
+            patch.dict(os.environ, {
+                "CUSTOM_LLM_BASE_URL": "http://localhost:8000/v1",
+                "CUSTOM_LLM_MODEL": "gpt-4o-mini",
+            }, clear=False),
+            patch("openai.OpenAI", _Client),
+        ):
+            status = provider_status("custom")
+
+        self.assertEqual(status["model_family"], "openai")
+        self.assertIn("gpt-5.4", status["selectable_models"])
+        self.assertEqual(status["model_badges"].get("gpt-5.4"), ["latest", "best"])
+        self.assertEqual(status["model_badges"].get("gpt-5-nano"), ["cheapest"])
+
     def test_provider_status_surfaces_model_fetch_error(self):
         from kendr.llm_router import provider_status
 

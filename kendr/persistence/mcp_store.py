@@ -312,6 +312,18 @@ def _sync_db_from_registry_json(db_path: str = DB_PATH) -> None:
 
 _DEFAULT_MCP_SERVERS: list[dict] = [
     {
+        "id": "browser-use-mcp",
+        "name": "browser-use",
+        "type": "stdio",
+        "connection": "python -m browser_use --mcp",
+        "description": (
+            "Built-in browser automation/search MCP. Uses your existing OPENAI_API_KEY or "
+            "ANTHROPIC_API_KEY. Good fallback when SerpAPI is off and for rendered website viewing."
+        ),
+        "auth_token": "",
+        "enabled": True,
+    },
+    {
         "id": "scpr-web-scraper",
         "name": "web-scraper (scpr)",
         "type": "stdio",
@@ -331,6 +343,39 @@ _DEFAULT_SERVER_IDS: frozenset[str] = frozenset(s["id"] for s in _DEFAULT_MCP_SE
 
 def is_default_server(server_id: str) -> bool:
     return str(server_id) in _DEFAULT_SERVER_IDS
+
+
+def _is_legacy_browser_use_connection(connection: str) -> bool:
+    text = str(connection or "").strip().lower()
+    if not text:
+        return False
+    return text.startswith("uvx --from browser-use[cli] browser-use --mcp") or text.startswith(
+        "uvx browser-use --mcp"
+    )
+
+
+def _normalize_browser_use_rows(db_path: str = DB_PATH) -> None:
+    initialize_db(db_path)
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT server_id, name, type, connection FROM mcp_servers WHERE LOWER(type)='stdio'"
+        ).fetchall()
+        changed = False
+        for row in rows:
+            server_id = str(row["server_id"] or "").strip().lower()
+            name = str(row["name"] or "").strip().lower()
+            if server_id != "browser-use-mcp" and name != "browser-use":
+                continue
+            connection = str(row["connection"] or "")
+            if not _is_legacy_browser_use_connection(connection):
+                continue
+            conn.execute(
+                "UPDATE mcp_servers SET connection=? WHERE server_id=?",
+                ("python -m browser_use --mcp", str(row["server_id"])),
+            )
+            changed = True
+    if changed:
+        _write_registry_payload(db_path)
 
 
 def _row_to_dict(row, *, db_path: str = DB_PATH) -> dict:
@@ -476,8 +521,8 @@ def list_mcp_servers(db_path: str = DB_PATH) -> list[dict]:
     initialize_db(db_path)
     _maybe_migrate(db_path)
     _seed_default_servers(db_path)
-    _sync_db_from_registry_json(db_path)
     _normalize_fastmcp_rows(db_path)
+    _normalize_browser_use_rows(db_path)
     with _connect(db_path) as conn:
         rows = conn.execute(
             "SELECT * FROM mcp_servers ORDER BY LOWER(name)"
@@ -488,8 +533,8 @@ def list_mcp_servers(db_path: str = DB_PATH) -> list[dict]:
 def get_mcp_server(server_id: str, db_path: str = DB_PATH) -> dict | None:
     initialize_db(db_path)
     _maybe_migrate(db_path)
-    _sync_db_from_registry_json(db_path)
     _normalize_fastmcp_rows(db_path)
+    _normalize_browser_use_rows(db_path)
     with _connect(db_path) as conn:
         row = conn.execute(
             "SELECT * FROM mcp_servers WHERE server_id=?", (server_id,)

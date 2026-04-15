@@ -12,6 +12,7 @@ const COMMANDS = [
   { id: 'view-runs',        label: 'View: Runs',               keys: '' },
   { id: 'view-settings',    label: 'View: Settings',           keys: '' },
   { id: 'view-developer',   label: 'View: Developer Workspace',keys: '' },
+  { id: 'view-about',       label: 'View: About Kendr',        keys: '' },
   { id: 'open-folder',      label: 'Open Folder…',             keys: '' },
   { id: 'start-backend',    label: 'Backend: Start',           keys: '' },
   { id: 'restart-backend',  label: 'Backend: Restart',         keys: '' },
@@ -48,6 +49,7 @@ export default function CommandPalette() {
       case 'view-runs':        dispatch({ type: 'SET_VIEW', view: 'runs' }); break
       case 'view-settings':    dispatch({ type: 'SET_VIEW', view: 'settings' }); break
       case 'view-developer':   dispatch({ type: 'SET_VIEW', view: 'developer' }); break
+      case 'view-about':       dispatch({ type: 'SET_VIEW', view: 'about' }); break
       case 'open-folder': {
         const dir = await api?.dialog.openDirectory()
         if (dir) {

@@ -15,13 +15,13 @@ class DirectToolCatalogTests(unittest.TestCase):
                 "kendr.skill_manager.list_runtime_skills",
                 return_value=[
                     {
-                        "slug": "shell-command",
-                        "name": "Shell Command",
-                        "description": "Run shell commands.",
-                        "input_schema": {"type": "object", "required": ["command"]},
-                        "metadata": {"permissions": {"requires_approval": True}},
+                        "slug": "file-reader",
+                        "name": "File Reader",
+                        "description": "Read local files.",
+                        "input_schema": {"type": "object", "required": ["file_path"]},
+                        "metadata": {"permissions": {"requires_approval": False}},
                         "skill_type": "catalog",
-                        "category": "Development",
+                        "category": "Documents",
                     }
                 ],
             ),
@@ -48,22 +48,22 @@ class DirectToolCatalogTests(unittest.TestCase):
             tools = build_direct_tool_catalog({})
 
         tool_ids = {tool.tool_id for tool in tools}
-        self.assertIn("skill:shell-command", tool_ids)
+        self.assertIn("skill:file-reader", tool_ids)
         self.assertIn("mcp:srv1:ping", tool_ids)
 
     def test_run_direct_tool_loop_calls_tool_then_returns_final(self):
         tool = DirectToolDefinition(
-            tool_id="skill:shell-command",
+            tool_id="skill:file-reader",
             kind="skill",
-            name="Shell Command",
-            description="Run shell commands.",
-            input_schema={"type": "object", "required": ["command"]},
-            requires_approval=True,
-            metadata={"slug": "shell-command"},
+            name="File Reader",
+            description="Read local files.",
+            input_schema={"type": "object", "required": ["file_path"]},
+            requires_approval=False,
+            metadata={"slug": "file-reader"},
         )
         llm_outputs = [
-            """{"action":"call_tool","tool_id":"skill:shell-command","arguments":{"command":"ls -1 /mnt/d"},"reason":"Need a directory listing."}""",
-            """{"action":"final","reason":"The command returned the answer.","response":"The top-level folders are: Projects, Media."}""",
+            """{"action":"call_tool","tool_id":"skill:file-reader","arguments":{"file_path":"/tmp/note.txt"},"reason":"Need the file contents."}""",
+            """{"action":"final","reason":"The tool returned the answer.","response":"The note says the meeting moved to Friday."}""",
         ]
 
         class _Response:
@@ -80,17 +80,17 @@ class DirectToolCatalogTests(unittest.TestCase):
                     (),
                     {
                         "ok": True,
-                        "summary": "Projects\nMedia",
+                        "summary": "The meeting moved to Friday.",
                         "awaiting_input": False,
-                        "state_updates": {"direct_tool_last_result": {"tool_id": "skill:shell-command", "status": "ok"}},
+                        "state_updates": {"direct_tool_last_result": {"tool_id": "skill:file-reader", "status": "ok"}},
                     },
                 )(),
             ),
         ):
-            result = run_direct_tool_loop({"user_query": "which folders are in D drive?"})
+            result = run_direct_tool_loop({"user_query": "what does the note say?"})
 
         self.assertEqual(result["status"], "final")
-        self.assertIn("Projects", result["response"])
+        self.assertIn("Friday", result["response"])
 
     def test_run_direct_tool_loop_uses_native_tool_calling_when_supported(self):
         tool = DirectToolDefinition(
@@ -152,15 +152,15 @@ class DirectToolCatalogTests(unittest.TestCase):
 
     def test_run_direct_tool_loop_falls_back_to_json_loop_when_native_path_fails(self):
         tool = DirectToolDefinition(
-            tool_id="skill:shell-command",
+            tool_id="skill:file-reader",
             kind="skill",
-            name="Shell Command",
-            description="Run shell commands.",
-            input_schema={"type": "object", "required": ["command"]},
-            metadata={"slug": "shell-command"},
+            name="File Reader",
+            description="Read local files.",
+            input_schema={"type": "object", "required": ["file_path"]},
+            metadata={"slug": "file-reader"},
         )
         llm_outputs = [
-            """{"action":"call_tool","tool_id":"skill:shell-command","arguments":{"command":"pwd"},"reason":"Need shell output."}""",
+            """{"action":"call_tool","tool_id":"skill:file-reader","arguments":{"file_path":"/tmp/note.txt"},"reason":"Need file output."}""",
             """{"action":"final","reason":"Done","response":"Used JSON fallback."}""",
         ]
 
@@ -185,9 +185,9 @@ class DirectToolCatalogTests(unittest.TestCase):
                     (),
                     {
                         "ok": True,
-                        "summary": "/mnt/d/Personal Data/projects/multi-agents/sample-agents",
+                        "summary": "Fallback note content.",
                         "awaiting_input": False,
-                        "state_updates": {"direct_tool_last_result": {"tool_id": "skill:shell-command", "status": "ok"}},
+                        "state_updates": {"direct_tool_last_result": {"tool_id": "skill:file-reader", "status": "ok"}},
                     },
                 )(),
             ),

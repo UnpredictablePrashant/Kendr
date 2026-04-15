@@ -1,6 +1,7 @@
 import unittest
 
 from kendr.persistence.mcp_store import (
+    _DEFAULT_MCP_SERVERS,
     _migrated_flag_path,
     _parse_registry_payload,
     _registry_payload_from_rows,
@@ -54,6 +55,10 @@ class MCPStoreTests(unittest.TestCase):
             "https://knowledge-mcp.global.api.aws",
         )
         self.assertEqual(payload["mcpServers"]["aws-knowledge-mcp-server"]["disabled"], False)
+
+    def test_default_servers_include_browser_use(self):
+        ids = {item["id"] for item in _DEFAULT_MCP_SERVERS}
+        self.assertIn("browser-use-mcp", ids)
 
 
 if __name__ == "__main__":

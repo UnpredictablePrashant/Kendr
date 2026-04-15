@@ -5,7 +5,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from kendr.persistence import initialize_db, list_monitor_rules
+from kendr.persistence import initialize_db, list_monitor_rules, list_recent_orchestration_events
 from tasks.utils import OUTPUT_DIR, log_task_update, set_active_output_dir
 
 from .discovery import build_registry
@@ -72,6 +72,34 @@ def _load_rule_payload(rule: dict, state: dict) -> dict:
     return state
 
 
+def _process_orchestration_events(last_seen_at: str, *, db_path: str = "") -> str:
+    events = list_recent_orchestration_events(since_timestamp=last_seen_at, limit=200, db_path=db_path)
+    cursor = str(last_seen_at or "").strip()
+    for event in events:
+        timestamp = str(event.get("timestamp", "")).strip()
+        if timestamp and timestamp > cursor:
+            cursor = timestamp
+        event_type = str(event.get("event_type", "")).strip()
+        if event_type not in {
+            "run.awaiting_user_input",
+            "run.completed",
+            "run.failed",
+            "run.cancelled",
+            "plan_task.failed",
+        }:
+            continue
+        subject = str(event.get("subject_id", "")).strip() or str(event.get("run_id", "")).strip() or "unknown"
+        detail = str((event.get("payload", {}) or {}).get("error", "")).strip()
+        if not detail:
+            detail = str((event.get("payload", {}) or {}).get("final_output_excerpt", "")).strip()
+        log_task_update(
+            "Daemon",
+            f"Observed orchestration event {event_type} for {subject}.",
+            detail[:400] if detail else "",
+        )
+    return cursor
+
+
 def run_daemon(*, poll_interval_seconds: int = 30, heartbeat_interval_seconds: int = 300, once: bool = False) -> int:
     initialize_db()
     daemon_output_dir = str(Path(OUTPUT_DIR) / "daemon")
@@ -80,9 +108,11 @@ def run_daemon(*, poll_interval_seconds: int = 30, heartbeat_interval_seconds: i
     heartbeat_agent = registry.agents.get("heartbeat_agent")
     log_task_update("Daemon", f"Kendr daemon started. poll={poll_interval_seconds}s heartbeat={heartbeat_interval_seconds}s")
     last_heartbeat_at: datetime | None = None
+    last_orchestration_event_at = ""
 
     while True:
         now = datetime.now(timezone.utc)
+        last_orchestration_event_at = _process_orchestration_events(last_orchestration_event_at)
         if heartbeat_agent and (
             last_heartbeat_at is None or now >= last_heartbeat_at + timedelta(seconds=heartbeat_interval_seconds)
         ):

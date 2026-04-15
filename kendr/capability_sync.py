@@ -10,6 +10,7 @@ from typing import Any
 
 from kendr.capability_registry import CapabilityRegistryService
 from kendr.persistence import (
+    delete_capability,
     get_capability_by_key,
     list_capabilities,
     list_mcp_servers,
@@ -24,11 +25,11 @@ def _slug(value: str) -> str:
 def _server_health(server_status: str, enabled: bool) -> str:
     status = str(server_status or "").strip().lower()
     if not enabled:
-        return "disabled"
+        return "unknown"
     if status in {"connected", "ok", "healthy"}:
         return "healthy"
     if status in {"error", "failed", "unhealthy"}:
-        return "error"
+        return "down"
     return "unknown"
 
 
@@ -46,6 +47,7 @@ def sync_mcp_capabilities(
         "servers_synced": 0,
         "tools_synced": 0,
         "stale_disabled": 0,
+        "stale_removed": 0,
     }
 
     for server in servers:
@@ -184,17 +186,25 @@ def sync_mcp_capabilities(
         if metadata.get("managed_by") != "mcp_sync":
             continue
         key = str(item.get("key", "")).strip()
-        if key and key not in seen_keys and str(item.get("status", "")).strip().lower() != "disabled":
-            service.update(
-                item["id"],
-                actor_user_id=actor_user_id,
-                workspace_id=workspace_id,
-                status="disabled",
-            )
-            counters["stale_disabled"] += 1
+        if key and key not in seen_keys:
+            removed = False
+            try:
+                removed = bool(delete_capability(item["id"], db_path=db_path))
+            except Exception:
+                removed = False
+            if removed:
+                counters["stale_removed"] += 1
+                continue
+            if str(item.get("status", "")).strip().lower() != "disabled":
+                service.update(
+                    item["id"],
+                    actor_user_id=actor_user_id,
+                    workspace_id=workspace_id,
+                    status="disabled",
+                )
+                counters["stale_disabled"] += 1
 
     return {
         "workspace_id": workspace_id,
         **counters,
     }
-

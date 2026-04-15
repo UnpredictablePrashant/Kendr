@@ -56,13 +56,17 @@ function useMenuDefs() {
     {
       label: 'View',
       items: [
-        { label: 'Developer Workspace', shortcut: 'Ctrl+Shift+J', action: () => dispatch({ type: 'SET_VIEW', view: 'developer' }) },
+        { label: 'Build Workspace', shortcut: 'Ctrl+Shift+J', action: () => dispatch({ type: 'SET_VIEW', view: 'developer' }) },
         { sep: true },
-        { label: 'Home',                                         action: () => { dispatch({ type: 'SET_VIEW', view: 'home' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
         { label: 'Studio',                                       action: () => { dispatch({ type: 'SET_VIEW', view: 'studio' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
-        { label: 'Build',                                        action: () => { dispatch({ type: 'SET_VIEW', view: 'build' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Build Workspace',                              action: () => { dispatch({ type: 'SET_VIEW', view: 'developer' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Automation & Builders',                        action: () => { dispatch({ type: 'SET_VIEW', view: 'build' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Machine',                                      action: () => { dispatch({ type: 'SET_VIEW', view: 'machine' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Memory',                                       action: () => { dispatch({ type: 'SET_VIEW', view: 'memory' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
         { label: 'Integrations',                                 action: () => { dispatch({ type: 'SET_VIEW', view: 'integrations' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
         { label: 'Runs',                                         action: () => { dispatch({ type: 'SET_VIEW', view: 'runs' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Marketplace',                                  action: () => { dispatch({ type: 'SET_VIEW', view: 'marketplace' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
+        { label: 'Settings',                                     action: () => { dispatch({ type: 'SET_VIEW', view: 'settings' }); dispatch({ type: 'SET_SIDEBAR', open: true }) } },
         { sep: true },
         { label: state.chatOpen ? 'Hide Chat' : 'Show Chat',  shortcut: 'Ctrl+Shift+C', action: () => dispatch({ type: 'TOGGLE_CHAT' }) },
         { label: 'Toggle Sidebar',   shortcut: 'Ctrl+B',       action: () => dispatch({ type: 'TOGGLE_SIDEBAR' }) },
@@ -130,7 +134,7 @@ function useMenuDefs() {
         { label: 'Keyboard Shortcuts', shortcut: 'Ctrl+Shift+P', action: () => dispatch({ type: 'TOGGLE_COMMAND_PALETTE' }) },
         { label: 'Model Docs',                                  action: () => dispatch({ type: 'SET_VIEW', view: 'settings' }) },
         { sep: true },
-        { label: 'About Kendr',                                action: () => window.dispatchEvent(new CustomEvent('kendr:about')) },
+        { label: 'About Kendr',                                action: () => dispatch({ type: 'SET_VIEW', view: 'about' }) },
       ]
     },
   ]

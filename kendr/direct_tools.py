@@ -812,7 +812,7 @@ Rules:
 - If the available tools are not the right surface for the task, choose `fallback`.
 - After a tool result is available, either call another tool or produce `final`.
 - Do not invent tool IDs or arguments outside the listed schema.
-- For `skill:shell-command`, provide an exact command string in `arguments.command`.
+- Match the selected skill's input schema exactly when building arguments.
 - Prefer concise, deterministic tool arguments.
 
 Return ONLY valid JSON in this schema:
@@ -866,6 +866,11 @@ def _execute_skill_tool(state: dict, tool: DirectToolDefinition, arguments: dict
             output=output if output is not None else result,
             summary=summary,
             state_updates={
+                "used_execution_surfaces": list(state.get("used_execution_surfaces", []) or []) + [{
+                    "kind": "skill",
+                    "skill": slug,
+                    "label": str(result.get("source_surface") or f"skill:{slug}"),
+                }],
                 "direct_tool_last_result": {
                     "tool_id": tool.tool_id,
                     "status": "ok",
@@ -1205,7 +1210,15 @@ def _execute_aws_integration(state: dict, tool: DirectToolDefinition, action: st
         ok=True,
         output=output,
         summary=summary,
-        state_updates={"direct_tool_last_result": {"tool_id": tool.tool_id, "status": "ok", "summary": summary}},
+        state_updates={
+            "used_execution_surfaces": list(state.get("used_execution_surfaces", []) or []) + [{
+                "kind": "integration",
+                "integration": "aws",
+                "tool": action,
+                "label": f"aws/{action}",
+            }],
+            "direct_tool_last_result": {"tool_id": tool.tool_id, "status": "ok", "summary": summary},
+        },
     )
 
 

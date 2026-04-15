@@ -711,7 +711,27 @@ def _handle_planned_batch_dispatch(runtime: Any, state: dict[str, Any], context:
     planned_batch = runtime._next_planned_agents(state)
     if not planned_batch:
         return None
+    if runtime._should_parallelize_planned_batch(state, planned_batch):
+        step_ids = [str(step.get("id", "")).strip() for step in planned_batch if isinstance(step, dict) and str(step.get("id", "")).strip()]
+        if not step_ids:
+            return None
+        state["parallel_plan_batch"] = step_ids
+        state["parallel_plan_batch_size"] = len(step_ids)
+        log_task_update("Plan", f"Starting parallel read-only batch with {len(step_ids)} steps.")
+        return _dispatch_task(
+            state,
+            recipient=runtime._PARALLEL_PLAN_EXECUTOR,
+            intent="planned-parallel-batch",
+            content=f"Execute planned steps in parallel: {', '.join(step_ids)}",
+            reason="Execute safe read-only planned steps in parallel.",
+            state_updates={
+                "parallel_plan_batch": step_ids,
+                "parallel_plan_batch_size": len(step_ids),
+            },
+        )
     next_step = planned_batch[0]
+    state["parallel_plan_batch"] = []
+    state["parallel_plan_batch_size"] = 0
     next_agent = str(next_step.get("agent") or "worker_agent").strip()
     task_content = str(next_step.get("task") or context.current_objective)
     if len(planned_batch) > 1:
@@ -728,6 +748,15 @@ def _handle_planned_batch_dispatch(runtime: Any, state: dict[str, Any], context:
     state["planned_active_step_id"] = str(next_step.get("id", "")).strip()
     state["planned_active_step_title"] = str(next_step.get("title", "")).strip()
     state["planned_active_step_success_criteria"] = str(next_step.get("success_criteria", "")).strip()
+    if state.get("orchestration_plan_id") and state["planned_active_step_id"]:
+        claimed = runtime._claim_plan_step_lease(state, state["planned_active_step_id"])
+        if claimed is None:
+            log_task_update("Plan", f"Step {state['planned_active_step_id']} is already leased; waiting for the active worker.")
+            state["planned_active_agent"] = ""
+            state["planned_active_step_id"] = ""
+            state["planned_active_step_title"] = ""
+            state["planned_active_step_success_criteria"] = ""
+            return None
     step_index = int(state.get("plan_step_index", 0) or 0)
     total_steps = len(state.get("plan_steps", []) or [])
     step_title = state.get("planned_active_step_title") or state.get("planned_active_step_id") or "planned step"

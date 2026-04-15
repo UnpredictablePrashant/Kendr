@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect, useCallback, useMemo, useReducer } from 'react'
 import { useApp } from '../contexts/AppContext'
+import GitDiffPreview from '../components/GitDiffPreview'
 import { basename, resolveAgentCapability, resolveContextWindow, resolveSelectedModel } from '../lib/modelSelection'
 import { buildActivityEntry, isPlanApprovalScope, isSkillApproval, shouldMirrorActivityMessage, summarizeRunArtifacts } from '../lib/runPresentation'
 
@@ -493,7 +494,7 @@ const DR_DEFAULTS = {
 }
 
 // ─── Component ───────────────────────────────────────────────────────────────
-export default function ChatPanel({ fullWidth = false, hideHeader = false, studioMode = false }) {
+export default function ChatPanel({ fullWidth = false, hideHeader = false, studioMode = false, minimalStudio = false, studioAccessory = null }) {
   const { state: appState, dispatch: appDispatch, openFile, refreshModelInventory } = useApp()
   const api = window.kendrAPI
   const [chat, dispatch] = useReducer(chatReducer, undefined, () => ({ ...initChat, messages: loadHistory() }))
@@ -508,10 +509,13 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   const [machineStatus, setMachineStatus] = useState(null)
   const [machineStatusLoaded, setMachineStatusLoaded] = useState(false)
   const [machineSyncRunning, setMachineSyncRunning] = useState(false)
+  const [diffPreviewPath, setDiffPreviewPath] = useState('')
   const [showHistory, setShowHistory] = useState(false)
   const [sessions, setSessions] = useState(() => loadSessions())
+  const [composerMenuOpen, setComposerMenuOpen] = useState(false)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
+  const composerMenuRef = useRef(null)
   const esRef = useRef(null)
   const resumeAttemptedRunRef = useRef('')
   const mirroredActivityIdsRef = useRef([])
@@ -550,12 +554,24 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   const stickyChecklistMsg = useMemo(() => latestChecklistMessage(chat.messages), [chat.messages])
   const stickyChecklist = Array.isArray(stickyChecklistMsg?.checklist) ? stickyChecklistMsg.checklist : []
   const inlineAwaiting = shouldInlineAwaitingContext(chat.awaitingContext)
+  const hasMessages = chat.messages.length > 0
+  const showInlineAttachmentTools = !minimalStudio
+  const showInlineContextTools = !minimalStudio
+  const showInlineFlowStrip = !minimalStudio
+  const planKeywordsDetected = /\b(plan|roadmap|outline|steps|milestones|strategy)\b/i.test(input)
+  const showPlanSuggestion = minimalStudio && selectedModelAgentCapable && !chat.streaming && chat.mode === 'chat' && planKeywordsDetected
+  const showActiveWorkflowChip = minimalStudio && chat.mode !== 'chat'
   const openArtifact = useCallback(async (item) => {
     const filePath = String(item?.path || '').trim()
     if (!filePath) return
     appDispatch({ type: 'SET_VIEW', view: 'developer' })
     await openFile(filePath)
   }, [appDispatch, openFile])
+  const reviewArtifact = useCallback((item) => {
+    const filePath = String(item?.path || '').trim()
+    if (!filePath) return
+    setDiffPreviewPath(filePath)
+  }, [])
 
   // Close the SSE stream when the panel unmounts (e.g. explicit new-chat remount)
   useEffect(() => {
@@ -575,6 +591,15 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chat.messages])
+
+  useEffect(() => {
+    if (!composerMenuOpen) return undefined
+    const onMouseDown = (event) => {
+      if (composerMenuRef.current && !composerMenuRef.current.contains(event.target)) setComposerMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onMouseDown)
+    return () => document.removeEventListener('mousedown', onMouseDown)
+  }, [composerMenuOpen])
 
   useEffect(() => {
     const entries = chat.messages
@@ -1358,9 +1383,11 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     { id: 'agent',    label: '✨ Agent' },
     { id: 'research', label: '🔬 Deep Research' },
   ]
+  const showLandingLayout = minimalStudio && !hasMessages && chat.mode !== 'research'
+  const showResearchIdleLayout = minimalStudio && !hasMessages && chat.mode === 'research'
 
   return (
-    <div className={`kc-panel${fullWidth ? ' kc-panel--full' : ''}`}>
+    <div className={`kc-panel${fullWidth ? ' kc-panel--full' : ''}${showLandingLayout ? ' kc-panel--landing' : ''}${showResearchIdleLayout ? ' kc-panel--research-idle' : ''}`}>
       {/* ── Header ── */}
       {!hideHeader && <div className="kc-header">
         <div className="kc-logo">K<span>endr</span></div>
@@ -1387,37 +1414,57 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       </div>}
 
       {/* ── Mode pills ── */}
-      <div className="kc-mode-bar">
-        {MODES.map((m) => {
-          const requiresAgent = m.id === 'agent' || m.id === 'plan'
-          const disabled = requiresAgent && !selectedModelAgentCapable
-          return (
-            <button
-              key={m.id}
-              className={`kc-mode-pill ${chat.mode === m.id ? 'kc-mode-pill--active' : ''} ${disabled ? 'kc-mode-pill--disabled' : ''}`}
-              onClick={() => { if (disabled) return; dispatch({ type: 'SET_MODE', mode: m.id }) }}
-              title={disabled ? 'Selected model cannot run planning or agent workflows.' : ''}
-            >{m.label}</button>
-          )
-        })}
-      </div>
+      {!minimalStudio && (
+        <div className="kc-mode-bar">
+          {MODES.map((m) => {
+            const requiresAgent = m.id === 'agent' || m.id === 'plan'
+            const disabled = requiresAgent && !selectedModelAgentCapable
+            return (
+              <button
+                key={m.id}
+                className={`kc-mode-pill ${chat.mode === m.id ? 'kc-mode-pill--active' : ''} ${disabled ? 'kc-mode-pill--disabled' : ''}`}
+                onClick={() => { if (disabled) return; dispatch({ type: 'SET_MODE', mode: m.id }) }}
+                title={disabled ? 'Selected model cannot run planning or agent workflows.' : ''}
+              >{m.label}</button>
+            )
+          })}
+        </div>
+      )}
 
       {/* ── Deep Research Panel ── */}
       {chat.mode === 'research' && (
         <DeepResearchPanel dr={dr} updateDr={updateDr} />
       )}
 
+      {minimalStudio && hasMessages && studioAccessory && (
+        <div className="kc-compact-toolbar">
+          {studioAccessory}
+        </div>
+      )}
+
       {/* ── Messages ── */}
       <div className="kc-messages">
-        {chat.messages.length === 0 && <WelcomeScreen onSuggest={s => { setInput(s); inputRef.current?.focus() }} />}
+        {chat.messages.length === 0 && (
+          <>
+            {minimalStudio && studioAccessory && <div className="kc-landing-accessory">{studioAccessory}</div>}
+            <WelcomeScreen minimal={minimalStudio} onSuggest={s => { setInput(s); inputRef.current?.focus() }} />
+          </>
+        )}
 
         {chat.messages.map(msg =>
           msg.role === 'user'
             ? <UserMessage key={msg.id} msg={msg} />
-            : <AssistantMessage key={msg.id} msg={msg} onQuickReply={(reply) => send(reply, true)} onSendSuggestion={(reply) => send(reply, true)} onOpenArtifact={openArtifact} />
+            : <AssistantMessage key={msg.id} msg={msg} onQuickReply={(reply) => send(reply, true)} onSendSuggestion={(reply) => send(reply, true)} onOpenArtifact={openArtifact} onReviewArtifact={reviewArtifact} />
         )}
         <div ref={messagesEndRef} />
       </div>
+
+      <GitDiffPreview
+        cwd={appState.projectRoot}
+        filePath={diffPreviewPath}
+        onClose={() => setDiffPreviewPath('')}
+        onOpenFile={(filePath) => openArtifact({ path: filePath })}
+      />
 
       {/* ── Agent approval modal ── */}
       {chat.awaitingContext && !inlineAwaiting && (
@@ -1464,71 +1511,163 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
 
       {/* ── Input area ── */}
       <div className="kc-input-area">
-        <div className="kc-attach-bar">
-          <div className="kc-attach-actions">
-            <button className="kc-attach-btn" onClick={attachFiles}>+ Files</button>
-            {studioMode && <button className="kc-attach-btn" onClick={attachFolder}>+ Folder</button>}
-            {chat.mode === 'agent' || chat.mode === 'plan' ? (
-              <span
-                className={`kc-mcp-indicator${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-indicator--warn' : ''}`}
-                title={mcpUndiscovered > 0
-                  ? `${mcpUndiscovered} server${mcpUndiscovered !== 1 ? 's have' : ' has'} no tools discovered yet — open MCP Settings to run discovery`
-                  : `${mcpServerCount} MCP server${mcpServerCount !== 1 ? 's' : ''} active`}
-              >
-                🔌 MCP {mcpServerCount > 0 ? `· ${mcpServerCount}` : ''}{mcpUndiscovered > 0 ? ' ⚠' : ''}
-              </span>
-            ) : (
-              <button
-                className={`kc-attach-btn kc-mcp-toggle${mcpEnabled ? ' kc-mcp-toggle--on' : ''}${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-toggle--warn' : ''}`}
-                onClick={() => setMcpEnabled(v => !v)}
-                title={
-                  mcpEnabled && mcpUndiscovered > 0
-                    ? `${mcpUndiscovered} server${mcpUndiscovered !== 1 ? 's have' : ' has'} no tools discovered — open MCP Settings to run discovery`
-                    : mcpEnabled ? 'Disable MCP tools for this chat' : `Enable MCP tools (${mcpServerCount} server${mcpServerCount !== 1 ? 's' : ''} available)`
-                }
-              >
-                🔌 MCP {mcpEnabled ? 'ON' : 'OFF'}{mcpEnabled && mcpUndiscovered > 0 ? ' ⚠' : ''}
-              </button>
+        {(showInlineAttachmentTools || attachments.length > 0) && (
+          <div className="kc-attach-bar">
+            {showInlineAttachmentTools && (
+              <div className="kc-attach-actions">
+                <button className="kc-attach-btn" onClick={attachFiles}>+ Files</button>
+                {studioMode && <button className="kc-attach-btn" onClick={attachFolder}>+ Folder</button>}
+                {chat.mode === 'agent' || chat.mode === 'plan' ? (
+                  <span
+                    className={`kc-mcp-indicator${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-indicator--warn' : ''}`}
+                    title={mcpUndiscovered > 0
+                      ? `${mcpUndiscovered} server${mcpUndiscovered !== 1 ? 's have' : ' has'} no tools discovered yet — open MCP Settings to run discovery`
+                      : `${mcpServerCount} MCP server${mcpServerCount !== 1 ? 's' : ''} active`}
+                  >
+                    🔌 MCP {mcpServerCount > 0 ? `· ${mcpServerCount}` : ''}{mcpUndiscovered > 0 ? ' ⚠' : ''}
+                  </span>
+                ) : (
+                  <button
+                    className={`kc-attach-btn kc-mcp-toggle${mcpEnabled ? ' kc-mcp-toggle--on' : ''}${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-toggle--warn' : ''}`}
+                    onClick={() => setMcpEnabled(v => !v)}
+                    title={
+                      mcpEnabled && mcpUndiscovered > 0
+                        ? `${mcpUndiscovered} server${mcpUndiscovered !== 1 ? 's have' : ' has'} no tools discovered — open MCP Settings to run discovery`
+                        : mcpEnabled ? 'Disable MCP tools for this chat' : `Enable MCP tools (${mcpServerCount} server${mcpServerCount !== 1 ? 's' : ''} available)`
+                    }
+                  >
+                    🔌 MCP {mcpEnabled ? 'ON' : 'OFF'}{mcpEnabled && mcpUndiscovered > 0 ? ' ⚠' : ''}
+                  </button>
+                )}
+              </div>
+            )}
+            {!!attachments.length && (
+              <div className="kc-attach-list">
+                {attachments.map(item => (
+                  <span key={item.path} className="kc-attach-chip" title={item.path}>
+                    <span>
+                      {item.type === 'folder' ? '📁' : item.type === 'image' ? '🖼' : '📄'} {item.name}
+                    </span>
+                    <button onClick={() => removeAttachment(item.path)}>×</button>
+                  </span>
+                ))}
+              </div>
             )}
           </div>
-          {!!attachments.length && (
-            <div className="kc-attach-list">
-              {attachments.map(item => (
-                <span key={item.path} className="kc-attach-chip" title={item.path}>
-                  <span>
-                    {item.type === 'folder' ? '📁' : item.type === 'image' ? '🖼' : '📄'} {item.name}
-                  </span>
-                  <button onClick={() => removeAttachment(item.path)}>×</button>
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
+        )}
         {!studioMode && appState.projectRoot && (
           <div className="kc-project-badge">
             <span>📁 {appState.projectRoot.split(/[\\/]/).pop()}</span>
           </div>
         )}
-        <div className="kc-context-row">
-          <div className="kc-context-badge" title={`Estimated context usage: ${estimatedContextTokens} / ${contextLimit} tokens (${contextPct}%)`}>
-            <span className="kc-context-icon">🧠</span>
-            <span className="kc-context-text">{estimatedContextTokens.toLocaleString()} / {contextLimit.toLocaleString()} ctx</span>
-            <div className="kc-context-bar">
-              <div
-                className={`kc-context-fill${contextPct >= 90 ? ' full' : contextPct >= 75 ? ' warn' : ''}`}
-                style={{ width: `${contextPct}%` }}
-              />
+        {showInlineContextTools && (
+          <div className="kc-context-row">
+            <div className="kc-context-badge" title={`Estimated context usage: ${estimatedContextTokens} / ${contextLimit} tokens (${contextPct}%)`}>
+              <span className="kc-context-icon">🧠</span>
+              <span className="kc-context-text">{estimatedContextTokens.toLocaleString()} / {contextLimit.toLocaleString()} ctx</span>
+              <div className="kc-context-bar">
+                <div
+                  className={`kc-context-fill${contextPct >= 90 ? ' full' : contextPct >= 75 ? ' warn' : ''}`}
+                  style={{ width: `${contextPct}%` }}
+                />
+              </div>
             </div>
+            <button className="kc-attach-btn" onClick={compactContext} title="Compact context and continue in a fresh backend session">
+              Compact
+            </button>
           </div>
-          <button className="kc-attach-btn" onClick={compactContext} title="Compact context and continue in a fresh backend session">
-            Compact
-          </button>
-        </div>
+        )}
+        {(showPlanSuggestion || showActiveWorkflowChip) && (
+          <div className="kc-smart-tools">
+            {showPlanSuggestion && (
+              <button className="kc-smart-chip kc-smart-chip--suggest" onClick={() => dispatch({ type: 'SET_MODE', mode: 'plan' })}>
+                Create a plan
+              </button>
+            )}
+            {showActiveWorkflowChip && (
+              <button
+                className="kc-smart-chip kc-smart-chip--active"
+                onClick={() => dispatch({ type: 'SET_MODE', mode: 'chat' })}
+              >
+                {chat.mode === 'plan' ? 'Plan mode on' : chat.mode === 'agent' ? 'Agent mode on' : 'Deep research on'}
+              </button>
+            )}
+          </div>
+        )}
         <div className="kc-input-row">
+          {minimalStudio && (
+            <div className="kc-composer-menu" ref={composerMenuRef}>
+              <button className="kc-composer-plus" onClick={() => setComposerMenuOpen((value) => !value)} title="Add files or tools">
+                +
+              </button>
+              {composerMenuOpen && (
+                <div className="kc-composer-pop">
+                  <button className="kc-composer-pop-item" onClick={() => { setComposerMenuOpen(false); attachFiles() }}>
+                    <span className="kc-composer-pop-main"><PaperclipIcon /><span>Add files</span></span>
+                  </button>
+                  {studioMode && (
+                    <button className="kc-composer-pop-item" onClick={() => { setComposerMenuOpen(false); attachFolder() }}>
+                      <span className="kc-composer-pop-main"><FolderIcon /><span>Add folder</span></span>
+                    </button>
+                  )}
+                  <div className="kc-composer-pop-sep" />
+                  <button
+                    className={`kc-composer-pop-item ${chat.mode === 'plan' ? 'active' : ''}${!selectedModelAgentCapable ? ' kc-composer-pop-item--disabled' : ''}`}
+                    onClick={() => {
+                      if (!selectedModelAgentCapable) return
+                      dispatch({ type: 'SET_MODE', mode: chat.mode === 'plan' ? 'chat' : 'plan' })
+                      setComposerMenuOpen(false)
+                    }}
+                    title={!selectedModelAgentCapable ? 'Selected model cannot run planning workflows.' : ''}
+                  >
+                    <span className="kc-composer-pop-main"><PlanModeIcon /><span>Plan mode</span></span>
+                    {chat.mode === 'plan' && <span className="kc-composer-pop-badge">On</span>}
+                  </button>
+                  <button
+                    className={`kc-composer-pop-item ${chat.mode === 'agent' ? 'active' : ''}${!selectedModelAgentCapable ? ' kc-composer-pop-item--disabled' : ''}`}
+                    onClick={() => {
+                      if (!selectedModelAgentCapable) return
+                      dispatch({ type: 'SET_MODE', mode: chat.mode === 'agent' ? 'chat' : 'agent' })
+                      setComposerMenuOpen(false)
+                    }}
+                    title={!selectedModelAgentCapable ? 'Selected model cannot run agent workflows.' : ''}
+                  >
+                    <span className="kc-composer-pop-main"><AgentModeIcon /><span>Agent mode</span></span>
+                    {chat.mode === 'agent' && <span className="kc-composer-pop-badge">On</span>}
+                  </button>
+                  <button
+                    className={`kc-composer-pop-item ${chat.mode === 'research' ? 'active' : ''}`}
+                    onClick={() => {
+                      dispatch({ type: 'SET_MODE', mode: chat.mode === 'research' ? 'chat' : 'research' })
+                      setComposerMenuOpen(false)
+                    }}
+                  >
+                    <span className="kc-composer-pop-main"><ResearchModeIcon /><span>Deep research</span></span>
+                    {chat.mode === 'research' && <span className="kc-composer-pop-badge">On</span>}
+                  </button>
+                  <div className="kc-composer-pop-sep" />
+                  <button
+                    className={`kc-composer-pop-item ${mcpEnabled ? 'active' : ''}`}
+                    onClick={() => {
+                      setMcpEnabled((value) => !value)
+                      setComposerMenuOpen(false)
+                    }}
+                  >
+                    <span className="kc-composer-pop-main"><PlugModeIcon /><span>MCP {mcpEnabled ? 'on' : 'off'}</span></span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
           <textarea
             ref={inputRef}
             className="kc-input"
             placeholder={
+              minimalStudio
+                ? (chat.mode === 'plan'
+                    ? 'Ask for a plan first. Kendr will outline the steps before doing the work…'
+                    : 'Search, ask, or tell Kendr what to do…')
+                :
               chat.mode === 'research'  ? 'Describe the deep research task, scope, and output you want…'  :
               chat.mode === 'plan'      ? 'Ask for a plan first. Kendr will outline steps and wait before implementation… (Ctrl+Enter)' :
               chat.mode === 'security'  ? 'Describe the target and scope…'     :
@@ -1539,7 +1678,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             onChange={e => setInput(e.target.value)}
             onPaste={handlePaste}
             onKeyDown={handleKey}
-            rows={3}
+            rows={minimalStudio ? 1 : 3}
             disabled={chat.streaming}
           />
           <button
@@ -1551,12 +1690,14 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             {chat.streaming ? <StopIcon /> : <SendIcon />}
           </button>
         </div>
-        <div className="kc-flow-strip">
-          <span className={`kc-flow-chip kc-flow-chip--${chat.mode}`}>{chat.mode === 'plan' ? 'Plan first' : chat.mode === 'agent' ? 'Agent run' : chat.mode === 'research' ? 'Research flow' : 'Quick answer'}</span>
-          {!studioMode && appState.projectRoot && <span className="kc-flow-chip">Workspace · {basename(appState.projectRoot)}</span>}
-          <span className="kc-flow-chip">{selectedModelMeta.model ? selectedModelMeta.label : 'Backend auto'}</span>
-          {chat.mode === 'plan' && <span className="kc-flow-chip kc-flow-chip--muted">waits before implement</span>}
-        </div>
+        {showInlineFlowStrip && (
+          <div className="kc-flow-strip">
+            <span className={`kc-flow-chip kc-flow-chip--${chat.mode}`}>{chat.mode === 'plan' ? 'Plan first' : chat.mode === 'agent' ? 'Agent run' : chat.mode === 'research' ? 'Research flow' : 'Quick answer'}</span>
+            {!studioMode && appState.projectRoot && <span className="kc-flow-chip">Workspace · {basename(appState.projectRoot)}</span>}
+            <span className="kc-flow-chip">{selectedModelMeta.model ? selectedModelMeta.label : 'Backend auto'}</span>
+            {chat.mode === 'plan' && <span className="kc-flow-chip kc-flow-chip--muted">waits before implement</span>}
+          </div>
+        )}
       </div>
     </div>
   )
@@ -1589,159 +1730,179 @@ function DeepResearchPanel({ dr, updateDr }) {
 
   return (
     <div className="dr-panel">
-      <div className="dr-panel-header" onClick={() => updateDr({ collapsed: !dr.collapsed })}>
-        <span className="dr-panel-title">🔬 Deep Research Settings</span>
-        <div className="dr-summary">
-          <span className="dr-sum-pill">~{dr.pages}p</span>
-          <span className="dr-sum-pill">{dr.citationStyle.toUpperCase()}</span>
-          <span className="dr-sum-pill">{dr.outputFormats.join('·')}</span>
-          {!dr.webSearchEnabled && <span className="dr-sum-pill dr-sum-warn">Local only</span>}
+      <div className="dr-panel-inner">
+        <div className="dr-panel-header" onClick={() => updateDr({ collapsed: !dr.collapsed })}>
+          <span className="dr-panel-title">🔬 Deep Research Settings</span>
+          <div className="dr-summary">
+            <span className="dr-sum-pill">~{dr.pages}p</span>
+            <span className="dr-sum-pill">{dr.citationStyle.toUpperCase()}</span>
+            <span className="dr-sum-pill">{dr.outputFormats.join('·')}</span>
+            {!dr.webSearchEnabled && <span className="dr-sum-pill dr-sum-warn">Local only</span>}
+          </div>
+          <span className="dr-collapse-btn">{dr.collapsed ? '▸' : '▾'}</span>
         </div>
-        <span className="dr-collapse-btn">{dr.collapsed ? '▸' : '▾'}</span>
+
+        {!dr.collapsed && (
+          <div className="dr-body">
+            {/* Row 1 */}
+            <div className="dr-grid">
+              <div className="dr-field">
+                <label className="dr-label">Approx. Length</label>
+                <select className="dr-select" value={dr.pages} onChange={e => updateDr({ pages: +e.target.value })}>
+                  <option value={10}>~10 pages</option>
+                  <option value={25}>~25 pages</option>
+                  <option value={50}>~50 pages</option>
+                  <option value={100}>~100 pages</option>
+                </select>
+                <div className="dr-note">Aiming near this length; citations and formatting can shift the final page count.</div>
+              </div>
+              <div className="dr-field">
+                <label className="dr-label">Citation Style</label>
+                <select className="dr-select" value={dr.citationStyle} onChange={e => updateDr({ citationStyle: e.target.value })}>
+                  <option value="apa">APA</option>
+                  <option value="mla">MLA</option>
+                  <option value="chicago">Chicago</option>
+                  <option value="ieee">IEEE</option>
+                </select>
+              </div>
+              <div className="dr-field">
+                <label className="dr-label">Date Range</label>
+                <select className="dr-select" value={dr.dateRange} onChange={e => updateDr({ dateRange: e.target.value })}>
+                  <option value="all_time">All time</option>
+                  <option value="1y">Last year</option>
+                  <option value="2y">Last 2 years</option>
+                  <option value="5y">Last 5 years</option>
+                </select>
+              </div>
+              <div className="dr-field">
+                <label className="dr-label">Max Sources</label>
+                <input className="dr-input-sm" type="number" min={0} step={10} value={dr.maxSources}
+                  onChange={e => updateDr({ maxSources: +e.target.value })} placeholder="0 = auto" />
+              </div>
+            </div>
+
+            {/* Row 2 */}
+            <div className="dr-grid" style={{ marginTop: 8 }}>
+              <div className="dr-field">
+                <label className="dr-label">Output Formats</label>
+                <div className="dr-checks">
+                  {['pdf','docx','html','md'].map(f => (
+                    <label key={f} className="dr-check">
+                      <input type="checkbox" checked={dr.outputFormats.includes(f)} onChange={() => toggleFormat(f)} />
+                      {f.toUpperCase()}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="dr-field">
+                <label className="dr-label">Source Families</label>
+                <div className="dr-checks">
+                  <label className="dr-check dr-check--web">
+                    <input type="checkbox" checked={dr.webSearchEnabled}
+                      onChange={e => updateDr({ webSearchEnabled: e.target.checked })} />
+                    🌐 Web Search
+                  </label>
+                  {[['web','Web'],['arxiv','Academic'],['patents','Patents'],['news','News'],['reddit','Community']].map(([v,l]) => (
+                    <label key={v} className="dr-check" style={{ opacity: dr.webSearchEnabled ? 1 : 0.4 }}>
+                      <input type="checkbox" checked={dr.sources.includes(v)} disabled={!dr.webSearchEnabled}
+                        onChange={() => toggleSource(v)} />
+                      {l}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <div className="dr-field">
+                <label className="dr-label">Quality Gates</label>
+                <div className="dr-checks">
+                  <label className="dr-check">
+                    <input type="checkbox" checked={dr.plagiarismCheck} onChange={e => updateDr({ plagiarismCheck: e.target.checked })} />
+                    Plagiarism Check
+                  </label>
+                  <label className="dr-check">
+                    <input type="checkbox" checked={dr.checkpointing} onChange={e => updateDr({ checkpointing: e.target.checked })} />
+                    Checkpointing
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            {/* Local paths */}
+            <div className="dr-field" style={{ marginTop: 8 }}>
+              <label className="dr-label">Local Folders / Files</label>
+              <div className="dr-path-row">
+                <button className="dr-action-btn" onClick={addLocalPath}>+ Browse Folder</button>
+              </div>
+              {dr.localPaths.length > 0 && (
+                <div className="dr-chips">
+                  {dr.localPaths.map(p => (
+                    <span key={p} className="dr-chip">
+                      <span>📁 {p.split(/[\\/]/).slice(-2).join('/')}</span>
+                      <button onClick={() => removeLocalPath(p)}>✕</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              <div className="dr-note">Folders are read recursively by the backend (local machine paths).</div>
+            </div>
+
+            {/* Explicit links */}
+            <div className="dr-field" style={{ marginTop: 8 }}>
+              <label className="dr-label">Explicit Content Links</label>
+              <textarea
+                className="dr-textarea"
+                rows={3}
+                placeholder={"https://example.com/report\nhttps://example.com/dataset"}
+                value={dr.links}
+                onChange={e => updateDr({ links: e.target.value })}
+                disabled={!dr.webSearchEnabled}
+              />
+              <div className="dr-note">
+                {dr.webSearchEnabled
+                  ? 'These exact URLs will be fetched as part of the report.'
+                  : 'Enable Web Search to use explicit links.'}
+              </div>
+            </div>
+          </div>
+        )}
       </div>
-
-      {!dr.collapsed && (
-        <div className="dr-body">
-          {/* Row 1 */}
-          <div className="dr-grid">
-            <div className="dr-field">
-              <label className="dr-label">Approx. Length</label>
-              <select className="dr-select" value={dr.pages} onChange={e => updateDr({ pages: +e.target.value })}>
-                <option value={10}>~10 pages</option>
-                <option value={25}>~25 pages</option>
-                <option value={50}>~50 pages</option>
-                <option value={100}>~100 pages</option>
-              </select>
-              <div className="dr-note">Aiming near this length; citations and formatting can shift the final page count.</div>
-            </div>
-            <div className="dr-field">
-              <label className="dr-label">Citation Style</label>
-              <select className="dr-select" value={dr.citationStyle} onChange={e => updateDr({ citationStyle: e.target.value })}>
-                <option value="apa">APA</option>
-                <option value="mla">MLA</option>
-                <option value="chicago">Chicago</option>
-                <option value="ieee">IEEE</option>
-              </select>
-            </div>
-            <div className="dr-field">
-              <label className="dr-label">Date Range</label>
-              <select className="dr-select" value={dr.dateRange} onChange={e => updateDr({ dateRange: e.target.value })}>
-                <option value="all_time">All time</option>
-                <option value="1y">Last year</option>
-                <option value="2y">Last 2 years</option>
-                <option value="5y">Last 5 years</option>
-              </select>
-            </div>
-            <div className="dr-field">
-              <label className="dr-label">Max Sources</label>
-              <input className="dr-input-sm" type="number" min={0} step={10} value={dr.maxSources}
-                onChange={e => updateDr({ maxSources: +e.target.value })} placeholder="0 = auto" />
-            </div>
-          </div>
-
-          {/* Row 2 */}
-          <div className="dr-grid" style={{ marginTop: 8 }}>
-            <div className="dr-field">
-              <label className="dr-label">Output Formats</label>
-              <div className="dr-checks">
-                {['pdf','docx','html','md'].map(f => (
-                  <label key={f} className="dr-check">
-                    <input type="checkbox" checked={dr.outputFormats.includes(f)} onChange={() => toggleFormat(f)} />
-                    {f.toUpperCase()}
-                  </label>
-                ))}
-              </div>
-            </div>
-            <div className="dr-field">
-              <label className="dr-label">Source Families</label>
-              <div className="dr-checks">
-                <label className="dr-check dr-check--web">
-                  <input type="checkbox" checked={dr.webSearchEnabled}
-                    onChange={e => updateDr({ webSearchEnabled: e.target.checked })} />
-                  🌐 Web Search
-                </label>
-                {[['web','Web'],['arxiv','Academic'],['patents','Patents'],['news','News'],['reddit','Community']].map(([v,l]) => (
-                  <label key={v} className="dr-check" style={{ opacity: dr.webSearchEnabled ? 1 : 0.4 }}>
-                    <input type="checkbox" checked={dr.sources.includes(v)} disabled={!dr.webSearchEnabled}
-                      onChange={() => toggleSource(v)} />
-                    {l}
-                  </label>
-                ))}
-              </div>
-            </div>
-            <div className="dr-field">
-              <label className="dr-label">Quality Gates</label>
-              <div className="dr-checks">
-                <label className="dr-check">
-                  <input type="checkbox" checked={dr.plagiarismCheck} onChange={e => updateDr({ plagiarismCheck: e.target.checked })} />
-                  Plagiarism Check
-                </label>
-                <label className="dr-check">
-                  <input type="checkbox" checked={dr.checkpointing} onChange={e => updateDr({ checkpointing: e.target.checked })} />
-                  Checkpointing
-                </label>
-              </div>
-            </div>
-          </div>
-
-          {/* Local paths */}
-          <div className="dr-field" style={{ marginTop: 8 }}>
-            <label className="dr-label">Local Folders / Files</label>
-            <div className="dr-path-row">
-              <button className="dr-action-btn" onClick={addLocalPath}>+ Browse Folder</button>
-            </div>
-            {dr.localPaths.length > 0 && (
-              <div className="dr-chips">
-                {dr.localPaths.map(p => (
-                  <span key={p} className="dr-chip">
-                    <span>📁 {p.split(/[\\/]/).slice(-2).join('/')}</span>
-                    <button onClick={() => removeLocalPath(p)}>✕</button>
-                  </span>
-                ))}
-              </div>
-            )}
-            <div className="dr-note">Folders are read recursively by the backend (local machine paths).</div>
-          </div>
-
-          {/* Explicit links */}
-          <div className="dr-field" style={{ marginTop: 8 }}>
-            <label className="dr-label">Explicit Content Links</label>
-            <textarea
-              className="dr-textarea"
-              rows={3}
-              placeholder={"https://example.com/report\nhttps://example.com/dataset"}
-              value={dr.links}
-              onChange={e => updateDr({ links: e.target.value })}
-              disabled={!dr.webSearchEnabled}
-            />
-            <div className="dr-note">
-              {dr.webSearchEnabled
-                ? 'These exact URLs will be fetched as part of the report.'
-                : 'Enable Web Search to use explicit links.'}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
 
 // ─── Welcome screen ───────────────────────────────────────────────────────────
-function WelcomeScreen({ onSuggest }) {
-  const SUGGESTIONS = [
-    'Summarize the attached files for me',
-    'Explain this topic simply',
-    'Make a plan before implementing this task',
-    'Investigate this problem step by step',
-    'Run a security assessment',
-    'Write a detailed technical report',
-    'Compare two approaches and recommend one',
-  ]
+function WelcomeScreen({ onSuggest, minimal = false }) {
+  const SUGGESTIONS = minimal
+    ? [
+        'Search files on my machine',
+        'Research this deeply',
+        'Turn this into a plan',
+      ]
+    : [
+        'Summarize the attached files for me',
+        'Explain this topic simply',
+        'Make a plan before implementing this task',
+        'Investigate this problem step by step',
+        'Run a security assessment',
+        'Write a detailed technical report',
+        'Compare two approaches and recommend one',
+      ]
   return (
     <div className="kc-welcome">
-      <div className="kc-welcome-logo">⚡</div>
-      <h2 className="kc-welcome-title">Kendr Studio</h2>
-      <p className="kc-welcome-sub">Use Chat for quick answers. Use Plan to outline the work first. Use Agent when you want Kendr to do the detailed work.</p>
+      {minimal && <div className="kc-welcome-brow">Orchestration</div>}
+      {!minimal && <div className="kc-welcome-logo">⚡</div>}
+      <h2 className={`kc-welcome-title${minimal ? ' kc-welcome-title--hero' : ''}`}>
+        {minimal ? (
+          <>
+            <span>Orchestrate</span>
+            <span className="kc-welcome-title-accent"> deep work.</span>
+          </>
+        ) : 'Kendr Studio'}
+      </h2>
+      <p className="kc-welcome-sub">
+        {minimal
+          ? 'Research, route models, and run agents from one workspace.'
+          : 'Use Chat for quick answers. Use Plan to outline the work first. Use Agent when you want Kendr to do the detailed work.'}
+      </p>
       <div className="kc-suggestions">
         {SUGGESTIONS.map(s => (
           <button key={s} className="kc-suggest" onClick={() => onSuggest(s)}>{s}</button>
@@ -1796,7 +1957,7 @@ function UserMessage({ msg }) {
 }
 
 // ─── Assistant message ────────────────────────────────────────────────────────
-function AssistantMessage({ msg, onQuickReply, onSendSuggestion, onOpenArtifact }) {
+function AssistantMessage({ msg, onQuickReply, onSendSuggestion, onOpenArtifact, onReviewArtifact }) {
   const [copied, setCopied] = useState(false)
   const [nowMs, setNowMs] = useState(Date.now())
   const copy = () => { navigator.clipboard.writeText(msg.content); setCopied(true); setTimeout(() => setCopied(false), 1500) }
@@ -1895,7 +2056,7 @@ function AssistantMessage({ msg, onQuickReply, onSendSuggestion, onOpenArtifact 
         )}
 
         {activityCards.length > 0 && (
-          <RunArtifactCards cards={activityCards} onOpenItem={onOpenArtifact} />
+          <RunArtifactCards cards={activityCards} onOpenItem={onOpenArtifact} onReviewItem={onReviewArtifact} />
         )}
 
         {/* Codex-style worklog */}
@@ -1967,7 +2128,7 @@ function AssistantMessage({ msg, onQuickReply, onSendSuggestion, onOpenArtifact 
   )
 }
 
-function RunArtifactCards({ cards, onOpenItem }) {
+function RunArtifactCards({ cards, onOpenItem, onReviewItem }) {
   return (
     <div className="kc-activity-grid">
       {cards.map((card) => (
@@ -1978,7 +2139,7 @@ function RunArtifactCards({ cards, onOpenItem }) {
               <div className="kc-activity-card-title">{card.title}</div>
             </div>
             {card.kind === 'edit' && Array.isArray(card.items) && card.items.some((item) => item?.path) && (
-              <button className="kc-activity-card-action" onClick={() => onOpenItem?.(card.items.find((item) => item?.path))}>
+              <button className="kc-activity-card-action" onClick={() => onReviewItem?.(card.items.find((item) => item?.path))}>
                 Review
               </button>
             )}
@@ -2684,6 +2845,24 @@ function HistoryIcon() {
 }
 function ClockIcon({ size = 14 }) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+}
+function PaperclipIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="m21.4 11.1-8.49 8.49a5 5 0 0 1-7.07-7.07l9.19-9.2a3.5 3.5 0 1 1 4.95 4.96L10.76 17.5a2 2 0 1 1-2.83-2.83l8.49-8.48"/></svg>
+}
+function FolderIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M3 7.5A1.5 1.5 0 0 1 4.5 6h4l1.5 2h7.5A1.5 1.5 0 0 1 19 9.5v7a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 3 16.5z"/></svg>
+}
+function PlanModeIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M8 6h11"/><path d="M8 12h11"/><path d="M8 18h11"/><circle cx="4" cy="6" r="1"/><circle cx="4" cy="12" r="1"/><circle cx="4" cy="18" r="1"/></svg>
+}
+function AgentModeIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M12 3v3"/><path d="M7 6h10"/><rect x="5" y="9" width="14" height="9" rx="3"/><path d="M9 13h.01"/><path d="M15 13h.01"/><path d="M9.5 16h5"/></svg>
+}
+function ResearchModeIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><circle cx="11" cy="11" r="6"/><path d="m20 20-3.5-3.5"/><path d="M11 8v3l2 2"/></svg>
+}
+function PlugModeIcon() {
+  return <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round"><path d="M9 7V3"/><path d="M15 7V3"/><path d="M7 9h10"/><path d="M8 9v3a4 4 0 0 0 8 0V9"/><path d="M12 16v5"/></svg>
 }
 
 // ─── History List ─────────────────────────────────────────────────────────────

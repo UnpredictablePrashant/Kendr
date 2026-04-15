@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react'
+import GitDiffPreview from '../components/GitDiffPreview'
 import { useApp } from '../contexts/AppContext'
 import { isPlanApprovalScope, isSkillApproval, summarizeRunArtifacts } from '../lib/runPresentation'
 
@@ -49,6 +50,7 @@ export default function AgentOrchestration() {
   const [selected, setSelected] = useState(null)
   const [runDetail, setRunDetail] = useState(null)
   const [loading, setLoading] = useState(false)
+  const [diffPreviewPath, setDiffPreviewPath] = useState('')
   const backendUrl = state.backendUrl || 'http://127.0.0.1:2151'
   const activityFeed = Array.isArray(state.activityFeed) ? state.activityFeed : []
 
@@ -128,11 +130,22 @@ export default function AgentOrchestration() {
     dispatch({ type: 'SET_VIEW', view: 'developer' })
     await openFile(filePath)
   }, [dispatch, openFile])
+  const reviewActivityItem = useCallback((item) => {
+    const filePath = String(item?.path || '').trim()
+    if (!filePath) return
+    setDiffPreviewPath(filePath)
+  }, [])
 
   const recentActivity = useMemo(() => activityFeed.slice(0, 16), [activityFeed])
 
   return (
     <div className="orchestration-view">
+      <GitDiffPreview
+        cwd={state.projectRoot}
+        filePath={diffPreviewPath}
+        onClose={() => setDiffPreviewPath('')}
+        onOpenFile={(filePath) => openActivityItem({ path: filePath })}
+      />
       <div className="orch-header">
         <h2 className="orch-title">Agent Orchestration</h2>
         <div className="orch-header-actions">
@@ -209,7 +222,7 @@ export default function AgentOrchestration() {
                                 <div className="kc-activity-card-title">{card.title}</div>
                               </div>
                               {card.kind === 'edit' && Array.isArray(card.items) && card.items.some((item) => item?.path) && (
-                                <button className="kc-activity-card-action" onClick={() => openActivityItem(card.items.find((item) => item?.path))}>
+                                <button className="kc-activity-card-action" onClick={() => reviewActivityItem(card.items.find((item) => item?.path))}>
                                   Review
                                 </button>
                               )}

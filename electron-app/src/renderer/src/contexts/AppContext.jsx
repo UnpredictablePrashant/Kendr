@@ -30,11 +30,11 @@ function normalizeView(view) {
 
 const initialState = {
   // App mode
-  appMode: (() => { try { return localStorage.getItem('kendr:appMode') || 'developer' } catch { return 'developer' } })(),
+  appMode: (() => { try { return localStorage.getItem('kendr:appMode') || 'studio' } catch { return 'studio' } })(),
   selectedModel: (() => { try { return localStorage.getItem('kendr:selectedModel') || null } catch { return null } })(),
 
   // Views & panels
-  activeView: 'home',
+  activeView: 'studio',
   sidebarOpen: true,
   chatOpen: true,
   terminalOpen: false,

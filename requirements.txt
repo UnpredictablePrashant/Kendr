@@ -12,6 +12,7 @@ sqlalchemy
 chromadb
 qdrant-client
 fastmcp
+browser-use[cli]
 telethon
 boto3
 playwright

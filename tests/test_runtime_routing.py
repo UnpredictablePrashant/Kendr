@@ -136,6 +136,16 @@ class RuntimeRoutingTests(unittest.TestCase):
         self.assertTrue(run_planner_plan)
         self.assertIn("plan mode", reason_plan.lower())
 
+    def test_execution_surface_note_is_appended_to_final_output(self):
+        runtime = AgentRuntime(build_registry())
+        note = runtime._with_execution_surface_note(
+            "answer body",
+            {"used_execution_surfaces": [{"label": "browser-use/browser_extract_content"}, {"label": "skill:web-search"}]},
+        )
+
+        self.assertIn("answer body", note)
+        self.assertIn("used: browser-use/browser_extract_content, skill:web-search", note)
+
     def test_drive_listing_query_routes_to_os_agent_with_command_hint(self):
         with (
             patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
@@ -605,6 +615,50 @@ class RuntimeRoutingTests(unittest.TestCase):
             task["state_updates"]["current_plan_step_success_criteria"],
             "A file catalog and evidence summary exist.",
         )
+
+    def test_planned_step_dispatch_uses_ready_dependency_step_not_stale_index(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Create a funding report from local files.")
+            state["plan_ready"] = True
+            state["plan_approval_status"] = "approved"
+            state["plan_step_index"] = 0
+            state["plan_steps"] = [
+                {
+                    "id": "step-1",
+                    "title": "Catalog files",
+                    "agent": "local_drive_agent",
+                    "task": "Catalog the local files.",
+                    "success_criteria": "A file catalog exists.",
+                    "status": "completed",
+                },
+                {
+                    "id": "step-2",
+                    "title": "Summarize evidence",
+                    "agent": "worker_agent",
+                    "task": "Summarize the evidence.",
+                    "depends_on": ["step-1"],
+                    "success_criteria": "An evidence summary exists.",
+                    "status": "waiting",
+                },
+                {
+                    "id": "step-3",
+                    "title": "Draft report",
+                    "agent": "worker_agent",
+                    "task": "Draft the report.",
+                    "depends_on": ["step-2"],
+                    "success_criteria": "A report draft exists.",
+                    "status": "waiting",
+                },
+            ]
+
+            routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "worker_agent")
+        self.assertEqual(routed_state["planned_active_step_id"], "step-2")
+        self.assertEqual(routed_state["plan_step_index"], 1)
+        task = routed_state["a2a"]["tasks"][-1]
+        self.assertEqual(task["state_updates"]["current_plan_step_id"], "step-2")
 
     def test_reviewer_revision_limit_raises_after_too_many_retries(self):
         with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):

@@ -1578,6 +1578,79 @@ def _get_model_guide(force: bool = False) -> dict[str, object]:
     return payload
 
 
+def _comparison_rows_from_provider_statuses(statuses: list[dict]) -> list[dict]:
+    rows: list[dict] = []
+    for status in statuses:
+        if not isinstance(status, dict):
+            continue
+        source_provider = str(status.get("provider") or "").strip()
+        configured_model = str(status.get("model") or "").strip()
+        configured_models = {
+            str(item or "").strip()
+            for item in (status.get("configured_models") or [])
+            if str(item or "").strip()
+        }
+        if configured_model:
+            configured_models.add(configured_model)
+
+        details = status.get("selectable_model_details")
+        if not isinstance(details, list) or not details:
+            fallback_name = configured_model
+            if fallback_name:
+                details = [{
+                    "name": fallback_name,
+                    "family": str(status.get("model_family") or source_provider or "").strip(),
+                    "context_window": int(status.get("context_window") or 0),
+                    "capabilities": dict(status.get("model_capabilities") or {}),
+                    "agent_capable": bool(status.get("agent_capable")),
+                }]
+            else:
+                details = []
+
+        badges = status.get("model_badges") if isinstance(status.get("model_badges"), dict) else {}
+        suggested_latest = next((model for model, tags in badges.items() if "latest" in (tags or [])), "—")
+        suggested_best = next((model for model, tags in badges.items() if "best" in (tags or [])), "—")
+        suggested_cheapest = next((model for model, tags in badges.items() if "cheapest" in (tags or [])), "—")
+        note = str(status.get("note") or "").strip()
+        model_fetch_error = str(status.get("model_fetch_error") or "").strip()
+
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            model_name = str(detail.get("name") or "").strip()
+            if not model_name:
+                continue
+            family = str(detail.get("family") or status.get("model_family") or source_provider or "").strip()
+            model_capabilities = detail.get("capabilities") if isinstance(detail.get("capabilities"), dict) else {}
+            rows.append({
+                "provider": family or source_provider,
+                "source_provider": source_provider,
+                "model": model_name,
+                "model_badges": list(badges.get(model_name) or []),
+                "status": (f"Error: {model_fetch_error}" if model_fetch_error else ("Ready" if status.get("ready") else note or "Not ready")),
+                "context_window": int(detail.get("context_window") or status.get("context_window") or 0),
+                "model_capabilities": model_capabilities,
+                "agent_capable": bool(detail.get("agent_capable")),
+                "selected": model_name == configured_model,
+                "configured": model_name in configured_models,
+                "suggested_latest": suggested_latest,
+                "suggested_best": suggested_best,
+                "suggested_cheapest": suggested_cheapest,
+                "model_fetch_error": model_fetch_error,
+            })
+
+    rows.sort(
+        key=lambda item: (
+            0 if item.get("configured") else 1,
+            0 if item.get("selected") else 1,
+            str(item.get("provider") or ""),
+            str(item.get("source_provider") or ""),
+            str(item.get("model") or "").lower(),
+        )
+    )
+    return rows
+
+
 def _delete_ollama_model(model_name: str) -> tuple[bool, dict[str, object], int]:
     model = str(model_name or "").strip()
     if not model:
@@ -3075,15 +3148,15 @@ a:hover { text-decoration: underline; }
   <div class="messages" id="messages">
     <div class="welcome" id="welcome">
       <div class="welcome-logo">&#x26A1;</div>
-      <h2>What would you like to research or build?</h2>
-      <p>Kendr orchestrates specialized AI agents to research, generate code, deploy applications, analyze data, and automate complex workflows &#x2014; all from a single query.</p>
+      <h2>What would you like help with today?</h2>
+      <p>Kendr helps with everyday work: reading files, summarizing documents, organizing tasks, drafting messages, checking schedules, and finding up-to-date information.</p>
       <div class="suggestions">
-        <div class="suggest-chip" onclick="fillInput('Create a competitive intelligence brief on Stripe')">&#x1F4CA; Stripe competitive brief</div>
-        <div class="suggest-chip" onclick="fillInput('Build a FastAPI REST API with JWT authentication and PostgreSQL')">&#x1F3D7;&#xFE0F; FastAPI + JWT + PostgreSQL</div>
-        <div class="suggest-chip" onclick="fillInput('Write API tests for https://jsonplaceholder.typicode.com')">&#x1F9EA; API test generation</div>
-        <div class="suggest-chip" onclick="fillInput('Summarize my unread emails and Slack messages from today')">&#x1F4EC; Communications digest</div>
-        <div class="suggest-chip" onclick="fillInput('Dockerize a Node.js app and write a docker-compose.yml')">&#x1F433; Dockerize + compose</div>
-        <div class="suggest-chip" onclick="fillInput('Deploy a React app to AWS S3 and CloudFront')">&#x2601;&#xFE0F; Deploy to AWS</div>
+        <div class="suggest-chip" onclick="fillInput('Summarize this PDF and extract action items')">&#x1F4C4; PDF action items</div>
+        <div class="suggest-chip" onclick="fillInput('Find the latest version of our leave policy online')">&#x1F310; Policy web search</div>
+        <div class="suggest-chip" onclick="fillInput('Read this spreadsheet and tell me the totals')">&#x1F4CA; Spreadsheet totals</div>
+        <div class="suggest-chip" onclick="fillInput('Draft an email reply to this customer update')">&#x1F4EC; Draft reply</div>
+        <div class="suggest-chip" onclick="fillInput('Organize my tasks for today')">&#x2705; Plan my day</div>
+        <div class="suggest-chip" onclick="fillInput('Plan a simple weekend trip itinerary')">&#x1F9F3; Travel helper</div>
       </div>
     </div>
   </div>
@@ -4741,7 +4814,7 @@ async function deleteRun(runId, itemEl) {
 
 function clearMessages() {
   const msgs = document.getElementById('messages');
-  msgs.innerHTML = '<div class="welcome" id="welcome"><div class="welcome-logo">&#x26A1;</div><h2>What would you like to research or build?</h2><p>Kendr orchestrates specialized AI agents to research, generate code, deploy applications, analyze data, and automate complex workflows &#x2014; all from a single query.</p><div class="suggestions"><div class="suggest-chip" onclick="fillInput(\'Create a competitive intelligence brief on Stripe\')">&#x1F4CA; Stripe competitive brief</div><div class="suggest-chip" onclick="fillInput(\'Build a FastAPI REST API with JWT authentication and PostgreSQL\')">&#x1F3D7;&#xFE0F; FastAPI + JWT + PostgreSQL</div><div class="suggest-chip" onclick="fillInput(\'Write API tests for https://jsonplaceholder.typicode.com\')">&#x1F9EA; API test generation</div><div class="suggest-chip" onclick="fillInput(\'Summarize my unread emails and Slack messages from today\')">&#x1F4EC; Communications digest</div><div class="suggest-chip" onclick="fillInput(\'Dockerize a Node.js app and write a docker-compose.yml\')">&#x1F433; Dockerize + compose</div><div class="suggest-chip" onclick="fillInput(\'Deploy a React app to AWS S3 and CloudFront\')">&#x2601;&#xFE0F; Deploy to AWS</div></div></div>';
+  msgs.innerHTML = '<div class="welcome" id="welcome"><div class="welcome-logo">&#x26A1;</div><h2>What would you like help with today?</h2><p>Kendr helps with everyday work: reading files, summarizing documents, organizing tasks, drafting messages, checking schedules, and finding up-to-date information.</p><div class="suggestions"><div class="suggest-chip" onclick="fillInput(\'Summarize this PDF and extract action items\')">&#x1F4C4; PDF action items</div><div class="suggest-chip" onclick="fillInput(\'Find the latest version of our leave policy online\')">&#x1F310; Policy web search</div><div class="suggest-chip" onclick="fillInput(\'Read this spreadsheet and tell me the totals\')">&#x1F4CA; Spreadsheet totals</div><div class="suggest-chip" onclick="fillInput(\'Draft an email reply to this customer update\')">&#x1F4EC; Draft reply</div><div class="suggest-chip" onclick="fillInput(\'Organize my tasks for today\')">&#x2705; Plan my day</div><div class="suggest-chip" onclick="fillInput(\'Plan a simple weekend trip itinerary\')">&#x1F9F3; Travel helper</div></div></div>';
   _renderChatInspector();
 }
 
@@ -11020,7 +11093,7 @@ input:checked + .slider:before { transform: translateX(14px); }
     <pre id="scaffoldCode">Loading...</pre>
   </div>
   <p style="font-size:12px;color:var(--muted);margin-top:10px">
-    The full example is at <code style="color:var(--teal)">mcp_servers/example_fastmcp_server.py</code> &mdash; run with <code style="color:var(--teal)">python mcp_servers/example_fastmcp_server.py</code>
+    Add your own MCP server by pointing Kendr at its command or URL, for example <code style="color:var(--teal)">python mcp_servers/my_server.py</code>
   </p>
 </div>
 
@@ -12678,6 +12751,7 @@ strong { color: var(--text); }
                 ollama_models = list_ollama_models() if ollama_running else []
                 for s in statuses:
                     s["context_window"] = get_context_window(s.get("model", ""))
+                comparison_rows = _comparison_rows_from_provider_statuses(statuses)
                 self._json(200, {
                     "active_provider": active,
                     "active_model": active_model,
@@ -12689,6 +12763,7 @@ strong { color: var(--text); }
                     "configured_provider_ready": configured_ready,
                     "configured_provider_note": str(configured_status.get("note") or "").strip(),
                     "providers": statuses,
+                    "comparison_rows": comparison_rows,
                     "ollama_running": ollama_running,
                     "ollama_models": [m.get("name", "") for m in ollama_models],
                 })

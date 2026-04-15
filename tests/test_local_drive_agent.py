@@ -317,6 +317,45 @@ class LocalDriveAgentTests(unittest.TestCase):
         self.assertIn(image_path, result.get("ocr_image_paths", []))
         self.assertIn(excel_path, result.get("excel_file_paths", []))
 
+    def test_local_drive_agent_duplicate_filename_mode_skips_document_parsing(self):
+        with TemporaryDirectory() as tmp:
+            folder_a = os.path.join(tmp, "a")
+            folder_b = os.path.join(tmp, "b")
+            os.makedirs(folder_a, exist_ok=True)
+            os.makedirs(folder_b, exist_ok=True)
+            path_a = os.path.join(folder_a, "report.txt")
+            path_b = os.path.join(folder_b, "report.txt")
+            with open(path_a, "w", encoding="utf-8") as handle:
+                handle.write("one")
+            with open(path_b, "w", encoding="utf-8") as handle:
+                handle.write("two")
+
+            state = {
+                "user_query": "identify duplicate files with same name",
+                "current_objective": "identify duplicate files with same name in D drive",
+                "local_drive_paths": [tmp],
+                "local_drive_working_directory": tmp,
+                "local_drive_index_to_memory": False,
+            }
+
+            with (
+                patch("tasks.a2a_agent_utils.record_work_note"),
+                patch("tasks.intelligence_tasks.log_task_update"),
+                patch("tasks.intelligence_tasks.write_text_file"),
+                patch("tasks.intelligence_tasks.parse_documents") as parse_documents_mock,
+                patch("tasks.intelligence_tasks.llm_text") as llm_text_mock,
+            ):
+                result = local_drive_agent(state)
+
+        parse_documents_mock.assert_not_called()
+        llm_text_mock.assert_not_called()
+        self.assertIn("Duplicate Filename Report", result["draft_response"])
+        self.assertIn("report.txt (2)", result["draft_response"])
+        duplicate_groups = result.get("local_drive_duplicate_name_groups", [])
+        self.assertEqual(len(duplicate_groups), 1)
+        self.assertEqual(duplicate_groups[0]["name"], "report.txt")
+        self.assertEqual(duplicate_groups[0]["count"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

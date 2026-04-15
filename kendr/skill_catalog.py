@@ -22,7 +22,7 @@ class CatalogSkill:
     id: str                          # unique catalog identifier (slug)
     name: str
     description: str
-    category: str                    # Recommended | Development | Research | Documents | Communication | Data
+    category: str                    # Recommended | Documents | Communication | Planning | Travel
     icon: str                        # emoji
     tags: tuple[str, ...] = ()
     input_schema: dict = field(default_factory=dict)
@@ -48,13 +48,10 @@ class CatalogSkill:
 # ---------------------------------------------------------------------------
 
 CATALOG: tuple[CatalogSkill, ...] = (
-
-    # ── Recommended ──────────────────────────────────────────────────────────
-
     CatalogSkill(
         id="web-search",
         name="Web Search",
-        description="Search the web for real-time information. Returns structured results with titles, snippets, and URLs.",
+        description="Search the web for real-time information and return structured results with titles, snippets, and URLs.",
         category="Recommended",
         icon="🌐",
         tags=("search", "web", "research", "real-time"),
@@ -69,29 +66,25 @@ CATALOG: tuple[CatalogSkill, ...] = (
         output_schema={
             "type": "object",
             "properties": {
-                "results": {"type": "array", "items": {"type": "object"}},
                 "query": {"type": "string"},
+                "results": {"type": "array", "items": {"type": "object"}},
             },
         },
-        example_input={"query": "latest AI news 2025"},
-        example_output='{"results": [{"title": "...", "url": "...", "snippet": "..."}]}',
+        example_input={"query": "latest version of a workplace leave policy"},
+        example_output='{"query": "latest version of a workplace leave policy", "results": [{"title": "...", "url": "..."}]}',
         core=True,
         default_permissions={
             "requires_approval": False,
-            "network": {
-                "allow": True,
-                "domains": ["api.duckduckgo.com"],
-            },
+            "network": {"allow": True, "domains": ["api.duckduckgo.com"]},
         },
     ),
-
     CatalogSkill(
         id="desktop-automation",
         name="Desktop Automation",
-        description="Broker desktop app actions with a safe sandbox preview mode and an explicitly approved full-access mode for native app launch hand-offs.",
+        description="Preview or dispatch safe desktop actions for opening apps, chats, documents, and links.",
         category="Recommended",
         icon="🖥️",
-        tags=("desktop", "native-apps", "automation", "local-first"),
+        tags=("desktop", "automation", "apps", "local-first"),
         input_schema={
             "type": "object",
             "properties": {
@@ -105,18 +98,14 @@ CATALOG: tuple[CatalogSkill, ...] = (
                     "enum": ["generic", "whatsapp", "telegram", "microsoft_365"],
                     "default": "generic",
                 },
-                "access_mode": {
-                    "type": "string",
-                    "enum": ["sandbox", "full_access"],
-                    "default": "sandbox",
-                },
-                "app_name": {"type": "string", "description": "Native app name for generic open_app actions."},
-                "office_app": {"type": "string", "description": "Office app for Microsoft 365: outlook, word, excel, powerpoint, teams."},
-                "phone_number": {"type": "string", "description": "Phone number for WhatsApp chat launch."},
-                "handle": {"type": "string", "description": "Telegram handle for chat launch."},
-                "message": {"type": "string", "description": "Optional chat draft message."},
-                "document_path": {"type": "string", "description": "Local document path for open_document."},
-                "url": {"type": "string", "description": "URL for open_url actions."},
+                "access_mode": {"type": "string", "enum": ["sandbox", "full_access"], "default": "sandbox"},
+                "app_name": {"type": "string"},
+                "office_app": {"type": "string"},
+                "phone_number": {"type": "string"},
+                "handle": {"type": "string"},
+                "message": {"type": "string"},
+                "document_path": {"type": "string"},
+                "url": {"type": "string"},
             },
         },
         output_schema={
@@ -126,11 +115,10 @@ CATALOG: tuple[CatalogSkill, ...] = (
                 "preview_only": {"type": "boolean"},
                 "dispatched": {"type": "boolean"},
                 "plan": {"type": "object"},
-                "supported_apps": {"type": "array"},
             },
         },
-        example_input={"action": "open_chat", "app": "telegram", "handle": "OpenAI", "message": "Hi from Kendr", "access_mode": "sandbox"},
-        example_output='{"access_mode": "sandbox", "preview_only": true, "dispatched": false, "plan": {"summary": "Open Telegram target OpenAI"}}',
+        example_input={"action": "open_document", "document_path": "/path/to/meeting-notes.docx", "access_mode": "sandbox"},
+        example_output='{"access_mode": "sandbox", "preview_only": true, "dispatched": false}',
         core=True,
         default_permissions={
             "requires_approval": False,
@@ -142,274 +130,268 @@ CATALOG: tuple[CatalogSkill, ...] = (
             },
         },
     ),
-
-    CatalogSkill(
-        id="code-executor",
-        name="Code Executor",
-        description="Execute Python code snippets safely and return the output. Useful for calculations, data transforms, and quick scripts.",
-        category="Recommended",
-        icon="⚡",
-        tags=("code", "python", "execute", "compute"),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "code": {"type": "string", "description": "Python code to execute"},
-                "timeout": {"type": "integer", "default": 10, "description": "Timeout in seconds"},
-            },
-            "required": ["code"],
-        },
-        output_schema={
-            "type": "object",
-            "properties": {
-                "stdout": {"type": "string"},
-                "stderr": {"type": "string"},
-                "success": {"type": "boolean"},
-            },
-        },
-        example_input={"code": "print(sum(range(100)))"},
-        example_output='{"stdout": "4950\\n", "stderr": "", "success": true}',
-    ),
-
     CatalogSkill(
         id="pdf-reader",
         name="PDF Reader",
-        description="Extract and structure text content from PDF files. Supports multi-page PDFs and preserves section structure.",
-        category="Recommended",
+        description="Extract text from a PDF so it can be reviewed, summarized, or reused.",
+        category="Documents",
         icon="📄",
         tags=("pdf", "documents", "extract", "text"),
         input_schema={
             "type": "object",
+            "properties": {"file_path": {"type": "string", "description": "Path to the PDF file"}},
+            "required": ["file_path"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"text": {"type": "string"}, "page_count": {"type": "integer"}},
+        },
+        example_input={"file_path": "/path/to/document.pdf"},
+        example_output='{"text": "...", "page_count": 12}',
+        core=True,
+    ),
+    CatalogSkill(
+        id="file-reader",
+        name="File Reader",
+        description="Read local files such as text, markdown, JSON, CSV, PDF, DOCX, and office extracts.",
+        category="Documents",
+        icon="📂",
+        tags=("files", "documents", "local", "read"),
+        input_schema={
+            "type": "object",
+            "properties": {"file_path": {"type": "string", "description": "Path to the local file"}},
+            "required": ["file_path"],
+        },
+        output_schema={
+            "type": "object",
             "properties": {
-                "file_path": {"type": "string", "description": "Path to the PDF file"},
-                "pages": {"type": "string", "default": "all", "description": "Page range, e.g. '1-5' or 'all'"},
+                "path": {"type": "string"},
+                "text": {"type": "string"},
+                "metadata": {"type": "object"},
+            },
+        },
+        example_input={"file_path": "/path/to/project-notes.md"},
+        example_output='{"path": "/path/to/project-notes.md", "text": "# Notes\\n...", "metadata": {"type": "md"}}',
+        core=True,
+    ),
+    CatalogSkill(
+        id="file-finder",
+        name="File Finder",
+        description="Find local files by file name, path, or text content inside a chosen folder.",
+        category="Documents",
+        icon="🔎",
+        tags=("files", "search", "local", "find"),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Filename, path, or text query"},
+                "root_path": {"type": "string", "description": "Folder to search. Defaults to the current workspace."},
+                "search_content": {"type": "boolean", "default": False, "description": "Also search inside text files."},
+                "limit": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"matches": {"type": "array", "items": {"type": "object"}}, "root_path": {"type": "string"}},
+        },
+        example_input={"query": "invoice", "root_path": "/path/to/documents", "search_content": True},
+        example_output='{"root_path": "/path/to/documents", "matches": [{"path": "/path/to/documents/invoice-march.pdf"}]}',
+        core=True,
+    ),
+    CatalogSkill(
+        id="doc-summarizer",
+        name="Doc Summarizer",
+        description="Summarize local files and documents into a short brief, fuller summary, or action items.",
+        category="Documents",
+        icon="🗒️",
+        tags=("summary", "documents", "pdf", "notes"),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the local file"},
+                "style": {"type": "string", "enum": ["short", "medium", "action_items"], "default": "medium"},
+                "focus": {"type": "string", "description": "Optional focus or question for the summary"},
+            },
+            "required": ["file_path"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"summary": {"type": "string"}, "path": {"type": "string"}},
+        },
+        example_input={"file_path": "/path/to/meeting-notes.pdf", "style": "action_items"},
+        example_output='{"path": "/path/to/meeting-notes.pdf", "summary": "Action items:\\n1. ..."}',
+        core=True,
+    ),
+    CatalogSkill(
+        id="spreadsheet-basic",
+        name="Spreadsheet Basic",
+        description="Read CSV and Excel files, summarize sheets and totals, and answer simple spreadsheet questions.",
+        category="Documents",
+        icon="📊",
+        tags=("spreadsheet", "csv", "excel", "totals"),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Path to the CSV or Excel file"},
+                "question": {"type": "string", "description": "Optional question about the spreadsheet"},
+                "max_rows": {"type": "integer", "default": 5},
             },
             "required": ["file_path"],
         },
         output_schema={
             "type": "object",
             "properties": {
-                "text": {"type": "string"},
-                "page_count": {"type": "integer"},
+                "path": {"type": "string"},
+                "summary": {"type": "string"},
+                "analysis": {"type": "string"},
             },
         },
-        example_input={"file_path": "/path/to/document.pdf"},
-        example_output='{"text": "...", "page_count": 12}',
+        example_input={"file_path": "/path/to/budget.xlsx", "question": "Tell me the totals by category"},
+        example_output='{"path": "/path/to/budget.xlsx", "analysis": "The largest category is ..."}',
+        core=True,
     ),
-
     CatalogSkill(
-        id="spreadsheet",
-        name="Spreadsheet",
-        description="Create, read, edit, and analyze spreadsheets. Supports CSV and Excel formats with formula evaluation.",
-        category="Recommended",
-        icon="📊",
-        tags=("spreadsheet", "csv", "excel", "data"),
+        id="email-digest",
+        name="Email Digest",
+        description="Summarize recent inbox items and draft reply guidance when Gmail or Outlook is connected.",
+        category="Communication",
+        icon="📬",
+        tags=("email", "digest", "gmail", "outlook"),
         input_schema={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["read", "write", "analyze"], "description": "Operation to perform"},
-                "file_path": {"type": "string", "description": "Path to the spreadsheet"},
-                "data": {"type": "array", "description": "Data rows for write operations"},
+                "query": {"type": "string", "description": "Optional inbox filter or search query"},
+                "max_results": {"type": "integer", "default": 10},
+                "draft_reply_to": {"type": "string", "description": "Optional sender or subject to draft a reply for"},
             },
-            "required": ["action", "file_path"],
         },
         output_schema={
             "type": "object",
-            "properties": {
-                "result": {"type": "object"},
-                "rows": {"type": "integer"},
-                "columns": {"type": "integer"},
-            },
+            "properties": {"summary": {"type": "string"}, "messages": {"type": "array", "items": {"type": "object"}}},
         },
-        example_input={"action": "read", "file_path": "/path/to/data.csv"},
-        example_output='{"result": {...}, "rows": 100, "columns": 5}',
+        example_input={"query": "is:unread", "max_results": 8},
+        example_output='{"summary": "You have 3 urgent emails ...", "messages": [{"subject": "..."}]}',
+        core=True,
     ),
-
-    # ── Development ───────────────────────────────────────────────────────────
-    # Note: raw GitHub API actions (create_issue, list_prs, etc.) live in the
-    # GitHub plugin (kendr.plugin_manager). Skills here are higher-level
-    # capabilities that may compose plugin actions with LLM reasoning.
-
     CatalogSkill(
-        id="shell-command",
-        name="Shell Command",
-        description="Run shell commands on the local machine. Useful for file operations, build scripts, and system tasks.",
-        category="Development",
-        icon="💻",
-        tags=("shell", "terminal", "command", "system"),
+        id="calendar-agenda",
+        name="Calendar Agenda",
+        description="Show today or this week’s agenda and highlight conflicts, open blocks, and follow-ups.",
+        category="Communication",
+        icon="🗓️",
+        tags=("calendar", "agenda", "schedule", "meetings"),
         input_schema={
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "Shell command to run"},
-                "cwd": {"type": "string", "description": "Working directory"},
-                "timeout": {"type": "integer", "default": 30},
+                "window": {"type": "string", "enum": ["today", "week"], "default": "today"},
+                "timezone": {"type": "string", "description": "Optional timezone name or offset hint"},
             },
-            "required": ["command"],
         },
         output_schema={
             "type": "object",
-            "properties": {
-                "stdout": {"type": "string"},
-                "stderr": {"type": "string"},
-                "returncode": {"type": "integer"},
-            },
+            "properties": {"summary": {"type": "string"}, "events": {"type": "array", "items": {"type": "object"}}},
         },
-        example_input={"command": "ls -la"},
-        example_output='{"stdout": "...", "stderr": "", "returncode": 0}',
+        example_input={"window": "today"},
+        example_output='{"summary": "You have 4 meetings today ...", "events": [{"title": "..."}]}',
+        core=True,
     ),
-
     CatalogSkill(
-        id="api-caller",
-        name="API Caller",
-        description="Make HTTP requests to any REST API. Supports GET, POST, PUT, DELETE with custom headers and auth.",
-        category="Development",
-        icon="🔌",
-        tags=("api", "http", "rest", "fetch"),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE", "PATCH"], "default": "GET"},
-                "headers": {"type": "object"},
-                "body": {"type": "object"},
-            },
-            "required": ["url"],
-        },
-        output_schema={
-            "type": "object",
-            "properties": {
-                "status_code": {"type": "integer"},
-                "body": {"type": "object"},
-                "headers": {"type": "object"},
-            },
-        },
-        example_input={"url": "https://api.example.com/data", "method": "GET"},
-        example_output='{"status_code": 200, "body": {...}}',
-        default_permissions={
-            "requires_approval": True,
-            "network": {
-                "allow": True,
-                "domains": [],
-            },
-        },
-    ),
-
-    # ── Research ──────────────────────────────────────────────────────────────
-
-    CatalogSkill(
-        id="image-analysis",
-        name="Image Analysis",
-        description="Analyze images using vision AI. Describes content, extracts text (OCR), identifies objects, and answers questions about images.",
-        category="Research",
-        icon="🔬",
-        tags=("image", "vision", "ocr", "analysis", "ai"),
-        requires_config=("OPENAI_API_KEY",),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "image_path": {"type": "string", "description": "Path or URL to the image"},
-                "question": {"type": "string", "description": "Question to ask about the image"},
-                "task": {"type": "string", "enum": ["describe", "ocr", "analyze"], "default": "describe"},
-            },
-            "required": ["image_path"],
-        },
-        output_schema={
-            "type": "object",
-            "properties": {
-                "result": {"type": "string"},
-                "confidence": {"type": "number"},
-            },
-        },
-        example_input={"image_path": "/path/to/image.png", "task": "describe"},
-        example_output='{"result": "A screenshot showing..."}',
-    ),
-
-    CatalogSkill(
-        id="data-analysis",
-        name="Data Analysis",
-        description="Analyze datasets with statistical summaries, trend detection, and visualizations. Supports CSV, JSON, and Pandas DataFrames.",
-        category="Research",
-        icon="📈",
-        tags=("data", "statistics", "analysis", "pandas", "visualization"),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "query": {"type": "string", "description": "Analysis question or instruction"},
-                "output_format": {"type": "string", "enum": ["summary", "chart", "table"], "default": "summary"},
-            },
-            "required": ["file_path", "query"],
-        },
-        output_schema={
-            "type": "object",
-            "properties": {
-                "result": {"type": "string"},
-                "stats": {"type": "object"},
-            },
-        },
-        example_input={"file_path": "/path/to/data.csv", "query": "Show me the top 5 rows and summary stats"},
-        example_output='{"result": "...", "stats": {"mean": ..., "std": ...}}',
-    ),
-
-    # ── Documents ─────────────────────────────────────────────────────────────
-    # Note: raw messaging actions (send Slack message, send email) live in the
-    # Slack / Gmail plugins (kendr.plugin_manager). Skills here are higher-level
-    # capabilities that compose plugin actions with LLM reasoning.
-
-    CatalogSkill(
-        id="doc-writer",
-        name="Doc Writer",
-        description="Create and edit Word documents (.docx). Generate reports, proposals, and structured documents with AI assistance.",
-        category="Documents",
+        id="meeting-notes",
+        name="Meeting Notes",
+        description="Turn raw notes or a transcript into a clean summary, action items, and follow-up draft.",
+        category="Communication",
         icon="📝",
-        tags=("word", "docx", "document", "report", "write"),
+        tags=("meetings", "notes", "action-items", "summary"),
         input_schema={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["create", "edit", "read"], "default": "create"},
-                "file_path": {"type": "string"},
-                "content": {"type": "string", "description": "Document content in Markdown or plain text"},
-                "title": {"type": "string"},
+                "notes": {"type": "string", "description": "Raw notes or transcript text"},
+                "style": {"type": "string", "enum": ["summary", "action_items", "follow_up"], "default": "summary"},
             },
-            "required": ["action", "file_path"],
+            "required": ["notes"],
         },
         output_schema={
             "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "pages": {"type": "integer"},
-            },
+            "properties": {"result": {"type": "string"}},
         },
-        example_input={"action": "create", "file_path": "/tmp/report.docx", "title": "Q4 Report", "content": "# Summary\n..."},
-        example_output='{"file_path": "/tmp/report.docx", "pages": 3}',
+        example_input={"notes": "Met with Alex about launch timing...", "style": "action_items"},
+        example_output='{"result": "1. Confirm launch date ..."}',
+        core=True,
     ),
-
     CatalogSkill(
-        id="image-gen",
-        name="Image Generator",
-        description="Generate images from text prompts using AI. Create illustrations, diagrams, icons, and visual content.",
-        category="Documents",
-        icon="🎨",
-        tags=("image", "generate", "dall-e", "ai", "art"),
-        requires_config=("OPENAI_API_KEY",),
+        id="todo-planner",
+        name="Todo Planner",
+        description="Turn a rough task list into a practical prioritized plan for today or this week.",
+        category="Planning",
+        icon="✅",
+        tags=("tasks", "planning", "priorities", "todo"),
         input_schema={
             "type": "object",
             "properties": {
-                "prompt": {"type": "string", "description": "Description of the image to generate"},
-                "size": {"type": "string", "enum": ["256x256", "512x512", "1024x1024"], "default": "512x512"},
-                "style": {"type": "string", "enum": ["vivid", "natural"], "default": "vivid"},
-                "output_path": {"type": "string", "description": "Where to save the image"},
+                "tasks": {"type": "string", "description": "Freeform task list"},
+                "horizon": {"type": "string", "enum": ["today", "week"], "default": "today"},
             },
-            "required": ["prompt"],
+            "required": ["tasks"],
         },
         output_schema={
             "type": "object",
-            "properties": {
-                "url": {"type": "string"},
-                "file_path": {"type": "string"},
-            },
+            "properties": {"plan": {"type": "string"}},
         },
-        example_input={"prompt": "A futuristic city at sunset", "size": "1024x1024"},
-        example_output='{"url": "https://...", "file_path": "/tmp/image.png"}',
+        example_input={"tasks": "pay bills, finish report, call doctor, buy groceries", "horizon": "today"},
+        example_output='{"plan": "Top priorities for today: ..."}',
+        core=True,
+    ),
+    CatalogSkill(
+        id="travel-helper",
+        name="Travel Helper",
+        description="Create a simple travel brief, checklist, and next steps for a trip or route.",
+        category="Travel",
+        icon="🧳",
+        tags=("travel", "trip", "itinerary", "checklist"),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "request": {"type": "string", "description": "Trip details or travel question"},
+                "origin": {"type": "string"},
+                "destination": {"type": "string"},
+                "date": {"type": "string", "description": "Travel date if known"},
+            },
+            "required": ["request"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"summary": {"type": "string"}, "travel_data": {"type": "object"}},
+        },
+        example_input={"request": "Plan a simple weekend trip from Boston to New York by train", "origin": "Boston", "destination": "New York"},
+        example_output='{"summary": "Best train options ...", "travel_data": {"source": "planner"}}',
+        core=True,
+    ),
+    CatalogSkill(
+        id="message-draft",
+        name="Message Draft",
+        description="Draft a message for email, WhatsApp, Telegram, or Slack without sending it.",
+        category="Communication",
+        icon="💬",
+        tags=("message", "draft", "email", "chat"),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "enum": ["email", "whatsapp", "telegram", "slack"], "default": "email"},
+                "recipient": {"type": "string", "description": "Who the message is for"},
+                "goal": {"type": "string", "description": "What the message should achieve"},
+                "tone": {"type": "string", "default": "clear and polite"},
+                "context": {"type": "string", "description": "Optional background details"},
+            },
+            "required": ["recipient", "goal"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {"draft": {"type": "string"}},
+        },
+        example_input={"channel": "email", "recipient": "team", "goal": "reschedule tomorrow's meeting", "tone": "friendly"},
+        example_output="{\"draft\": \"Hi team, I need to move tomorrow's meeting ...\"}",
+        core=True,
     ),
 )
 

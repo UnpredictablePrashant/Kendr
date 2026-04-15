@@ -1,4 +1,5 @@
 import React, { useMemo, useState, useCallback } from 'react'
+import GitDiffPreview from '../components/GitDiffPreview'
 import { useApp } from '../contexts/AppContext'
 import { isPlanApprovalScope, isSkillApproval, summarizeRunArtifacts } from '../lib/runPresentation'
 
@@ -59,6 +60,7 @@ export default function RunPanel() {
   const [newName, setNewName] = useState('')
   const [newCmd, setNewCmd] = useState('')
   const [newCwd, setNewCwd] = useState('')
+  const [diffPreviewPath, setDiffPreviewPath] = useState('')
   const [running, setRunning] = useState(null)
 
   const activityFeed = Array.isArray(state.activityFeed) ? state.activityFeed : []
@@ -118,11 +120,22 @@ export default function RunPanel() {
     if (!filePath) return
     await openFile(filePath)
   }, [openFile])
+  const reviewActivityItem = useCallback((item) => {
+    const filePath = String(item?.path || '').trim()
+    if (!filePath) return
+    setDiffPreviewPath(filePath)
+  }, [])
 
   const activityItems = useMemo(() => activityFeed.slice(0, 10), [activityFeed])
 
   return (
     <div className="rp-root">
+      <GitDiffPreview
+        cwd={state.projectRoot}
+        filePath={diffPreviewPath}
+        onClose={() => setDiffPreviewPath('')}
+        onOpenFile={(filePath) => openActivityItem({ path: filePath })}
+      />
       <div className="rp-header">
         <span className="rp-title">Activity</span>
         <div className="rp-header-actions">
@@ -179,7 +192,7 @@ export default function RunPanel() {
                               <div className="kc-activity-card-title">{card.title}</div>
                             </div>
                             {card.kind === 'edit' && Array.isArray(card.items) && card.items.some((item) => item?.path) && (
-                              <button className="kc-activity-card-action" onClick={() => openActivityItem(card.items.find((item) => item?.path))}>
+                              <button className="kc-activity-card-action" onClick={() => reviewActivityItem(card.items.find((item) => item?.path))}>
                                 Review
                               </button>
                             )}

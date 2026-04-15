@@ -25,6 +25,7 @@ class FailureCheckpoint(TypedDict, total=False):
 
 
 class RuntimeState(TypedDict, total=False):
+    db_path: str
     run_id: str
     workflow_id: str
     attempt_id: str
@@ -40,8 +41,15 @@ class RuntimeState(TypedDict, total=False):
     plan_step_index: int
     current_plan_step_id: str
     current_plan_step_title: str
+    orchestration_plan_id: str
+    orchestration_plan_version: int
     last_completed_plan_step_id: str
     last_completed_plan_step_title: str
+    intent_signature: str
+    selected_intent_id: str
+    selected_intent_type: str
+    selected_intent: dict[str, Any]
+    intent_candidates: list[dict[str, Any]]
     plan_needs_clarification: bool
     plan_waiting_for_approval: bool
     plan_approval_status: str

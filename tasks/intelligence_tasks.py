@@ -69,6 +69,22 @@ AGENT_METADATA = {
 }
 
 
+def _is_duplicate_filename_objective(text: str) -> bool:
+    normalized = str(text or "").lower()
+    if "duplicate" not in normalized:
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "same name",
+            "file name",
+            "filename",
+            "duplicate files",
+            "duplicate file",
+        )
+    )
+
+
 def _safe_json_filename(agent_name: str, call_number: int) -> str:
     return f"{agent_name}_{call_number}.json"
 
@@ -651,6 +667,87 @@ def local_drive_agent(state):
         ),
         "\n".join(files[:20]),
     )
+
+    if _is_duplicate_filename_objective(objective):
+        file_entries = manifest.get("files") if isinstance(manifest.get("files"), list) else []
+        grouped: dict[str, dict] = {}
+        for entry in file_entries:
+            if not isinstance(entry, dict):
+                continue
+            path_value = str(entry.get("path", "") or "").strip()
+            name_value = str(entry.get("name", "") or "").strip()
+            if not path_value:
+                continue
+            file_name = name_value or Path(path_value).name
+            key = file_name.lower()
+            group = grouped.get(key)
+            if group is None:
+                group = {"name": file_name, "paths": []}
+                grouped[key] = group
+            group["paths"].append(path_value)
+
+        duplicate_groups = [
+            {"name": item["name"], "count": len(item["paths"]), "paths": sorted(item["paths"])}
+            for item in grouped.values()
+            if len(item.get("paths", [])) > 1
+        ]
+        duplicate_groups.sort(key=lambda item: (-int(item["count"]), str(item["name"]).lower()))
+        duplicate_file_count = sum(int(item["count"]) for item in duplicate_groups)
+
+        summary_lines = [
+            "Duplicate Filename Report",
+            f"- Scan roots: {', '.join(roots)}",
+            f"- Total discovered files: {manifest.get('file_count', 0)}",
+            f"- Duplicate filename groups: {len(duplicate_groups)}",
+            f"- Files participating in duplicate groups: {duplicate_file_count}",
+            "",
+        ]
+        if duplicate_groups:
+            summary_lines.append("Groups")
+            for item in duplicate_groups[:100]:
+                summary_lines.append(f"- {item['name']} ({item['count']})")
+                for path_value in item["paths"][:20]:
+                    summary_lines.append(f"  - {path_value}")
+        else:
+            summary_lines.append("No duplicate filenames found in scanned scope.")
+        final_summary = "\n".join(summary_lines)
+
+        payload = {
+            "roots": roots,
+            "recursive": recursive,
+            "max_files": max_files,
+            "files": files,
+            "manifest": manifest,
+            "handler_registry": handler_registry,
+            "handler_routes": handler_routes,
+            "unknown_extensions": unknown_extensions,
+            "duplicate_name_groups": duplicate_groups,
+            "catalog": {
+                "file_count": manifest.get("file_count", 0),
+                "duplicate_group_count": len(duplicate_groups),
+                "duplicate_file_count": duplicate_file_count,
+            },
+        }
+        _write_agent_artifacts("local_drive_agent", call_number, final_summary, payload)
+
+        state["local_drive_files"] = files
+        state["local_drive_manifest"] = manifest
+        state["local_drive_documents"] = []
+        state["local_drive_document_summaries"] = []
+        state["local_drive_summary_bank"] = {}
+        state["local_drive_catalog"] = payload["catalog"]
+        state["local_drive_duplicate_name_groups"] = duplicate_groups
+        state["local_drive_rollup_summary"] = ""
+        state["local_drive_summary"] = final_summary
+        state["document_summary"] = final_summary
+        state["draft_response"] = final_summary
+        return publish_agent_output(
+            state,
+            "local_drive_agent",
+            final_summary,
+            f"local_drive_result_{call_number}",
+            recipients=["orchestrator_agent", "worker_agent", "reviewer_agent", "report_agent"],
+        )
 
     documents = []
     document_summaries = []

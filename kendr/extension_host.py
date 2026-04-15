@@ -516,6 +516,8 @@ def _perform_http_request(
 
 
 def _run_web_search(query: str, num_results: int, *, permissions: dict | None = None, approval: dict | None = None) -> dict:
+    from tasks.research_infra import fetch_search_results
+
     manifest = normalize_permission_manifest(permissions, skill_type="catalog", catalog_id="web-search")
     _ensure_network_allowed(
         manifest,
@@ -523,28 +525,18 @@ def _run_web_search(query: str, num_results: int, *, permissions: dict | None = 
         url="https://api.duckduckgo.com/",
         capability="Web search skill",
     )
-    params = urllib_parse.urlencode(
-        {
-            "q": str(query or "").strip(),
-            "format": "json",
-            "no_redirect": 1,
-        }
-    )
-    url = f"https://api.duckduckgo.com/?{params}"
-    request = urllib_request.Request(url, headers={"Accept": "application/json"}, method="GET")
-    with urllib_request.urlopen(request, timeout=10) as response:
-        payload = json.loads(response.read().decode("utf-8", errors="replace"))
-    results = []
-    for topic in (payload.get("RelatedTopics") or [])[: max(1, int(num_results or 5))]:
-        if isinstance(topic, dict) and topic.get("Text"):
-            results.append(
-                {
-                    "title": topic.get("Text", ""),
-                    "url": topic.get("FirstURL", ""),
-                    "snippet": topic.get("Text", ""),
-                }
-            )
-    return {"query": str(query or "").strip(), "results": results}
+    payload = fetch_search_results(str(query or "").strip(), num=max(1, int(num_results or 5)), fetch_pages=0)
+    return {
+        "query": str(query or "").strip(),
+        "results": list(payload.get("results", []) or []),
+        "provider": str(payload.get("provider", "") or "").strip(),
+        "providers_tried": list(payload.get("providers_tried", []) or []),
+        "source_surface": (
+            "mcp:browser-use/browser_extract_content"
+            if str(payload.get("provider", "") or "").strip() == "browser_use_mcp"
+            else ("skill:web-search:serpapi" if str(payload.get("provider", "") or "").strip() == "serpapi" else "skill:web-search")
+        ),
+    }
 
 
 def _run_desktop_automation(

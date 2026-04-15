@@ -899,7 +899,24 @@ def delete_chat_session(
     if run_ids:
         placeholders = ",".join("?" * len(run_ids))
         with _connect(db_path) as conn:
-            for table in ("run_checkpoints", "artifacts", "agent_executions", "messages", "tasks"):
+            try:
+                conn.execute(
+                    f"DELETE FROM task_dependencies WHERE plan_id IN (SELECT plan_id FROM execution_plans WHERE run_id IN ({placeholders}))",
+                    run_ids,
+                )
+            except Exception:
+                pass
+            for table in (
+                "run_checkpoints",
+                "artifacts",
+                "agent_executions",
+                "messages",
+                "tasks",
+                "orchestration_events",
+                "plan_tasks",
+                "execution_plans",
+                "intent_candidates",
+            ):
                 conn.execute(f"DELETE FROM {table} WHERE run_id IN ({placeholders})", run_ids)
             try:
                 conn.execute(f"DELETE FROM task_sessions WHERE run_id IN ({placeholders})", run_ids)
@@ -942,7 +959,24 @@ def delete_run(
             errors.append(str(exc))
 
     with _connect(db_path) as conn:
-        for table in ("run_checkpoints", "artifacts", "agent_executions", "messages", "tasks"):
+        try:
+            conn.execute(
+                "DELETE FROM task_dependencies WHERE plan_id IN (SELECT plan_id FROM execution_plans WHERE run_id = ?)",
+                (run_id,),
+            )
+        except Exception:
+            pass
+        for table in (
+            "run_checkpoints",
+            "artifacts",
+            "agent_executions",
+            "messages",
+            "tasks",
+            "orchestration_events",
+            "plan_tasks",
+            "execution_plans",
+            "intent_candidates",
+        ):
             try:
                 conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))
             except Exception:

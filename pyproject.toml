@@ -49,6 +49,7 @@ dependencies = [
   "chromadb>=0.5",
   # MCP protocol
   "fastmcp>=0.9",
+  "browser-use[cli]>=0.1.40",
   # Terminal output
   "rich>=13.0",
 ]

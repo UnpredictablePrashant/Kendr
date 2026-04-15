@@ -1,5 +1,6 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { DiffEditor } from '@monaco-editor/react'
+import GitDiffPreview from '../components/GitDiffPreview'
 import { useApp } from '../contexts/AppContext'
 import { basename, resolveSelectedModel } from '../lib/modelSelection'
 import { buildActivityEntry, extractChecklist, isPlanApprovalScope, isSkillApproval, shouldMirrorActivityMessage, summarizeRunArtifacts } from '../lib/runPresentation'
@@ -32,6 +33,7 @@ export default function AIComposer({ editorInstanceRef }) {
   const { state: app, dispatch: appDispatch, openFile, refreshModelInventory } = useApp()
   const [mode, setMode]             = useState('agent')  // agent | plan | chat | edit
   const [messages, setMessages]     = useState([])
+  const [diffPreviewPath, setDiffPreviewPath] = useState('')
   const [input, setInput]           = useState('')
   const [streaming, setStreaming]   = useState(false)
   const [awaitingContext, setAwaitingContext] = useState(null)
@@ -247,6 +249,11 @@ export default function AIComposer({ editorInstanceRef }) {
     if (!filePath) return
     await openFile(filePath)
   }, [openFile])
+  const reviewArtifact = useCallback((item) => {
+    const filePath = String(item?.path || '').trim()
+    if (!filePath) return
+    setDiffPreviewPath(filePath)
+  }, [])
 
   const buildContextPrompt = useCallback((userText) => {
     let ctx = userText
@@ -528,6 +535,12 @@ Return ONLY the complete modified code in a single code block. No explanation.`
   // ── RENDER ───────────────────────────────────────────────────────────────────
   return (
     <div className="ac-panel">
+      <GitDiffPreview
+        cwd={app.projectRoot}
+        filePath={diffPreviewPath}
+        onClose={() => setDiffPreviewPath('')}
+        onOpenFile={(filePath) => openArtifact({ path: filePath })}
+      />
 
       {/* Apply diff overlay — full panel takeover */}
       {applyDiff && (
@@ -633,7 +646,7 @@ Return ONLY the complete modified code in a single code block. No explanation.`
                         {msg.steps?.length > 0 && (
                           <AgentSteps steps={msg.steps} live={streaming && msg.status !== 'done' && msg.status !== 'error'} />
                         )}
-                        <ComposerActivityCards progress={msg.progress} artifacts={msg.artifacts} onOpenItem={openArtifact} />
+                        <ComposerActivityCards progress={msg.progress} artifacts={msg.artifacts} onOpenItem={openArtifact} onReviewItem={reviewArtifact} />
                         {msg.checklist?.length > 0 && (msg.mode === 'plan' || isPlanApprovalScope(msg.approvalScope, msg.approvalKind, msg.approvalRequest)) && (
                           <ComposerPlanCard
                             msg={msg}
@@ -824,7 +837,7 @@ function AgentSteps({ steps, live }) {
   )
 }
 
-function ComposerActivityCards({ progress, artifacts, onOpenItem }) {
+function ComposerActivityCards({ progress, artifacts, onOpenItem, onReviewItem }) {
   const cards = summarizeRunArtifacts(progress, artifacts)
   if (!cards.length) return null
   return (
@@ -837,7 +850,7 @@ function ComposerActivityCards({ progress, artifacts, onOpenItem }) {
               <div className="kc-activity-card-title">{card.title}</div>
             </div>
             {card.kind === 'edit' && Array.isArray(card.items) && card.items.some((item) => item?.path) && (
-              <button className="kc-activity-card-action" onClick={() => onOpenItem?.(card.items.find((item) => item?.path))}>
+              <button className="kc-activity-card-action" onClick={() => onReviewItem?.(card.items.find((item) => item?.path))}>
                 Review
               </button>
             )}

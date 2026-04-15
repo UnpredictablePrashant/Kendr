@@ -1,9 +1,12 @@
+import json
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 
+from kendr.persistence import initialize_db, list_execution_plans, list_orchestration_events, list_plan_tasks
 from tasks.planning_tasks import normalize_plan_data, planner_agent
 from tasks.utils import model_selection_for_agent, runtime_model_override
 
@@ -225,6 +228,113 @@ class PlanningTaskTests(unittest.TestCase):
         self.assertEqual(selection["provider"], "anthropic")
         self.assertEqual(selection["model"], "claude-sonnet-test")
         self.assertEqual(selection["source"], "runtime_override")
+
+    def test_planner_agent_persists_execution_plan_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "workflow.sqlite3")
+            initialize_db(db_path)
+            state = {
+                "run_id": "run-plan-1",
+                "db_path": db_path,
+                "selected_intent_id": "intent-1",
+                "user_query": "Build a deployment plan.",
+                "current_objective": "Build a deployment plan.",
+            }
+            planner_payload = json.dumps(
+                {
+                    "summary": "Deployment plan",
+                    "steps": [
+                        {
+                            "id": "step-1",
+                            "title": "Prepare manifests",
+                            "agent": "worker_agent",
+                            "task": "Prepare the deployment manifests.",
+                            "success_criteria": "Deployment manifests are ready.",
+                        },
+                        {
+                            "id": "step-2",
+                            "title": "Run verification",
+                            "agent": "worker_agent",
+                            "task": "Run verification checks.",
+                            "depends_on": ["step-1"],
+                            "success_criteria": "Verification checks pass.",
+                        },
+                    ],
+                }
+            )
+
+            with (
+                patch("tasks.planning_tasks.begin_agent_session", return_value=("", state["user_query"], "")),
+                patch("tasks.planning_tasks.log_task_update"),
+                patch("tasks.planning_tasks.write_text_file"),
+                patch("tasks.planning_tasks.update_planning_file"),
+                patch("tasks.planning_tasks.publish_agent_output", side_effect=lambda current_state, *_args, **_kwargs: current_state),
+                patch("tasks.planning_tasks.model_selection_for_agent", return_value={"provider": "openai", "model": "gpt-4o-mini", "source": "OPENAI_MODEL_GENERAL"}),
+                patch("tasks.planning_tasks.provider_status", return_value={"provider": "openai", "ready": True, "note": "", "base_url": "", "model": "gpt-4o-mini"}),
+                patch("tasks.planning_tasks.llm.invoke", return_value=planner_payload),
+            ):
+                result = planner_agent(state)
+
+            plans = list_execution_plans("run-plan-1", db_path=db_path)
+            steps = list_plan_tasks(plan_id=result["orchestration_plan_id"], db_path=db_path)
+            events = list_orchestration_events("run-plan-1", db_path=db_path)
+
+            self.assertEqual(len(plans), 1)
+            self.assertEqual(plans[0]["intent_id"], "intent-1")
+            self.assertEqual(plans[0]["status"], "awaiting_approval")
+            self.assertEqual(plans[0]["approval_status"], "pending")
+            self.assertEqual(len(steps), 2)
+            self.assertEqual(steps[1]["depends_on"], ["step-1"])
+            self.assertEqual(events[-1]["event_type"], "plan.generated")
+            self.assertEqual(result["orchestration_plan_version"], 1)
+
+    def test_planner_auto_approves_conservative_read_only_plan(self):
+        state = {
+            "run_id": "run-plan-read-only",
+            "db_path": "",
+            "user_query": "Research the local evidence and summarize it.",
+            "current_objective": "Research the local evidence and summarize it.",
+        }
+        planner_payload = json.dumps(
+            {
+                "summary": "Inspect and summarize the available evidence.",
+                "steps": [
+                    {
+                        "id": "step-1",
+                        "title": "Catalog files",
+                        "agent": "local_drive_agent",
+                        "task": "Catalog the local files and extract the relevant evidence.",
+                        "success_criteria": "A file catalog exists.",
+                    },
+                    {
+                        "id": "step-2",
+                        "title": "Research findings",
+                        "agent": "people_research_agent",
+                        "task": "Research and summarize the evidence from the collected notes.",
+                        "depends_on": ["step-1"],
+                        "success_criteria": "A concise findings summary exists.",
+                    },
+                ],
+            }
+        )
+
+        with (
+            patch("tasks.planning_tasks.begin_agent_session", return_value=("", state["user_query"], "")),
+            patch("tasks.planning_tasks.log_task_update"),
+            patch("tasks.planning_tasks.write_text_file"),
+            patch("tasks.planning_tasks.update_planning_file"),
+            patch("tasks.planning_tasks.publish_agent_output", side_effect=lambda current_state, *_args, **_kwargs: current_state),
+            patch("tasks.planning_tasks.model_selection_for_agent", return_value={"provider": "openai", "model": "gpt-4o-mini", "source": "OPENAI_MODEL_GENERAL"}),
+            patch("tasks.planning_tasks.provider_status", return_value={"provider": "openai", "ready": True, "note": "", "base_url": "", "model": "gpt-4o-mini"}),
+            patch("tasks.planning_tasks.llm.invoke", return_value=planner_payload),
+        ):
+            result = planner_agent(state)
+
+        self.assertTrue(result["plan_ready"])
+        self.assertFalse(result["plan_waiting_for_approval"])
+        self.assertEqual(result["plan_approval_status"], "approved")
+        self.assertEqual(result["plan_steps"][0]["side_effect_level"], "read_only")
+        self.assertEqual(result["plan_steps"][1]["side_effect_level"], "read_only")
 
 
 if __name__ == "__main__":

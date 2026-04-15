@@ -71,7 +71,7 @@ Return ONLY valid JSON in this exact schema:
   "module_name": "python_module_name",
   "function_name": "python_function_name",
   "description": "short description",
-  "skills": ["skill 1", "skill 2"],
+  "skills": ["capability keyword", "secondary keyword"],
   "input_keys": ["state_input_key"],
   "output_keys": ["state_output_key"],
   "primary_input_key": "main state key this agent should read",

@@ -304,7 +304,11 @@ ipcMain.handle('git:status', async (_, cwd) => {
 
 ipcMain.handle('git:diff', async (_, cwd, filePath) => {
   try {
-    const out = await runGit(cwd, filePath ? `diff HEAD -- "${filePath}"` : 'diff HEAD')
+    const target = String(filePath || '').trim()
+    const scopedPath = target
+      ? (path.isAbsolute(target) ? path.relative(cwd, target) : target).replace(/\\/g, '/').replace(/"/g, '\\"')
+      : ''
+    const out = await runGit(cwd, scopedPath ? `diff HEAD -- "${scopedPath}"` : 'diff HEAD')
     return { diff: out }
   } catch (err) {
     return { error: err.message, diff: '' }

@@ -1190,6 +1190,44 @@ class TestUIModelInventory(unittest.TestCase):
         self.assertEqual(body.get("active_provider"), "openai")
         self.assertEqual(body.get("active_model"), "gpt-5.1")
 
+    def test_comparison_rows_expand_per_model_and_family(self):
+        from kendr.ui_server import _comparison_rows_from_provider_statuses
+
+        rows = _comparison_rows_from_provider_statuses([
+            {
+                "provider": "custom",
+                "ready": True,
+                "model": "gpt-4o-mini",
+                "model_family": "openai",
+                "configured_models": ["gpt-4o-mini"],
+                "selectable_model_details": [
+                    {"name": "gpt-4o-mini", "family": "openai", "context_window": 128000, "capabilities": {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": False}, "agent_capable": True},
+                    {"name": "gpt-5.4", "family": "openai", "context_window": 400000, "capabilities": {"tool_calling": True, "vision": True, "structured_output": True, "reasoning": True}, "agent_capable": True},
+                ],
+                "model_badges": {"gpt-5.4": ["latest", "best"], "gpt-4o-mini": ["cheapest"]},
+                "note": "Configured",
+            },
+            {
+                "provider": "ollama",
+                "ready": True,
+                "model": "llama3.2",
+                "model_family": "ollama",
+                "configured_models": ["llama3.2"],
+                "selectable_model_details": [
+                    {"name": "llama3.2", "family": "ollama", "context_window": 131072, "capabilities": {"tool_calling": True, "vision": False, "structured_output": False, "reasoning": False}, "agent_capable": False},
+                    {"name": "mistral", "family": "ollama", "context_window": 32768, "capabilities": {"tool_calling": True, "vision": False, "structured_output": False, "reasoning": False}, "agent_capable": False},
+                ],
+                "model_badges": {},
+                "note": "Running",
+            },
+        ])
+
+        self.assertEqual(len(rows), 4)
+        openai_custom_row = next(row for row in rows if row["source_provider"] == "custom" and row["model"] == "gpt-4o-mini")
+        self.assertEqual(openai_custom_row["provider"], "openai")
+        self.assertTrue(openai_custom_row["selected"])
+        self.assertEqual(openai_custom_row["suggested_latest"], "gpt-5.4")
+
 
 class TestUIMachineDetails(unittest.TestCase):
     def test_machine_details_endpoint_returns_tree_payload(self):

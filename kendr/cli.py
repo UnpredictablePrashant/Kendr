@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
@@ -3072,6 +3073,24 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
     upgrade_parser.add_argument("--pre", action="store_true", help="Include pre-release versions.")
     command_parsers["upgrade"] = upgrade_parser
 
+    update_parser = subparsers.add_parser(
+        "update",
+        help="Alias for upgrade; can also force a fresh reinstall.",
+        description=(
+            "Update Kendr to the latest available version.\n"
+            "By default this behaves like 'kendr upgrade'.\n"
+            "Use --refresh to force reinstall even when already up to date.\n"
+        ),
+    )
+    update_parser.add_argument("--check", action="store_true", help="Check for updates without installing.")
+    update_parser.add_argument("--pre", action="store_true", help="Include pre-release versions.")
+    update_parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force reinstall Kendr for a fresh local rebuild, even if versions match.",
+    )
+    command_parsers["update"] = update_parser
+
     return parser, command_parsers
 
 
@@ -3380,28 +3399,85 @@ def _cmd_upgrade(args: argparse.Namespace) -> int:
     check_only = bool(getattr(args, "check", False))
     pre = bool(getattr(args, "pre", False))
 
-    try:
-        current = importlib.metadata.version("kendr")
-    except importlib.metadata.PackageNotFoundError:
-        current = "dev"
+    def _installed_package_name() -> tuple[str, str, Any | None]:
+        for candidate in ("kendr-runtime", "kendr"):
+            try:
+                return candidate, importlib.metadata.version(candidate), importlib.metadata.distribution(candidate)
+            except importlib.metadata.PackageNotFoundError:
+                continue
+        return "kendr", "dev", None
 
+    def _distribution_local_source(dist_obj: Any | None) -> str:
+        if dist_obj is None:
+            return ""
+        try:
+            direct_url_raw = dist_obj.read_text("direct_url.json") or ""
+            if not direct_url_raw.strip():
+                return ""
+            direct_url = json.loads(direct_url_raw)
+            url = str(direct_url.get("url", "") or "").strip()
+            if not url.startswith("file://"):
+                return ""
+            parsed = urllib.parse.urlparse(url)
+            local_path = urllib.parse.unquote(parsed.path or "")
+            if re.match(r"^/[A-Za-z]:/", local_path):
+                local_path = local_path[1:]
+            if local_path and Path(local_path).exists():
+                return local_path
+        except Exception:
+            return ""
+        return ""
+
+    package_name, current, dist = _installed_package_name()
+    local_source = _distribution_local_source(dist)
+    print(style.muted(f"  Installed pkg:   {package_name}"))
     print(style.muted(f"  Current version: {current}"))
 
-    # Check PyPI for latest
-    try:
-        url = "https://pypi.org/pypi/kendr/json"
-        req = urllib.request.Request(url, headers={"User-Agent": "kendr-cli"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        if pre:
-            all_versions = list(data.get("releases", {}).keys())
-            latest = sorted(all_versions)[-1] if all_versions else data["info"]["version"]
-        else:
-            latest = data["info"]["version"]
-    except Exception as exc:
-        print(style.fail(f"✗ Could not check PyPI: {exc}"))
+    pypi_package = ""
+    latest = ""
+    candidates = [package_name]
+    if package_name != "kendr":
+        candidates.append("kendr")
+    if package_name != "kendr-runtime":
+        candidates.append("kendr-runtime")
+
+    for candidate in candidates:
+        try:
+            url = f"https://pypi.org/pypi/{candidate}/json"
+            req = urllib.request.Request(url, headers={"User-Agent": "kendr-cli"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+            if pre:
+                all_versions = list(data.get("releases", {}).keys())
+                latest = sorted(all_versions)[-1] if all_versions else data["info"]["version"]
+            else:
+                latest = data["info"]["version"]
+            pypi_package = candidate
+            break
+        except Exception:
+            continue
+
+    if not pypi_package:
+        if local_source:
+            print(style.warn("  PyPI update package not found; using local editable source instead."))
+            print(style.muted(f"  Local source:    {local_source}"))
+            if check_only:
+                print(style.ok("✓ Local source install detected. Use 'kendr update --refresh' to rebuild from source."))
+                return 0
+            pre_flag = ["--pre"] if pre else []
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade", "--force-reinstall"] + pre_flag + ["-e", local_source],
+                capture_output=False,
+            )
+            if result.returncode == 0:
+                print(style.ok("\n✓ Reinstalled from local source."))
+                return 0
+            print(style.fail("\n✗ Local source reinstall failed."))
+            return 1
+        print(style.fail("✗ Could not find an update package on PyPI (checked kendr and kendr-runtime)."))
         return 1
 
+    print(style.muted(f"  Update pkg:      {pypi_package}"))
     print(style.muted(f"  Latest version:  {latest}"))
 
     if current == latest:
@@ -3416,15 +3492,93 @@ def _cmd_upgrade(args: argparse.Namespace) -> int:
     print(style.muted(f"  Upgrading {current} → {latest}…"))
     pre_flag = ["--pre"] if pre else []
     result = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--upgrade"] + pre_flag + ["kendr"],
+        [sys.executable, "-m", "pip", "install", "--upgrade"] + pre_flag + [pypi_package],
         capture_output=False,
     )
     if result.returncode == 0:
-        print(style.ok(f"\n✓ Upgraded to kendr {latest}"))
+        print(style.ok(f"\n✓ Upgraded {pypi_package} to {latest}"))
         return 0
     else:
-        print(style.fail("\n✗ Upgrade failed. Try: pip install --upgrade kendr"))
+        print(style.fail(f"\n✗ Upgrade failed. Try: pip install --upgrade {pypi_package}"))
         return 1
+
+
+def _cmd_update(args: argparse.Namespace) -> int:
+    """'kendr update' — upgrade alias with optional force-refresh reinstall."""
+    style = _style_from_args(args)
+    check_only = bool(getattr(args, "check", False))
+    pre = bool(getattr(args, "pre", False))
+    refresh = bool(getattr(args, "refresh", False))
+
+    if not refresh:
+        return _cmd_upgrade(args)
+
+    # Refresh mode: always force reinstall for a clean rebuild of the local package install.
+    if check_only:
+        print(style.warn("  --check with --refresh performs check only; no reinstall performed."))
+        return _cmd_upgrade(args)
+
+    package_name = "kendr-runtime"
+    dist = None
+    try:
+        dist = importlib.metadata.distribution(package_name)
+    except importlib.metadata.PackageNotFoundError:
+        package_name = "kendr"
+        try:
+            dist = importlib.metadata.distribution(package_name)
+        except importlib.metadata.PackageNotFoundError:
+            dist = None
+
+    local_source = ""
+    if dist is not None:
+        try:
+            direct_url_raw = dist.read_text("direct_url.json") or ""
+            if direct_url_raw.strip():
+                direct_url = json.loads(direct_url_raw)
+                url = str(direct_url.get("url", "") or "").strip()
+                if url.startswith("file://"):
+                    parsed = urllib.parse.urlparse(url)
+                    local_path = urllib.parse.unquote(parsed.path or "")
+                    if re.match(r"^/[A-Za-z]:/", local_path):
+                        local_path = local_path[1:]
+                    if local_path and Path(local_path).exists():
+                        local_source = local_path
+        except Exception:
+            local_source = ""
+
+    print(style.muted("  Running fresh Kendr reinstall (refresh mode)…"))
+    pre_flag = ["--pre"] if pre else []
+    if local_source:
+        print(style.muted(f"  Refresh source:   {local_source} (editable/local)"))
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+        ] + pre_flag + ["-e", local_source]
+    else:
+        print(style.muted(f"  Refresh package:  {package_name} (PyPI)"))
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+        ] + pre_flag + [package_name]
+    result = subprocess.run(cmd, capture_output=False)
+    if result.returncode == 0:
+        print(style.ok("\n✓ Refresh install complete."))
+        print(style.muted("  Next: run 'kendr doctor --fix' to validate local dependencies."))
+        return 0
+    print(
+        style.fail(
+            f"\n✗ Refresh install failed. Try: pip install --upgrade --force-reinstall {package_name}"
+        )
+    )
+    return 1
 
 
 def _render_test_report(report: dict, style: "_CliStyle") -> str:
@@ -7474,6 +7628,8 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_clean(args)
         if args.command == "upgrade":
             return _cmd_upgrade(args)
+        if args.command == "update":
+            return _cmd_update(args)
         raise SystemExit(f"Unknown command: {args.command}")
     except KeyboardInterrupt:
         print("\nQuit")

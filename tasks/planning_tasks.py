@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from kendr.llm_router import provider_status
+from kendr.orchestration import annotate_plan_steps, plan_is_read_only
+from kendr.persistence import insert_orchestration_event, replace_plan_tasks, upsert_execution_plan
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.file_memory import update_planning_file
 from tasks.security_policy import is_security_assessment_query
@@ -17,6 +19,68 @@ _SECURITY_PLAN_AGENT_PREFERENCE = [
     "security_report_agent",
     "security_scanner_agent",
 ]
+
+
+def _planner_db_path(state: dict[str, Any]) -> str:
+    return str(state.get("db_path", "") or "").strip()
+
+
+def _persist_plan_snapshot(
+    state: dict[str, Any],
+    *,
+    plan_id: str,
+    plan_version: int,
+    plan_md: str,
+    plan_data: dict[str, Any],
+    planning_status: str,
+    execution_note: str,
+) -> None:
+    run_id = str(state.get("run_id", "")).strip()
+    if not run_id:
+        return
+    db_path = _planner_db_path(state)
+    upsert_execution_plan(
+        plan_id,
+        run_id=run_id,
+        intent_id=str(state.get("selected_intent_id", "")).strip(),
+        version=plan_version,
+        status=planning_status,
+        approval_status=str(state.get("plan_approval_status", "")).strip() or "not_started",
+        needs_clarification=bool(state.get("plan_needs_clarification", False)),
+        objective=str(state.get("current_objective", state.get("user_query", ""))).strip(),
+        summary=str(plan_data.get("summary", "")).strip(),
+        plan_markdown=plan_md,
+        plan_data=plan_data,
+        metadata={
+            "execution_note": execution_note,
+            "clarification_questions": list(plan_data.get("clarification_questions", []) or []),
+        },
+        db_path=db_path,
+    )
+    replace_plan_tasks(
+        plan_id,
+        run_id,
+        list(plan_data.get("execution_steps", plan_data.get("steps", [])) or []),
+        db_path=db_path,
+    )
+    insert_orchestration_event(
+        {
+            "run_id": run_id,
+            "plan_id": plan_id,
+            "subject_type": "plan",
+            "subject_id": plan_id,
+            "event_type": "plan.generated",
+            "status": planning_status,
+            "source": "planner_agent",
+            "payload": {
+                "plan_version": plan_version,
+                "step_count": len(plan_data.get("execution_steps", plan_data.get("steps", [])) or []),
+                "approval_status": state.get("plan_approval_status", ""),
+                "needs_clarification": bool(state.get("plan_needs_clarification", False)),
+            },
+        },
+        db_path=db_path,
+    )
 
 
 def _planner_provider_snapshot() -> dict[str, str]:
@@ -147,8 +211,11 @@ def _normalize_step(item: dict[str, Any], objective: str, index: int, parent_id:
         "depends_on": _as_str_list(item.get("depends_on", [])),
         "parallel_group": str(item.get("parallel_group") or "").strip(),
         "success_criteria": str(item.get("success_criteria") or "").strip(),
+        "rationale": str(item.get("rationale") or "").strip(),
         "llm_model": llm_model,
         "model_source": model_source,
+        "side_effect_level": str(item.get("side_effect_level") or "").strip(),
+        "conflict_keys": _as_str_list(item.get("conflict_keys", [])),
         "substeps": substeps,
         "status": str(item.get("status") or "pending"),
         "started_at": item.get("started_at") or None,
@@ -314,7 +381,7 @@ def normalize_plan_data(raw_plan: Any, objective: str) -> dict[str, Any]:
     execution_steps = _collect_execution_steps(steps)
     if not execution_steps:
         execution_steps = [_normalize_step(fallback["steps"][0], objective, 1)]
-    plan_data["execution_steps"] = execution_steps
+    plan_data["execution_steps"] = annotate_plan_steps(execution_steps)
     plan_data["model_assignments"] = _collect_model_assignments(steps)
     return plan_data
 
@@ -560,6 +627,8 @@ Return ONLY valid JSON in this exact schema (no extra fields, no markdown, no ex
     state["plan_steps"] = plan_data.get("execution_steps", plan_data.get("steps", []))
     state["plan_step_index"] = 0
     state["plan_version"] = plan_version
+    state["orchestration_plan_id"] = f"{state.get('run_id', '')}:plan:v{plan_version}" if str(state.get("run_id", "")).strip() else ""
+    state["orchestration_plan_version"] = plan_version
     state["plan_ready"] = False
     state["plan_needs_clarification"] = bool(plan_data.get("needs_clarification", False))
     state["plan_clarification_questions"] = questions
@@ -587,7 +656,14 @@ Return ONLY valid JSON in this exact schema (no extra fields, no markdown, no ex
         planning_status = "needs_clarification"
         execution_note = f"Plan version {plan_version} needs clarification."
     else:
-        auto_approve = bool(state.get("auto_approve")) or bool(state.get("auto_approve_plan"))
+        auto_approve = (
+            bool(state.get("auto_approve"))
+            or bool(state.get("auto_approve_plan"))
+            or (
+                bool(state.get("auto_approve_read_only_plans", True))
+                and plan_is_read_only(plan_data.get("execution_steps", plan_data.get("steps", [])) or [])
+            )
+        )
         plan_steps = plan_data.get("execution_steps", plan_data.get("steps", []))
         plan_json_response = json.dumps({
             "type": "plan_approval",
@@ -626,6 +702,17 @@ Return ONLY valid JSON in this exact schema (no extra fields, no markdown, no ex
             state["draft_response"] = plan_json_response
             planning_status = "awaiting_approval"
             execution_note = f"Plan version {plan_version} generated and queued for approval."
+
+    if state.get("orchestration_plan_id"):
+        _persist_plan_snapshot(
+            state,
+            plan_id=str(state.get("orchestration_plan_id", "")).strip(),
+            plan_version=plan_version,
+            plan_md=plan_md,
+            plan_data=plan_data,
+            planning_status=planning_status,
+            execution_note=execution_note,
+        )
 
     write_text_file("planner_output.txt", plan_md + "\n")
     write_text_file("planner_output.json", json.dumps(plan_data, indent=2, ensure_ascii=False))

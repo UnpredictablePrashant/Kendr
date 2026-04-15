@@ -5,13 +5,26 @@ from tempfile import TemporaryDirectory
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-from tasks.research_infra import fetch_search_results, parse_document, parse_documents
+from tasks.research_infra import fetch_search_results, llm_text, parse_document, parse_documents
 
 
 class ResearchInfraTests(unittest.TestCase):
+    def test_llm_text_sanitizes_unpaired_surrogates_before_invoke(self):
+        bad_prompt = "bad-\ud83c-prompt"
+
+        with patch("tasks.research_infra.llm.invoke", return_value=MagicMock(content="ok")) as mock_invoke:
+            result = llm_text(bad_prompt, max_retries=1)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(mock_invoke.call_count, 1)
+        called_prompt = mock_invoke.call_args.args[0]
+        self.assertNotIn("\ud83c", called_prompt)
+        self.assertIn("\uFFFD", called_prompt)
+
     def test_fetch_search_results_falls_back_to_duckduckgo_and_fetches_evidence(self):
         with (
-            patch("tasks.research_infra.serp_search", side_effect=RuntimeError("no serp")),
+            patch.dict(os.environ, {"SERP_API_KEY": "", "KENDR_BROWSER_USE_SEARCH_ENABLED": "0"}, clear=False),
+            patch("tasks.research_infra._browser_use_server_enabled", return_value=False),
             patch(
                 "tasks.research_infra.duckduckgo_html_search",
                 return_value={
@@ -34,24 +47,24 @@ class ResearchInfraTests(unittest.TestCase):
             result = fetch_search_results("fallback query", num=3, fetch_pages=1)
 
         self.assertEqual(result["provider"], "duckduckgo_html")
-        self.assertEqual(result["providers_tried"], ["serpapi", "duckduckgo_html"])
+        self.assertEqual(result["providers_tried"], ["duckduckgo_html"])
         self.assertEqual(result["results"][0]["url"], "https://example.com/a")
         self.assertEqual(result["viewed_pages"][0]["url"], "https://example.com/a")
         self.assertIn("evidence body", result["viewed_pages"][0]["excerpt"])
 
-    def test_fetch_search_results_falls_back_to_browser_when_free_search_fails(self):
+    def test_fetch_search_results_uses_browser_use_before_free_search_when_serpapi_missing(self):
         with (
-            patch("tasks.research_infra.serp_search", side_effect=RuntimeError("no serp")),
-            patch("tasks.research_infra.duckduckgo_html_search", side_effect=RuntimeError("no ddg")),
+            patch.dict(os.environ, {"SERP_API_KEY": "", "KENDR_BROWSER_USE_SEARCH_ENABLED": "1"}, clear=False),
+            patch("tasks.research_infra._browser_use_server_enabled", return_value=True),
             patch(
-                "tasks.research_infra.browser_search",
+                "tasks.research_infra.browser_use_search",
                 return_value={
                     "results": [
                         {
-                            "title": "Browser result",
+                            "title": "Browser Use result",
                             "url": "https://example.com/b",
                             "snippet": "snippet b",
-                            "source": "DuckDuckGo browser",
+                            "source": "browser-use MCP",
                             "date": "",
                         }
                     ]
@@ -64,9 +77,33 @@ class ResearchInfraTests(unittest.TestCase):
         ):
             result = fetch_search_results("browser fallback", num=2, fetch_pages=1)
 
-        self.assertEqual(result["provider"], "playwright_browser")
-        self.assertEqual(result["providers_tried"], ["serpapi", "duckduckgo_html", "playwright_browser"])
+        self.assertEqual(result["provider"], "browser_use_mcp")
+        self.assertEqual(result["providers_tried"], ["browser_use_mcp"])
         self.assertEqual(result["results"][0]["url"], "https://example.com/b")
+
+    def test_fetch_search_results_prefers_serpapi_when_enabled(self):
+        with (
+            patch.dict(os.environ, {"SERP_API_KEY": "test-key", "KENDR_BROWSER_USE_SEARCH_ENABLED": "1"}, clear=False),
+            patch(
+                "tasks.research_infra.serp_search",
+                return_value={
+                    "organic_results": [
+                        {"title": "Serp result", "link": "https://example.com/serp", "snippet": "serp snippet", "source": "Google"},
+                    ]
+                },
+            ),
+            patch("tasks.research_infra._browser_use_server_enabled", return_value=True),
+            patch("tasks.research_infra.browser_use_search") as mock_browser_use,
+            patch(
+                "tasks.research_infra.fetch_url_content",
+                return_value={"content_type": "text/html", "text": "serp evidence"},
+            ),
+        ):
+            result = fetch_search_results("serp first", num=2, fetch_pages=1)
+
+        self.assertEqual(result["provider"], "serpapi")
+        self.assertEqual(result["providers_tried"], ["serpapi"])
+        self.assertFalse(mock_browser_use.called)
 
     def test_parse_document_uses_excel_pdf_fallback_when_primary_read_fails(self):
         with TemporaryDirectory() as tmp:

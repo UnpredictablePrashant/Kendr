@@ -6,6 +6,8 @@ import re
 import shlex
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,16 +15,35 @@ from typing import Any
 
 from langgraph.graph import END, StateGraph
 from kendr.approval_resume_handlers import restore_pending_user_input
-from kendr.orchestration import ResumeStateOverrides, RuntimeState, state_awaiting_user_input
+from kendr.orchestration import (
+    CycleError,
+    ResumeStateOverrides,
+    RuntimeState,
+    TaskGraph,
+    annotate_plan_steps,
+    build_intent_candidates,
+    can_parallelize_step_batch,
+    state_awaiting_user_input,
+)
 from kendr.execution_trace import append_execution_event, render_execution_event_line
 from kendr.direct_tools import run_direct_tool_loop
 from kendr.persistence import (
+    claim_plan_task,
     get_channel_session,
+    get_latest_execution_plan,
     initialize_db,
     insert_agent_execution,
+    insert_orchestration_event,
     insert_run,
     insert_run_checkpoint,
+    release_plan_task_lease,
+    replace_intent_candidates,
+    replace_plan_tasks,
+    resolve_db_path,
+    update_execution_plan_status,
+    update_plan_task_state,
     update_run,
+    upsert_execution_plan,
     upsert_channel_session,
     upsert_task_session,
 )
@@ -86,6 +107,14 @@ def _truthy(value: Any, default: bool = False) -> bool:
 
 
 class AgentRuntime:
+    _PLAN_SUCCESS_STATUSES = {"completed", "skipped"}
+    _PLAN_ACTIVE_STATUSES = {"running"}
+    _PLAN_BLOCKED_STATUSES = {"failed", "blocked", "cancelled"}
+    _PLAN_OPEN_STATUSES = {"pending", "queued", "ready", "waiting", ""}
+    _PARALLEL_PLAN_EXECUTOR = "__parallel_plan_executor__"
+    _DEFAULT_MAX_PARALLEL_READ_TASKS = 3
+    _DEFAULT_MAX_NO_PROGRESS_CYCLES = 6
+
     def __init__(self, registry: Registry):
         self.registry = registry
         self.agent_routing: AgentRoutingIndex = build_agent_routing_index(registry)
@@ -196,6 +225,214 @@ class AgentRuntime:
         except Exception:
             state["skills_context"] = "unavailable"
         ensure_a2a_state(state, filtered_cards)
+        return state
+
+    def _db_path(self, state: Mapping[str, Any]) -> str:
+        return str(state.get("db_path", "") or "").strip() or resolve_db_path()
+
+    def _intent_flags(self, state: Mapping[str, Any]) -> dict[str, bool]:
+        snapshot = dict(state)
+        return {
+            "security_assessment": bool(snapshot.get("security_authorized", False))
+            or bool(str(snapshot.get("security_target_url", "")).strip())
+            or any(marker in self._objective_text(snapshot).lower() for marker in ("security", "vulnerability", "pentest", "scan ")),
+            "local_command": self._is_local_command_request(snapshot),
+            "shell_plan": self._is_shell_plan_request(snapshot),
+            "github": self._is_github_request(snapshot),
+            "registry_discovery": self._is_registry_discovery_request(snapshot),
+            "communication_digest": self._is_communication_summary_request(snapshot),
+            "project_build": self._is_project_build_request(snapshot),
+            "long_document": self._is_long_document_request(snapshot),
+            "deep_research": self._is_deep_research_workflow(snapshot),
+            "superrag": self._is_superrag_request(snapshot),
+            "local_drive": self._has_local_drive_request(snapshot),
+        }
+
+    def _record_orchestration_event(
+        self,
+        state: Mapping[str, Any],
+        *,
+        event_type: str,
+        subject_type: str,
+        subject_id: str,
+        status: str = "",
+        payload: dict[str, Any] | None = None,
+        plan_id: str = "",
+    ) -> None:
+        run_id = str(state.get("run_id", "")).strip()
+        if not run_id:
+            return
+        try:
+            insert_orchestration_event(
+                {
+                    "run_id": run_id,
+                    "plan_id": plan_id or str(state.get("orchestration_plan_id", "")).strip(),
+                    "subject_type": subject_type,
+                    "subject_id": subject_id,
+                    "event_type": event_type,
+                    "status": status,
+                    "source": "runtime",
+                    "payload": dict(payload or {}),
+                },
+                db_path=self._db_path(state),
+            )
+        except Exception:
+            pass
+
+    def _refresh_intent_projection(self, state: dict[str, Any]) -> dict[str, Any]:
+        objective_text = str(state.get("current_objective") or state.get("user_query") or "").strip()
+        if not objective_text:
+            return state
+        flags = self._intent_flags(state)
+        planner_signals = self._planner_signal_snapshot(state)
+        discovery = build_intent_candidates(
+            user_query=str(state.get("user_query", "") or ""),
+            current_objective=objective_text,
+            flags=flags,
+            planner_signals=planner_signals,
+        )
+        signature = str(discovery.get("objective_signature", "")).strip()
+        selected = discovery.get("selected", {}) if isinstance(discovery.get("selected"), dict) else {}
+        state["intent_signature"] = signature
+        state["intent_candidates"] = discovery.get("candidates", [])
+        state["selected_intent"] = selected
+        state["selected_intent_id"] = str(selected.get("intent_id", "")).strip()
+        state["selected_intent_type"] = str(selected.get("intent_type", "")).strip()
+        if (
+            signature
+            and state.get("_persisted_intent_signature") == signature
+            and state.get("_persisted_selected_intent_id") == state.get("selected_intent_id", "")
+        ):
+            return state
+        run_id = str(state.get("run_id", "")).strip()
+        if run_id and signature:
+            try:
+                replace_intent_candidates(
+                    run_id,
+                    list(state.get("intent_candidates", [])),
+                    objective_signature=signature,
+                    db_path=self._db_path(state),
+                )
+                self._record_orchestration_event(
+                    state,
+                    event_type="intent.discovered",
+                    subject_type="intent",
+                    subject_id=state["selected_intent_id"] or signature,
+                    status="selected",
+                    payload={
+                        "objective_signature": signature,
+                        "selected_intent_type": state.get("selected_intent_type", ""),
+                        "candidate_count": len(state.get("intent_candidates", []) or []),
+                    },
+                )
+                state["_persisted_intent_signature"] = signature
+                state["_persisted_selected_intent_id"] = state.get("selected_intent_id", "")
+            except Exception:
+                pass
+        return state
+
+    def _plan_status_from_state(self, state: Mapping[str, Any], *, final_status: str = "") -> str:
+        if final_status in {"failed", "cancelled", "completed"}:
+            return final_status
+        if bool(state.get("plan_needs_clarification", False)):
+            return "needs_clarification"
+        if bool(state.get("plan_waiting_for_approval", False)):
+            return "awaiting_approval"
+        approval_status = str(state.get("plan_approval_status", "") or "").strip().lower()
+        if approval_status == "revision_requested":
+            return "revision_requested"
+        if approval_status == "approved":
+            steps = state.get("plan_steps", [])
+            if not isinstance(steps, list) or not steps:
+                return "approved"
+            status_snapshot = self._plan_status_snapshot(dict(state))
+            if status_snapshot["blocked"]:
+                return "failed"
+            if len(status_snapshot["success"]) >= len([step for step in steps if isinstance(step, dict)]):
+                return "completed"
+            if status_snapshot["active"] or str(state.get("planned_active_step_id", "") or "").strip():
+                return "executing"
+            return "ready"
+        if state.get("plan_steps"):
+            return "draft"
+        return final_status or "draft"
+
+    def _sync_orchestration_plan_record(self, state: dict[str, Any], *, final_status: str = "") -> dict[str, Any]:
+        run_id = str(state.get("run_id", "")).strip()
+        if not run_id or not (state.get("plan_steps") or state.get("plan_data")):
+            return state
+        plan_id = str(state.get("orchestration_plan_id", "")).strip()
+        plan_version = int(state.get("orchestration_plan_version", state.get("plan_version", 0)) or state.get("plan_version", 0) or 0)
+        if not plan_id:
+            latest_plan = get_latest_execution_plan(run_id, db_path=self._db_path(state))
+            if latest_plan:
+                plan_id = str(latest_plan.get("plan_id", "")).strip()
+                plan_version = int(latest_plan.get("version", plan_version or 0) or plan_version or 0)
+            elif plan_version > 0:
+                plan_id = f"{run_id}:plan:v{plan_version}"
+        if not plan_id:
+            return state
+        plan_version = max(1, plan_version or 1)
+        desired_status = self._plan_status_from_state(state, final_status=final_status)
+        try:
+            if not get_latest_execution_plan(run_id, db_path=self._db_path(state)) or not str(state.get("orchestration_plan_id", "")).strip():
+                upsert_execution_plan(
+                    plan_id,
+                    run_id=run_id,
+                    intent_id=str(state.get("selected_intent_id", "")).strip(),
+                    version=plan_version,
+                    status=desired_status,
+                    approval_status=str(state.get("plan_approval_status", "")).strip() or "not_started",
+                    needs_clarification=bool(state.get("plan_needs_clarification", False)),
+                    objective=str(state.get("current_objective", state.get("user_query", ""))).strip(),
+                    summary=str((state.get("plan_data", {}) or {}).get("summary", "")).strip(),
+                    plan_markdown=str(state.get("plan", "")).strip(),
+                    plan_data=dict(state.get("plan_data", {}) or {}),
+                    metadata={
+                        "plan_step_index": int(state.get("plan_step_index", 0) or 0),
+                        "selected_intent_id": str(state.get("selected_intent_id", "")).strip(),
+                    },
+                    db_path=self._db_path(state),
+                )
+                replace_plan_tasks(
+                    plan_id,
+                    run_id,
+                    list(state.get("plan_steps", []) or []),
+                    db_path=self._db_path(state),
+                )
+                state["orchestration_plan_id"] = plan_id
+                state["orchestration_plan_version"] = plan_version
+            updated = update_execution_plan_status(
+                plan_id,
+                status=desired_status,
+                approval_status=str(state.get("plan_approval_status", "")).strip() or "not_started",
+                needs_clarification=bool(state.get("plan_needs_clarification", False)),
+                metadata={
+                    "plan_step_index": int(state.get("plan_step_index", 0) or 0),
+                    "selected_intent_id": str(state.get("selected_intent_id", "")).strip(),
+                    "final_status": final_status,
+                },
+                db_path=self._db_path(state),
+            )
+            if updated:
+                state["orchestration_plan_id"] = str(updated.get("plan_id", "")).strip() or plan_id
+                state["orchestration_plan_version"] = int(updated.get("version", plan_version) or plan_version)
+            if state.get("_persisted_plan_status") != desired_status:
+                self._record_orchestration_event(
+                    state,
+                    event_type="plan.status_changed",
+                    subject_type="plan",
+                    subject_id=state.get("orchestration_plan_id", plan_id),
+                    status=desired_status,
+                    payload={
+                        "approval_status": state.get("plan_approval_status", ""),
+                        "needs_clarification": bool(state.get("plan_needs_clarification", False)),
+                        "plan_step_index": int(state.get("plan_step_index", 0) or 0),
+                    },
+                )
+                state["_persisted_plan_status"] = desired_status
+        except Exception:
+            pass
         return state
 
     _DEFAULT_MAX_CONSECUTIVE_FAILURES = 3
@@ -384,6 +621,21 @@ class AgentRuntime:
             return False, "Plan already exists in state.", {"mode": mode}
         if self._awaiting_user_input(state):
             return False, "Run is waiting for user input.", {"mode": mode}
+        selected_intent = state.get("selected_intent")
+        if isinstance(selected_intent, Mapping):
+            intent_type = str(selected_intent.get("intent_type", "")).strip()
+            requires_planner = bool(selected_intent.get("requires_planner", False))
+            intent_mode = str(selected_intent.get("execution_mode", "")).strip().lower()
+            intent_signals = {
+                "mode": mode,
+                "intent_type": intent_type,
+                "intent_execution_mode": intent_mode,
+                "intent_requires_planner": requires_planner,
+            }
+            if requires_planner and intent_type:
+                return True, f"Intent '{intent_type}' requires staged planning.", intent_signals
+            if intent_mode in {"direct", "direct_tools"} and intent_type and intent_type != "general_task":
+                return False, f"Intent '{intent_type}' routes directly without the generic planner.", intent_signals
         if self._is_local_command_request(dict(state)):
             return False, "Local command workflow routes directly to os_agent.", {"mode": mode}
         if self._is_shell_plan_request(dict(state)):
@@ -707,6 +959,33 @@ class AgentRuntime:
         if len(cleaned) <= limit:
             return cleaned
         return cleaned[: limit - 3] + "..."
+
+    def _execution_surface_note(self, state: Mapping[str, Any]) -> str:
+        raw = state.get("used_execution_surfaces") or []
+        if not isinstance(raw, list):
+            return ""
+        labels: list[str] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            label = str(item.get("label") or "").strip()
+            if not label:
+                continue
+            if label in seen:
+                continue
+            seen.add(label)
+            labels.append(label)
+        if not labels:
+            return ""
+        return "used: " + ", ".join(labels[:4])
+
+    def _with_execution_surface_note(self, text: str, state: Mapping[str, Any]) -> str:
+        base = str(text or "").rstrip()
+        note = self._execution_surface_note(state)
+        if not note or note in base:
+            return base
+        return f"{base}\n\n{note}" if base else note
 
     def _awaiting_user_input(self, state: Mapping[str, Any]) -> bool:
         return state_awaiting_user_input(state)
@@ -1204,7 +1483,7 @@ class AgentRuntime:
         state["last_agent_status"] = status
         state["last_agent_output"] = output_text
         run_id = state.get("run_id")
-        if run_id:
+        if run_id and not bool(state.get("_suppress_agent_execution_persistence", False)):
             insert_agent_execution(
                 run_id,
                 timestamp,
@@ -1214,7 +1493,8 @@ class AgentRuntime:
                 self._truncate(output_text),
                 completed_at=completed_at,
             )
-        self._write_session_record(state, status="running", active_agent=agent_name)
+        if not bool(state.get("_suppress_session_record", False)):
+            self._write_session_record(state, status="running", active_agent=agent_name)
         return state
 
     def _session_payload(self, state: RuntimeState, *, status: str, active_agent: str = "", completed_at: str = "") -> dict:
@@ -2477,7 +2757,11 @@ class AgentRuntime:
         return ""
 
     def _build_failure_checkpoint(self, state: dict, agent_name: str, error_message: str, active_task: dict | None) -> dict:
-        step_index = int(state.get("plan_step_index", 0) or 0)
+        step_index = self._plan_step_index_for_id(
+            state,
+            str(state.get("planned_active_step_id", "")).strip(),
+            default=int(state.get("plan_step_index", 0) or 0),
+        )
         block_reason = self._resume_block_reason(error_message)
         can_resume = not bool(block_reason)
         return {
@@ -2491,30 +2775,532 @@ class AgentRuntime:
             "block_reason": block_reason,
         }
 
-    def _next_planned_agents(self, state: dict) -> list[dict]:
+    @staticmethod
+    def _plan_step_id(step: Mapping[str, Any], index: int) -> str:
+        return str(step.get("id", "")).strip() or f"step-{index + 1}"
+
+    def _plan_step_index_for_id(self, state: Mapping[str, Any], step_id: str, *, default: int = 0) -> int:
+        target = str(step_id or "").strip()
+        steps = state.get("plan_steps", [])
+        if not target or not isinstance(steps, list):
+            return default
+        for index, step in enumerate(steps):
+            if isinstance(step, dict) and self._plan_step_id(step, index) == target:
+                return index
+        return default
+
+    @staticmethod
+    def _plan_depends_on(step: Mapping[str, Any]) -> list[str]:
+        raw = step.get("depends_on", [])
+        if not isinstance(raw, list):
+            return []
+        return [str(item).strip() for item in raw if str(item).strip()]
+
+    def _plan_graph(self, state: dict) -> TaskGraph | None:
+        steps = state.get("plan_steps", [])
+        if not isinstance(steps, list) or not steps:
+            return None
+        ids = {
+            self._plan_step_id(step, index)
+            for index, step in enumerate(steps)
+            if isinstance(step, dict)
+        }
+        tasks: dict[str, dict[str, Any]] = {}
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            step_id = self._plan_step_id(step, index)
+            tasks[step_id] = {
+                "agent": str(step.get("agent", "")).strip() or "worker_agent",
+                "depends_on": [dep for dep in self._plan_depends_on(step) if dep in ids],
+            }
+        if not tasks:
+            return None
+        try:
+            return TaskGraph(tasks)
+        except (CycleError, ValueError):
+            return None
+
+    def _plan_status_snapshot(self, state: dict) -> dict[str, set[str]]:
+        steps = state.get("plan_steps", [])
+        snapshot = {
+            "success": set(),
+            "active": set(),
+            "blocked": set(),
+            "open": set(),
+        }
+        if not isinstance(steps, list):
+            return snapshot
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            step_id = self._plan_step_id(step, index)
+            status = str(step.get("status", "")).strip().lower()
+            if status in self._PLAN_SUCCESS_STATUSES:
+                snapshot["success"].add(step_id)
+            elif status in self._PLAN_ACTIVE_STATUSES:
+                snapshot["active"].add(step_id)
+            elif status in self._PLAN_BLOCKED_STATUSES:
+                snapshot["blocked"].add(step_id)
+            else:
+                snapshot["open"].add(step_id)
+        return snapshot
+
+    def _plan_agent_lookup(self) -> dict[str, dict[str, Any]]:
+        lookup: dict[str, dict[str, Any]] = {}
+        for name, spec in self.registry.agents.items():
+            metadata = dict(getattr(spec, "metadata", {}) or {})
+            if metadata.get("side_effect_level"):
+                metadata["side_effect_level"] = str(metadata.get("side_effect_level", "")).strip().lower()
+            lookup[name] = {
+                "metadata": metadata,
+                "output_keys": list(getattr(spec, "output_keys", []) or []),
+                "input_keys": list(getattr(spec, "input_keys", []) or []),
+                "side_effect_level": metadata.get("side_effect_level", ""),
+                "read_only": bool(metadata.get("read_only", False)),
+            }
+        return lookup
+
+    def _ensure_plan_safety_metadata(self, state: dict) -> list[dict]:
         steps = state.get("plan_steps", [])
         if not isinstance(steps, list) or not steps:
             return []
-        index = int(state.get("plan_step_index", 0) or 0)
-        if index < 0 or index >= len(steps):
+        annotated = annotate_plan_steps(steps, agent_lookup=self._plan_agent_lookup())
+        if annotated != steps:
+            state["plan_steps"] = annotated
+            plan_data = state.get("plan_data")
+            if isinstance(plan_data, dict) and isinstance(plan_data.get("execution_steps"), list):
+                plan_data = dict(plan_data)
+                plan_data["execution_steps"] = annotated
+                state["plan_data"] = plan_data
+        return state.get("plan_steps", [])
+
+    def _plan_step_record(self, state: Mapping[str, Any], step_id: str) -> tuple[int, dict[str, Any] | None]:
+        resolved_step_id = str(step_id or "").strip()
+        steps = state.get("plan_steps", [])
+        if not resolved_step_id or not isinstance(steps, list):
+            return -1, None
+        for index, step in enumerate(steps):
+            if isinstance(step, dict) and self._plan_step_id(step, index) == resolved_step_id:
+                return index, step
+        return -1, None
+
+    def _apply_plan_task_row(self, state: dict, row: Mapping[str, Any]) -> None:
+        step_id = str(row.get("step_id", "")).strip()
+        index, step = self._plan_step_record(state, step_id)
+        if index < 0 or not isinstance(step, dict):
+            return
+        step["status"] = str(row.get("status", step.get("status", "")) or step.get("status", "")).strip()
+        step["side_effect_level"] = str(row.get("side_effect_level", step.get("side_effect_level", "")) or step.get("side_effect_level", "")).strip()
+        conflict_keys = row.get("conflict_keys", step.get("conflict_keys", []))
+        if isinstance(conflict_keys, list):
+            step["conflict_keys"] = [str(item).strip() for item in conflict_keys if str(item).strip()]
+        step["lease_owner"] = str(row.get("lease_owner", step.get("lease_owner", "")) or step.get("lease_owner", "")).strip()
+        step["lease_expires_at"] = row.get("lease_expires_at") or step.get("lease_expires_at")
+        step["attempt_count"] = int(row.get("attempt_count", step.get("attempt_count", 0)) or step.get("attempt_count", 0) or 0)
+        step["last_attempt_at"] = row.get("last_attempt_at") or step.get("last_attempt_at")
+        step["started_at"] = row.get("started_at") or step.get("started_at")
+        step["completed_at"] = row.get("completed_at") or step.get("completed_at")
+        step["result_summary"] = row.get("result_summary") or step.get("result_summary")
+        step["error"] = row.get("error") or step.get("error")
+
+    def _claim_plan_step_lease(
+        self,
+        state: dict,
+        step_id: str,
+        *,
+        lease_owner: str = "",
+        lease_seconds: int = 300,
+    ) -> dict[str, Any] | None:
+        plan_id = str(state.get("orchestration_plan_id", "")).strip()
+        resolved_step_id = str(step_id or "").strip()
+        if not plan_id or not resolved_step_id:
+            return None
+        owner = lease_owner or f"{state.get('run_id', 'run')}:{resolved_step_id}:{uuid.uuid4().hex[:8]}"
+        try:
+            row = claim_plan_task(
+                plan_id,
+                resolved_step_id,
+                lease_owner=owner,
+                lease_seconds=lease_seconds,
+                db_path=self._db_path(state),
+            )
+        except Exception:
+            return None
+        if isinstance(row, dict):
+            self._apply_plan_task_row(state, row)
+        return row
+
+    def _release_plan_step_lease(self, state: dict, step_id: str, *, lease_owner: str = "") -> None:
+        plan_id = str(state.get("orchestration_plan_id", "")).strip()
+        resolved_step_id = str(step_id or "").strip()
+        if plan_id and resolved_step_id:
+            try:
+                release_plan_task_lease(
+                    plan_id,
+                    resolved_step_id,
+                    lease_owner=str(lease_owner or "").strip(),
+                    db_path=self._db_path(state),
+                )
+            except Exception:
+                pass
+        index, step = self._plan_step_record(state, resolved_step_id)
+        if index >= 0 and isinstance(step, dict):
+            step["lease_owner"] = ""
+            step["lease_expires_at"] = None
+
+    def _parallel_read_budget(self, state: Mapping[str, Any]) -> int:
+        return max(1, int(state.get("max_parallel_read_tasks", self._DEFAULT_MAX_PARALLEL_READ_TASKS) or self._DEFAULT_MAX_PARALLEL_READ_TASKS))
+
+    def _should_parallelize_planned_batch(self, state: dict, batch: list[dict[str, Any]]) -> bool:
+        if not bool(state.get("parallel_read_only_enabled", True)):
+            return False
+        if len(batch) < 2:
+            return False
+        annotated = annotate_plan_steps(batch, agent_lookup=self._plan_agent_lookup())
+        return can_parallelize_step_batch(annotated, agent_lookup=self._plan_agent_lookup())
+
+    def _merge_parallel_child_result(self, state: dict, result: Mapping[str, Any]) -> None:
+        ensure_a2a_state(state, state.get("available_agent_cards") or self._agent_cards())
+        a2a = state.get("a2a", {})
+        for key in ("messages", "tasks", "artifacts"):
+            additions = result.get(f"a2a_{key}", [])
+            if not isinstance(additions, list) or not additions:
+                continue
+            current = a2a.setdefault(key, [])
+            current.extend(deepcopy(additions))
+
+        history = state.get("agent_history", [])
+        additions = result.get("agent_history", [])
+        if isinstance(history, list) and isinstance(additions, list) and additions:
+            history.extend(deepcopy(additions))
+            state["agent_history"] = history
+
+        output_values = result.get("output_values", {})
+        if isinstance(output_values, Mapping):
+            for key, value in output_values.items():
+                state[str(key)] = deepcopy(value)
+
+        merged_surfaces = state.get("used_execution_surfaces", [])
+        if not isinstance(merged_surfaces, list):
+            merged_surfaces = []
+        seen_labels = {
+            str(item.get("label", "")).strip()
+            for item in merged_surfaces
+            if isinstance(item, dict) and str(item.get("label", "")).strip()
+        }
+        for entry in result.get("used_execution_surfaces", []):
+            if not isinstance(entry, dict):
+                continue
+            label = str(entry.get("label", "")).strip()
+            if label and label in seen_labels:
+                continue
+            if label:
+                seen_labels.add(label)
+            merged_surfaces.append(deepcopy(entry))
+        state["used_execution_surfaces"] = merged_surfaces
+
+        step_id = str(result.get("step_id", "")).strip()
+        if step_id:
+            parallel_results = state.get("parallel_step_results", {})
+            if not isinstance(parallel_results, dict):
+                parallel_results = {}
+            parallel_results[step_id] = {
+                "agent": str(result.get("agent", "")).strip(),
+                "status": "completed" if bool(result.get("success", False)) else "failed",
+                "output_excerpt": self._truncate(str(result.get("output_text", "") or "")),
+                "error": self._truncate(str(result.get("error_text", "") or "")),
+                "output_keys": sorted(str(key).strip() for key in (result.get("output_values", {}) or {}).keys() if str(key).strip()),
+            }
+            state["parallel_step_results"] = parallel_results
+
+    def _run_parallel_plan_step(self, base_state: dict, step: dict[str, Any]) -> dict[str, Any]:
+        child_state = deepcopy(base_state)
+        ensure_a2a_state(child_state, child_state.get("available_agent_cards") or self._agent_cards())
+        baseline_messages = len(child_state["a2a"].get("messages", []))
+        baseline_tasks = len(child_state["a2a"].get("tasks", []))
+        baseline_artifacts = len(child_state["a2a"].get("artifacts", []))
+        baseline_history = len(child_state.get("agent_history", []) or [])
+
+        step_id = str(step.get("id", "")).strip()
+        agent_name = str(step.get("agent") or "worker_agent").strip()
+        task_content = str(step.get("task") or child_state.get("current_objective") or child_state.get("user_query") or "").strip()
+        success_criteria = str(step.get("success_criteria", "")).strip()
+        reason = f"Execute parallel planned step {step_id}: {success_criteria or task_content}"
+
+        child_state["_parallel_plan_step"] = True
+        child_state["_skip_review_once"] = True
+        child_state["_suppress_session_record"] = True
+        child_state["orchestrator_reason"] = reason
+        child_state["current_objective"] = task_content
+        child_state["planned_active_agent"] = agent_name
+        child_state["planned_active_step_id"] = step_id
+        child_state["planned_active_step_title"] = str(step.get("title", "")).strip()
+        child_state["planned_active_step_success_criteria"] = success_criteria
+        child_state["current_plan_step_id"] = step_id
+        child_state["current_plan_step_title"] = str(step.get("title", "")).strip()
+        child_state["current_plan_step_success_criteria"] = success_criteria
+        child_state = append_task(
+            child_state,
+            make_task(
+                sender=self._PARALLEL_PLAN_EXECUTOR,
+                recipient=agent_name,
+                intent="planned-parallel-step",
+                content=task_content,
+                state_updates={
+                    "current_objective": task_content,
+                    "current_plan_step_id": step_id,
+                    "current_plan_step_title": str(step.get("title", "")).strip(),
+                    "current_plan_step_success_criteria": success_criteria,
+                },
+            ),
+        )
+
+        try:
+            child_state = self._execute_agent(child_state, agent_name)
+            error_text = ""
+        except Exception as exc:
+            error_text = str(exc)
+            child_state["last_agent"] = agent_name
+            child_state["last_agent_status"] = "error"
+            child_state["last_agent_output"] = error_text
+
+        agent_spec = self.registry.agents.get(agent_name)
+        output_keys = list(getattr(agent_spec, "output_keys", []) or []) if agent_spec else []
+        output_values = {
+            key: deepcopy(child_state.get(key))
+            for key in output_keys
+            if key in child_state
+        }
+        last_status = str(child_state.get("last_agent_status", "")).strip().lower()
+        output_text = str(child_state.get("last_agent_output", "") or error_text).strip()
+        failure_checkpoint = child_state.get("failure_checkpoint", {}) if isinstance(child_state.get("failure_checkpoint"), dict) else {}
+        return {
+            "step_id": step_id,
+            "agent": agent_name,
+            "success": last_status == "success",
+            "output_text": output_text,
+            "error_text": error_text or str(child_state.get("last_error", "") or ""),
+            "output_values": output_values,
+            "a2a_messages": deepcopy(child_state["a2a"].get("messages", [])[baseline_messages:]),
+            "a2a_tasks": deepcopy(child_state["a2a"].get("tasks", [])[baseline_tasks:]),
+            "a2a_artifacts": deepcopy(child_state["a2a"].get("artifacts", [])[baseline_artifacts:]),
+            "agent_history": deepcopy((child_state.get("agent_history", []) or [])[baseline_history:]),
+            "used_execution_surfaces": deepcopy(child_state.get("used_execution_surfaces", [])),
+            "failure_checkpoint": deepcopy(failure_checkpoint),
+        }
+
+    def _execute_parallel_plan_batch(self, state: dict) -> dict:
+        batch_ids = state.get("parallel_plan_batch", [])
+        if not isinstance(batch_ids, list) or not batch_ids:
+            return state
+        self._ensure_plan_safety_metadata(state)
+        selected_steps: list[dict[str, Any]] = []
+        for step_id in batch_ids:
+            _, step = self._plan_step_record(state, str(step_id).strip())
+            if isinstance(step, dict):
+                selected_steps.append(dict(step))
+        if not self._should_parallelize_planned_batch(state, selected_steps):
+            state["parallel_plan_batch"] = []
+            state["parallel_plan_batch_size"] = 0
+            return state
+
+        batch_owner = f"{state.get('run_id', 'run')}:parallel:{uuid.uuid4().hex[:8]}"
+        runnable_steps: list[dict[str, Any]] = []
+        for step in selected_steps:
+            step_id = str(step.get("id", "")).strip()
+            claimed = self._claim_plan_step_lease(state, step_id, lease_owner=batch_owner)
+            if claimed is None:
+                continue
+            step_index = self._plan_step_index_for_id(state, step_id)
+            self._mark_step_running(state, step_index)
+            _, local_step = self._plan_step_record(state, step_id)
+            if isinstance(local_step, dict):
+                runnable_steps.append(dict(local_step))
+
+        if not runnable_steps:
+            state["parallel_plan_batch"] = []
+            state["parallel_plan_batch_size"] = 0
+            state["review_pending"] = False
+            state["review_pending_reason"] = ""
+            return state
+
+        max_workers = min(self._parallel_read_budget(state), len(runnable_steps))
+        base_state = deepcopy(state)
+        success_count = 0
+        failure_count = 0
+        batch_lines: list[str] = []
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(self._run_parallel_plan_step, base_state, dict(step)): dict(step)
+                for step in runnable_steps
+            }
+            for future in as_completed(futures):
+                step = futures[future]
+                step_id = str(step.get("id", "")).strip()
+                step_title = str(step.get("title", "")).strip()
+                agent_name = str(step.get("agent", "")).strip()
+                state["planned_active_agent"] = agent_name
+                state["planned_active_step_id"] = step_id
+                state["planned_active_step_title"] = step_title
+                state["planned_active_step_success_criteria"] = str(step.get("success_criteria", "")).strip()
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        "step_id": step_id,
+                        "agent": agent_name,
+                        "success": False,
+                        "output_text": "",
+                        "error_text": str(exc),
+                        "output_values": {},
+                        "a2a_messages": [],
+                        "a2a_tasks": [],
+                        "a2a_artifacts": [],
+                        "agent_history": [],
+                        "used_execution_surfaces": [],
+                        "failure_checkpoint": {},
+                    }
+                self._merge_parallel_child_result(state, result)
+                if bool(result.get("success", False)):
+                    success_count += 1
+                    state["last_agent"] = agent_name
+                    state["last_agent_status"] = "success"
+                    state["last_agent_output"] = str(result.get("output_text", "") or "").strip()
+                    self._mark_planned_step_complete(state, result_text=self._truncate(state["last_agent_output"], 300))
+                    batch_lines.append(f"{step_id}: completed")
+                else:
+                    failure_count += 1
+                    error_text = str(result.get("error_text", "") or "parallel planned step failed").strip()
+                    state["last_error"] = error_text
+                    self._mark_step_failed(state, self._plan_step_index_for_id(state, step_id), error_text)
+                    if not state.get("failure_checkpoint") and isinstance(result.get("failure_checkpoint"), dict):
+                        state["failure_checkpoint"] = dict(result.get("failure_checkpoint", {}))
+                    batch_lines.append(f"{step_id}: failed")
+
+        state["effective_steps"] = int(state.get("effective_steps", 0) or 0) + success_count
+        state["planned_active_agent"] = ""
+        state["planned_active_step_id"] = ""
+        state["planned_active_step_title"] = ""
+        state["planned_active_step_success_criteria"] = ""
+        state["current_plan_step_id"] = ""
+        state["current_plan_step_title"] = ""
+        state["current_plan_step_success_criteria"] = ""
+        state["parallel_plan_batch"] = []
+        state["parallel_plan_batch_size"] = 0
+        state["active_task"] = None
+        state["active_agent_task"] = ""
+        state["next_agent"] = ""
+        state["review_pending"] = False
+        state["review_pending_reason"] = ""
+
+        batch_status = "completed" if failure_count == 0 else ("partial" if success_count else "failed")
+        batch_summary = (
+            f"Parallel batch finished with {success_count} completed and {failure_count} failed steps."
+            + (f" Details: {', '.join(batch_lines)}." if batch_lines else "")
+        )
+        state["last_agent"] = self._PARALLEL_PLAN_EXECUTOR
+        state["last_agent_status"] = "success" if failure_count == 0 else "error"
+        state["last_agent_output"] = batch_summary
+        log_task_update("Plan", batch_summary)
+        self._record_orchestration_event(
+            state,
+            event_type="plan.parallel_batch.completed",
+            subject_type="plan",
+            subject_id=str(state.get("orchestration_plan_id", "")).strip() or str(state.get("run_id", "")).strip(),
+            status=batch_status,
+            payload={
+                "step_ids": [str(step.get("id", "")).strip() for step in runnable_steps],
+                "completed": success_count,
+                "failed": failure_count,
+            },
+        )
+        return state
+
+    def _refresh_plan_readiness(self, state: dict, *, persist: bool = True) -> list[dict]:
+        steps = self._ensure_plan_safety_metadata(state)
+        if not isinstance(steps, list) or not steps:
             return []
-        current = steps[index]
-        if not isinstance(current, dict):
+        graph = self._plan_graph(state)
+        if graph is None:
+            return steps
+        status_snapshot = self._plan_status_snapshot(state)
+        completed = set(status_snapshot["success"])
+        blocked = set(status_snapshot["blocked"])
+        changed = False
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            step_id = self._plan_step_id(step, index)
+            status = str(step.get("status", "")).strip().lower()
+            if not status:
+                status = "pending"
+                step["status"] = status
+                changed = True
+            if status in self._PLAN_SUCCESS_STATUSES | self._PLAN_ACTIVE_STATUSES | self._PLAN_BLOCKED_STATUSES:
+                continue
+            deps = graph.dependencies(step_id)
+            if any(dep in blocked for dep in deps):
+                new_status = "blocked"
+            elif all(dep in completed for dep in deps):
+                new_status = "ready"
+            else:
+                new_status = "waiting"
+            if status != new_status:
+                step["status"] = new_status
+                changed = True
+                if persist and str(state.get("orchestration_plan_id", "")).strip():
+                    try:
+                        update_plan_task_state(
+                            str(state.get("orchestration_plan_id", "")).strip(),
+                            step_id,
+                            status=new_status,
+                            metadata={"step_index": index},
+                            db_path=self._db_path(state),
+                        )
+                    except Exception:
+                        pass
+        if changed:
+            state["plan_steps"] = steps
+            self._flush_live_plan(state)
+        return steps
+
+    def _next_planned_agents(self, state: dict, *, ignore_active: bool = False) -> list[dict]:
+        steps = self._refresh_plan_readiness(state)
+        if not steps:
             return []
-        group = str(current.get("parallel_group") or "").strip()
+        if not ignore_active:
+            if str(state.get("planned_active_agent", "")).strip() or str(state.get("planned_active_step_id", "")).strip():
+                return []
+            if any(
+                isinstance(step, dict) and str(step.get("status", "")).strip().lower() in self._PLAN_ACTIVE_STATUSES
+                for step in steps
+            ):
+                return []
+        ready_steps: list[tuple[int, dict[str, Any]]] = []
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            status = str(step.get("status", "")).strip().lower()
+            if status != "ready":
+                continue
+            ready_steps.append((index, step))
+        if not ready_steps:
+            if all(
+                isinstance(step, dict)
+                and str(step.get("status", "")).strip().lower() in self._PLAN_SUCCESS_STATUSES | self._PLAN_BLOCKED_STATUSES
+                for step in steps
+                if isinstance(step, dict)
+            ):
+                state["plan_step_index"] = len(steps)
+            return []
+        first_index, first_step = ready_steps[0]
+        state["plan_step_index"] = first_index
+        group = str(first_step.get("parallel_group") or "").strip()
         if not group:
-            return [current]
-        batch = [current]
-        cursor = index + 1
-        while cursor < len(steps):
-            candidate = steps[cursor]
-            if not isinstance(candidate, dict):
-                break
-            if str(candidate.get("parallel_group") or "").strip() != group:
-                break
-            batch.append(candidate)
-            cursor += 1
-        return batch
+            return [first_step]
+        batch = [step for _, step in ready_steps if str(step.get("parallel_group") or "").strip() == group]
+        return batch or [first_step]
 
     def _quality_gate_report(self, state: dict) -> tuple[bool, str]:
         if not bool(state.get("project_build_mode", False)):
@@ -2535,6 +3321,134 @@ class AgentRuntime:
             all_ok = all_ok and ok
             lines.append(f"- {name}: {status}")
         return all_ok, "\n".join(lines)
+
+    def _no_progress_signature(self, state: Mapping[str, Any]) -> str:
+        steps = state.get("plan_steps", [])
+        ready_steps: list[str] = []
+        waiting_steps: list[str] = []
+        running_steps: list[str] = []
+        if isinstance(steps, list):
+            for index, step in enumerate(steps):
+                if not isinstance(step, dict):
+                    continue
+                status = str(step.get("status", "")).strip().lower()
+                step_id = self._plan_step_id(step, index)
+                if status == "ready":
+                    ready_steps.append(step_id)
+                elif status == "waiting":
+                    waiting_steps.append(step_id)
+                elif status == "running":
+                    running_steps.append(step_id)
+        signature = {
+            "ready_steps": ready_steps,
+            "waiting_steps": waiting_steps,
+            "running_steps": running_steps,
+            "plan_step_index": int(state.get("plan_step_index", 0) or 0),
+            "plan_ready": bool(state.get("plan_ready", False)),
+            "plan_waiting_for_approval": bool(state.get("plan_waiting_for_approval", False)),
+            "pending_user_input_kind": str(state.get("pending_user_input_kind", "")).strip(),
+            "approval_pending_scope": str(state.get("approval_pending_scope", "")).strip(),
+            "review_pending": bool(state.get("review_pending", False)),
+            "review_target_agent": str(state.get("review_target_agent", "")).strip(),
+            "last_agent": str(state.get("last_agent", "")).strip(),
+            "last_agent_status": str(state.get("last_agent_status", "")).strip(),
+            "parallel_plan_batch": [str(item).strip() for item in state.get("parallel_plan_batch", []) if str(item).strip()] if isinstance(state.get("parallel_plan_batch", []), list) else [],
+            "next_agent": str(state.get("next_agent", "")).strip(),
+        }
+        return json.dumps(signature, sort_keys=True, ensure_ascii=False)
+
+    def _dispatch_stalled_replan(self, state: dict, current_objective: str) -> dict:
+        feedback = (
+            "Executor detected repeated no-progress orchestration cycles. "
+            "Regenerate a simpler plan, prefer direct capable agents, reduce unnecessary review hops, "
+            "and keep read-only steps safely parallelizable when possible."
+        )
+        state["_stalled_replan_attempted"] = True
+        state["plan_ready"] = False
+        state["plan_waiting_for_approval"] = False
+        state["plan_approval_status"] = "draft"
+        state["approval_pending_scope"] = ""
+        state["pending_user_question"] = ""
+        state["pending_user_input_kind"] = ""
+        state["review_pending"] = False
+        state["review_pending_reason"] = ""
+        state["plan_revision_feedback"] = feedback
+        state["plan_revision_count"] = int(state.get("plan_revision_count", 0) or 0) + 1
+        state["orchestrator_reason"] = "No forward progress was detected. Regenerate the execution plan."
+        state["next_agent"] = "planner_agent"
+        log_task_update("Orchestrator", "No-progress watchdog triggered; regenerating the plan.")
+        return append_task(
+            state,
+            make_task(
+                sender="orchestrator_agent",
+                recipient="planner_agent",
+                intent="stalled-replan",
+                content=current_objective,
+                state_updates={
+                    "current_objective": current_objective,
+                    "plan_revision_feedback": feedback,
+                },
+            ),
+        )
+
+    def _handle_no_progress_watchdog(self, state: dict, current_objective: str) -> dict | None:
+        if not bool(state.get("no_progress_watchdog_enabled", True)):
+            return None
+        if self._awaiting_user_input(state):
+            state["_no_progress_signature"] = ""
+            state["_no_progress_repeats"] = 0
+            return None
+
+        completed_plan_steps = sum(
+            1
+            for step in state.get("plan_steps", [])
+            if isinstance(step, dict)
+            and str(step.get("status", "")).strip().lower() in self._PLAN_SUCCESS_STATUSES
+        )
+        effective_steps = int(state.get("effective_steps", 0) or 0)
+        signature = self._no_progress_signature(state)
+        previous_effective_steps = state.get("_no_progress_effective_steps", -1)
+        previous_completed_plan_steps = state.get("_no_progress_completed_plan_steps", -1)
+        try:
+            previous_effective_steps = int(previous_effective_steps)
+        except Exception:
+            previous_effective_steps = -1
+        try:
+            previous_completed_plan_steps = int(previous_completed_plan_steps)
+        except Exception:
+            previous_completed_plan_steps = -1
+        if (
+            signature != str(state.get("_no_progress_signature", "") or "")
+            or effective_steps != previous_effective_steps
+            or completed_plan_steps != previous_completed_plan_steps
+        ):
+            state["_no_progress_signature"] = signature
+            state["_no_progress_repeats"] = 0
+            state["_no_progress_effective_steps"] = effective_steps
+            state["_no_progress_completed_plan_steps"] = completed_plan_steps
+            return None
+
+        repeats = int(state.get("_no_progress_repeats", 0) or 0) + 1
+        state["_no_progress_repeats"] = repeats
+        threshold = max(2, int(state.get("max_no_progress_cycles", self._DEFAULT_MAX_NO_PROGRESS_CYCLES) or self._DEFAULT_MAX_NO_PROGRESS_CYCLES))
+        if repeats < threshold:
+            return None
+
+        if (
+            state.get("plan_steps")
+            and not bool(state.get("_stalled_replan_attempted", False))
+            and self._is_agent_available(state, "planner_agent")
+        ):
+            return self._dispatch_stalled_replan(state, current_objective)
+
+        message = (
+            "Execution stalled because the orchestrator stopped making forward progress. "
+            "This run was terminated to avoid an infinite loop."
+        )
+        state["next_agent"] = "__finish__"
+        state["final_output"] = message
+        log_task_update("Orchestrator", "No-progress watchdog terminated the run to avoid a loop.")
+        return append_message(state, make_message("orchestrator_agent", "user", "final", message))
 
     def _flush_live_plan(self, state: dict) -> None:
         try:
@@ -2567,11 +3481,47 @@ class AgentRuntime:
         step["error"] = None
         state["plan_steps"] = steps
         self._flush_live_plan(state)
+        plan_id = str(state.get("orchestration_plan_id", "")).strip()
+        step_id = str(step.get("id", "")).strip()
+        if plan_id and step_id:
+            try:
+                update_plan_task_state(
+                    plan_id,
+                    step_id,
+                    status="running",
+                    started_at=str(step.get("started_at", "")).strip() or None,
+                    completed_at=None,
+                    result_summary=None,
+                    error_text="",
+                    metadata={"step_index": step_index},
+                    db_path=self._db_path(state),
+                )
+                update_execution_plan_status(
+                    plan_id,
+                    status="executing",
+                    approval_status=str(state.get("plan_approval_status", "")).strip() or "approved",
+                    db_path=self._db_path(state),
+                )
+                state["_persisted_plan_status"] = "executing"
+                self._record_orchestration_event(
+                    state,
+                    event_type="plan_task.started",
+                    subject_type="plan_task",
+                    subject_id=step_id,
+                    status="running",
+                    payload={"step_index": step_index, "agent": step.get("agent", "")},
+                )
+            except Exception:
+                pass
 
     def _mark_planned_step_complete(self, state: dict, result_text: str = "") -> None:
         from datetime import datetime, timezone
-        current_index = int(state.get("plan_step_index", 0) or 0)
-        completed_index = current_index + 1
+        current_step_id = str(state.get("planned_active_step_id", "")).strip()
+        current_index = self._plan_step_index_for_id(
+            state,
+            current_step_id,
+            default=int(state.get("plan_step_index", 0) or 0),
+        )
         total_steps = len(state.get("plan_steps", []) or [])
         completed_title = (
             state.get("last_completed_plan_step_title")
@@ -2581,22 +3531,74 @@ class AgentRuntime:
             or "planned step"
         )
         steps = state.get("plan_steps")
+        completed_count = int(state.get("plan_execution_count", 0) or 0) + 1
         if isinstance(steps, list) and 0 <= current_index < len(steps):
             step = steps[current_index]
             if isinstance(step, dict):
+                lease_owner = str(step.get("lease_owner", "")).strip()
                 step["status"] = "completed"
                 step["completed_at"] = datetime.now(timezone.utc).isoformat()
                 if result_text:
                     step["result_summary"] = result_text[:300]
                 step["error"] = None
+                plan_id = str(state.get("orchestration_plan_id", "")).strip()
+                step_id = str(step.get("id", "")).strip()
+                if plan_id and step_id:
+                    try:
+                        update_plan_task_state(
+                            plan_id,
+                            step_id,
+                            status="completed",
+                            completed_at=str(step.get("completed_at", "")).strip() or None,
+                            result_summary=str(step.get("result_summary", "")).strip() or None,
+                            error_text="",
+                            metadata={"step_index": current_index},
+                            db_path=self._db_path(state),
+                        )
+                        self._refresh_plan_readiness(state)
+                        remaining_batch = self._next_planned_agents(state, ignore_active=True)
+                        plan_status = "completed" if not remaining_batch else "executing"
+                        update_execution_plan_status(
+                            plan_id,
+                            status=plan_status,
+                            approval_status=str(state.get("plan_approval_status", "")).strip() or "approved",
+                            db_path=self._db_path(state),
+                        )
+                        state["_persisted_plan_status"] = plan_status
+                        self._record_orchestration_event(
+                            state,
+                            event_type="plan_task.completed",
+                            subject_type="plan_task",
+                            subject_id=step_id,
+                            status="completed",
+                            payload={
+                                "step_index": current_index,
+                                "result_summary": str(step.get("result_summary", "")).strip(),
+                            },
+                        )
+                    except Exception:
+                        pass
+                self._release_plan_step_lease(state, step_id, lease_owner=lease_owner)
             state["plan_steps"] = steps
+            completed_count = sum(
+                1
+                for item in steps
+                if isinstance(item, dict)
+                and str(item.get("status", "")).strip().lower() in self._PLAN_SUCCESS_STATUSES
+            )
+        remaining_batch = self._next_planned_agents(state, ignore_active=True)
+        next_index = self._plan_step_index_for_id(
+            state,
+            self._plan_step_id(remaining_batch[0], 0) if remaining_batch and isinstance(remaining_batch[0], dict) else "",
+            default=len(steps) if isinstance(steps, list) else 0,
+        )
         self._flush_live_plan(state)
-        log_task_update("Plan", f"Completed step {completed_index}/{total_steps}: {completed_title}.")
-        state["plan_step_index"] = completed_index
-        state["plan_execution_count"] = int(state.get("plan_execution_count", 0) or 0) + 1
+        log_task_update("Plan", f"Completed step {completed_count}/{total_steps}: {completed_title}.")
+        state["plan_step_index"] = next_index
+        state["plan_execution_count"] = completed_count
         update_planning_file(
             state,
-            status="executing",
+            status="executing" if remaining_batch else "completed",
             objective=state.get("current_objective", state.get("user_query", "")),
             plan_text=state.get("plan", ""),
             clarifications=state.get("plan_clarification_questions", []),
@@ -2614,11 +3616,44 @@ class AgentRuntime:
         step = steps[step_index]
         if not isinstance(step, dict):
             return
+        lease_owner = str(step.get("lease_owner", "")).strip()
         step["status"] = "failed"
         step["completed_at"] = datetime.now(timezone.utc).isoformat()
         step["error"] = error_message[:300]
+        state["plan_step_index"] = step_index
         state["plan_steps"] = steps
         self._flush_live_plan(state)
+        plan_id = str(state.get("orchestration_plan_id", "")).strip()
+        step_id = str(step.get("id", "")).strip()
+        if plan_id and step_id:
+            try:
+                update_plan_task_state(
+                    plan_id,
+                    step_id,
+                    status="failed",
+                    completed_at=str(step.get("completed_at", "")).strip() or None,
+                    error_text=str(step.get("error", "")).strip() or error_message[:300],
+                    metadata={"step_index": step_index},
+                    db_path=self._db_path(state),
+                )
+                update_execution_plan_status(
+                    plan_id,
+                    status="failed",
+                    approval_status=str(state.get("plan_approval_status", "")).strip() or "approved",
+                    db_path=self._db_path(state),
+                )
+                state["_persisted_plan_status"] = "failed"
+                self._record_orchestration_event(
+                    state,
+                    event_type="plan_task.failed",
+                    subject_type="plan_task",
+                    subject_id=step_id,
+                    status="failed",
+                    payload={"step_index": step_index, "error": error_message[:300]},
+                )
+            except Exception:
+                pass
+        self._release_plan_step_lease(state, step_id, lease_owner=lease_owner)
 
     def _review_revision_key(self, step_id: str, agent_name: str) -> str:
         resolved_step = str(step_id or "").strip() or "adhoc-step"
@@ -2650,6 +3685,7 @@ class AgentRuntime:
         if self._kill_switch_triggered(state):
             raise RuntimeError("Kill switch triggered. Refusing further execution.")
         state = self.apply_runtime_setup(state)
+        parallel_plan_step = bool(state.get("_parallel_plan_step", False))
         if not self._is_agent_available(state, agent_name):
             unavailable_reason = (
                 f"{agent_name} is not configured in the current environment. "
@@ -2681,34 +3717,36 @@ class AgentRuntime:
 
         state["active_task"] = active_task
         state["active_agent_task"] = self._active_task_summary(state, active_task)
-        append_daily_memory_note(
-            state,
-            "orchestrator_agent",
-            "dispatch",
-            f"agent={agent_name}\ntask_id={active_task['task_id']}\nintent={active_task.get('intent', '')}",
-        )
-        append_session_event(
-            state,
-            "orchestrator_agent",
-            "dispatch",
-            f"agent={agent_name}\ntask_id={active_task['task_id']}\nintent={active_task.get('intent', '')}",
-        )
-        record_work_note(
-            state,
-            "orchestrator_agent",
-            "dispatch",
-            (
-                f"agent={agent_name}\n"
-                f"task_id={active_task['task_id']}\n"
-                f"intent={active_task.get('intent', '')}\n"
-                f"content={active_task.get('content', '')}"
-            ),
-        )
+        if not parallel_plan_step:
+            append_daily_memory_note(
+                state,
+                "orchestrator_agent",
+                "dispatch",
+                f"agent={agent_name}\ntask_id={active_task['task_id']}\nintent={active_task.get('intent', '')}",
+            )
+            append_session_event(
+                state,
+                "orchestrator_agent",
+                "dispatch",
+                f"agent={agent_name}\ntask_id={active_task['task_id']}\nintent={active_task.get('intent', '')}",
+            )
+            record_work_note(
+                state,
+                "orchestrator_agent",
+                "dispatch",
+                (
+                    f"agent={agent_name}\n"
+                    f"task_id={active_task['task_id']}\n"
+                    f"intent={active_task.get('intent', '')}\n"
+                    f"content={active_task.get('content', '')}"
+                ),
+            )
         state = append_message(state, make_message(active_task["sender"], agent_name, "task", active_task["content"]))
         task_updates = active_task.get("state_updates", {})
         if isinstance(task_updates, dict):
             state.update(task_updates)
-        self._write_session_record(state, status="running", active_agent=agent_name)
+        if not bool(state.get("_suppress_session_record", False)):
+            self._write_session_record(state, status="running", active_agent=agent_name)
 
         before_state = {k: v for k, v in state.items() if k != "a2a"}
         _agent_start_mono = time.monotonic()
@@ -2792,14 +3830,18 @@ class AgentRuntime:
                 _cli_step_done(agent_name, duration=_agent_elapsed)
             except Exception:
                 pass
-            append_daily_memory_note(state, agent_name, "completed", self._truncate(output_text, 1000))
-            append_session_event(state, agent_name, "completed", self._truncate(output_text, 600))
+            if not parallel_plan_step:
+                append_daily_memory_note(state, agent_name, "completed", self._truncate(output_text, 1000))
+                append_session_event(state, agent_name, "completed", self._truncate(output_text, 600))
+            if parallel_plan_step:
+                state["review_pending"] = False
+                state["review_pending_reason"] = ""
             if agent_name == str(state.get("planned_active_agent", "")).strip():
                 state["last_completed_plan_step_id"] = str(state.get("planned_active_step_id", "")).strip()
                 state["last_completed_plan_step_title"] = str(state.get("planned_active_step_title", "")).strip()
                 state["last_completed_plan_step_success_criteria"] = str(state.get("planned_active_step_success_criteria", "")).strip()
                 state["last_completed_plan_step_agent"] = str(agent_name).strip()
-                if not hold_step_completion:
+                if not parallel_plan_step and not hold_step_completion:
                     self._mark_planned_step_complete(state, result_text=self._truncate(output_text, 300))
                 state["planned_active_agent"] = ""
                 state["planned_active_step_id"] = ""
@@ -2814,8 +3856,13 @@ class AgentRuntime:
             error_message = str(exc)
             state["last_error"] = error_message
             self._record_agent_failure(state, agent_name, error_message)
-            if agent_name == str(state.get("planned_active_agent", "")).strip():
-                self._mark_step_failed(state, int(state.get("plan_step_index", 0) or 0), error_message)
+            if not parallel_plan_step and agent_name == str(state.get("planned_active_agent", "")).strip():
+                failed_index = self._plan_step_index_for_id(
+                    state,
+                    str(state.get("planned_active_step_id", "")).strip(),
+                    default=int(state.get("plan_step_index", 0) or 0),
+                )
+                self._mark_step_failed(state, failed_index, error_message)
             state = complete_task(state, active_task["task_id"], "failed")
             state["review_pending"] = False
             state["review_pending_reason"] = ""
@@ -2850,9 +3897,10 @@ class AgentRuntime:
                 _cli_step_error(agent_name, error_message)
             except Exception:
                 pass
-            append_daily_memory_note(state, agent_name, "failed", self._truncate(error_message, 1000))
-            append_session_event(state, agent_name, "failed", self._truncate(error_message, 600))
-            record_work_note(state, agent_name, "failed", f"task_id={active_task['task_id']}\nerror={error_message}")
+            if not parallel_plan_step:
+                append_daily_memory_note(state, agent_name, "failed", self._truncate(error_message, 1000))
+                append_session_event(state, agent_name, "failed", self._truncate(error_message, 600))
+                record_work_note(state, agent_name, "failed", f"task_id={active_task['task_id']}\nerror={error_message}")
             log_task_update("System", f"{agent_name} failed.", error_message)
             state["failure_checkpoint"] = self._build_failure_checkpoint(state, agent_name, error_message, active_task)
         return state
@@ -2868,6 +3916,8 @@ class AgentRuntime:
         effective_steps = int(state.get("effective_steps", 0))
         hard_ceiling = max_steps * 3
         state = self.apply_runtime_setup(state)
+        state = self._refresh_intent_projection(state)
+        state = self._sync_orchestration_plan_record(state)
         state["_policy_blocked_agents"] = []
         ensure_a2a_state(state, state.get("available_agent_cards") or self._agent_cards())
         current_objective = state.get("current_objective") or state.get("user_query", "")
@@ -2969,6 +4019,10 @@ class AgentRuntime:
             state["final_output"] = self._stuck_agent_message(state, last_agent)
             log_task_update("Orchestrator", f"Stuck-agent detection: {last_agent} dispatched too many times consecutively.")
             return state
+
+        watchdog_result = self._handle_no_progress_watchdog(state, str(current_objective or ""))
+        if watchdog_result is not None:
+            return watchdog_result
 
         if bool(state.get("resume_blocked", False)):
             failed = state.get("failure_checkpoint", {}) if isinstance(state.get("failure_checkpoint"), dict) else {}
@@ -3180,14 +4234,17 @@ Return ONLY valid JSON in this exact schema:
     def build_workflow(self):
         workflow = StateGraph(dict)
         workflow.add_node("orchestrator_agent", self.orchestrator_agent)
+        workflow.add_node(self._PARALLEL_PLAN_EXECUTOR, self._execute_parallel_plan_batch)
         for agent_name in self.registry.agents:
             workflow.add_node(agent_name, lambda state, name=agent_name: self._execute_agent(state, name))
         workflow.set_entry_point("orchestrator_agent")
         edge_map = {agent_name: agent_name for agent_name in self.registry.agents}
+        edge_map[self._PARALLEL_PLAN_EXECUTOR] = self._PARALLEL_PLAN_EXECUTOR
         edge_map["__finish__"] = END
         workflow.add_conditional_edges("orchestrator_agent", self.orchestrator_router, edge_map)
         for agent_name in self.registry.agents:
             workflow.add_edge(agent_name, "orchestrator_agent")
+        workflow.add_edge(self._PARALLEL_PLAN_EXECUTOR, "orchestrator_agent")
         return workflow.compile()
 
     def save_graph(self, app):
@@ -3385,6 +4442,7 @@ Return ONLY valid JSON in this exact schema:
             default=_truthy(os.getenv("KENDR_COMMUNICATION_AUTHORIZED"), True),
         )
         initial_state: RuntimeState = {
+            "db_path": str(overrides.get("db_path") or resolve_db_path()),
             "run_id": resolved_run_id,
             "workflow_id": resolved_workflow_id,
             "attempt_id": resolved_attempt_id,
@@ -3410,6 +4468,11 @@ Return ONLY valid JSON in this exact schema:
             "planned_active_step_id": "",
             "planned_active_step_title": "",
             "planned_active_step_success_criteria": "",
+            "parallel_plan_batch": [],
+            "parallel_plan_batch_size": 0,
+            "parallel_step_results": {},
+            "orchestration_plan_id": "",
+            "orchestration_plan_version": 0,
             "current_plan_step_id": "",
             "current_plan_step_title": "",
             "current_plan_step_success_criteria": "",
@@ -3417,6 +4480,21 @@ Return ONLY valid JSON in this exact schema:
             "last_completed_plan_step_title": "",
             "last_completed_plan_step_success_criteria": "",
             "last_completed_plan_step_agent": "",
+            "intent_signature": "",
+            "selected_intent_id": "",
+            "selected_intent_type": "",
+            "selected_intent": {},
+            "intent_candidates": [],
+            "parallel_read_only_enabled": _truthy(overrides.get("parallel_read_only_enabled"), True),
+            "max_parallel_read_tasks": int(overrides.get("max_parallel_read_tasks", self._DEFAULT_MAX_PARALLEL_READ_TASKS) or self._DEFAULT_MAX_PARALLEL_READ_TASKS),
+            "auto_approve_read_only_plans": _truthy(overrides.get("auto_approve_read_only_plans"), True),
+            "no_progress_watchdog_enabled": _truthy(overrides.get("no_progress_watchdog_enabled"), True),
+            "max_no_progress_cycles": int(overrides.get("max_no_progress_cycles", self._DEFAULT_MAX_NO_PROGRESS_CYCLES) or self._DEFAULT_MAX_NO_PROGRESS_CYCLES),
+            "_no_progress_signature": "",
+            "_no_progress_repeats": 0,
+            "_no_progress_effective_steps": -1,
+            "_no_progress_completed_plan_steps": -1,
+            "_stalled_replan_attempted": False,
             "active_agent_task": "",
             "pending_user_question": "",
             "pending_user_input_kind": "",
@@ -3625,6 +4703,25 @@ Return ONLY valid JSON in this exact schema:
                 initial_state["plan_revision_feedback"] = str(prior_channel_state.get("plan_revision_feedback", "") or "")
                 initial_state["plan_revision_count"] = int(prior_channel_state.get("plan_revision_count", 0) or 0)
                 initial_state["plan_version"] = int(prior_channel_state.get("plan_version", 0) or 0)
+                initial_state["orchestration_plan_id"] = str(prior_channel_state.get("orchestration_plan_id", "") or "")
+                initial_state["orchestration_plan_version"] = int(
+                    prior_channel_state.get("orchestration_plan_version", initial_state.get("orchestration_plan_version", 0))
+                    or initial_state.get("orchestration_plan_version", 0)
+                    or 0
+                )
+                initial_state["intent_signature"] = str(prior_channel_state.get("intent_signature", "") or "")
+                initial_state["selected_intent_id"] = str(prior_channel_state.get("selected_intent_id", "") or "")
+                initial_state["selected_intent_type"] = str(prior_channel_state.get("selected_intent_type", "") or "")
+                initial_state["selected_intent"] = (
+                    prior_channel_state.get("selected_intent", {})
+                    if isinstance(prior_channel_state.get("selected_intent", {}), dict)
+                    else {}
+                )
+                initial_state["intent_candidates"] = (
+                    prior_channel_state.get("intent_candidates", [])
+                    if isinstance(prior_channel_state.get("intent_candidates", []), list)
+                    else []
+                )
                 initial_state["planning_notes"] = prior_channel_state.get("planning_notes", [])
                 initial_state["review_revision_counts"] = prior_channel_state.get("review_revision_counts", {})
                 initial_state["pending_user_input_kind"] = str(prior_channel_state.get("pending_user_input_kind", "") or "")
@@ -3769,6 +4866,9 @@ Return ONLY valid JSON in this exact schema:
         initial_state["planner_score_threshold"] = max(1, int(initial_state.get("planner_score_threshold", 4) or 4))
         initial_state["reviewer_score_threshold"] = max(1, int(initial_state.get("reviewer_score_threshold", 5) or 5))
         initial_state = self.apply_runtime_setup(initial_state)
+        if initial_state.get("plan_steps"):
+            self._refresh_plan_readiness(initial_state, persist=False)
+            self._next_planned_agents(initial_state, ignore_active=True)
         initial_state["privileged_policy"] = build_privileged_policy(initial_state)
         # Inject project context (kendr.md) for every session with a project root
         project_root = str(initial_state.get("project_root", "")).strip()
@@ -3943,6 +5043,14 @@ Return ONLY valid JSON in this exact schema:
             user_query,
             **initial_state_overrides,
         )
+        self._record_orchestration_event(
+            initial_state,
+            event_type="run.started",
+            subject_type="run",
+            subject_id=run_id,
+            status="running",
+            payload={"user_query": user_query},
+        )
         if self._kill_switch_triggered(initial_state):
             raise RuntimeError("Kill switch triggered. Remove kill-switch file to continue.")
         if not self._is_agent_available(initial_state, "worker_agent"):
@@ -3967,11 +5075,22 @@ Return ONLY valid JSON in this exact schema:
                     for b in _fo_raw
                 ) if isinstance(_fo_raw, list) else str(_fo_raw or "")
             )
+            final_output = self._with_execution_surface_note(final_output, result)
+            result["final_output"] = final_output
             if create_outputs:
                 write_text_file("final_output.txt", final_output)
             completed_at = datetime.now(timezone.utc).isoformat()
             final_status = "awaiting_user_input" if self._awaiting_user_input(result) else "completed"
+            result = self._sync_orchestration_plan_record(result, final_status=final_status if final_status != "awaiting_user_input" else "")
             update_run(run_id, status=final_status, completed_at=completed_at, final_output=final_output)
+            self._record_orchestration_event(
+                result,
+                event_type=f"run.{final_status}",
+                subject_type="run",
+                subject_id=run_id,
+                status=final_status,
+                payload={"final_output_excerpt": self._truncate(final_output, 240)},
+            )
             append_daily_memory_note(result, "system", f"run_{final_status}", self._truncate(final_output, 1000))
             if final_status == "completed":
                 append_long_term_memory(result, "Run Summary", self._truncate(final_output, 1200))
@@ -3999,7 +5118,16 @@ Return ONLY valid JSON in this exact schema:
             final_status = "cancelled" if cancelled else "failed"
             final_output = "Run stopped by user." if cancelled else "workflow failed"
             completed_at = datetime.now(timezone.utc).isoformat()
+            initial_state = self._sync_orchestration_plan_record(initial_state, final_status=final_status)
             update_run(run_id, status=final_status, completed_at=completed_at, final_output=final_output)
+            self._record_orchestration_event(
+                initial_state,
+                event_type=f"run.{final_status}",
+                subject_type="run",
+                subject_id=run_id,
+                status=final_status,
+                payload={"error": self._truncate(error_text or final_output, 240)},
+            )
             if not initial_state.get("failure_checkpoint"):
                 fallback_error = initial_state.get("last_error", "workflow failed")
                 initial_state["failure_checkpoint"] = self._build_failure_checkpoint(

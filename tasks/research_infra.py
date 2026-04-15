@@ -32,6 +32,10 @@ OPENALEX_API_URL = "https://api.openalex.org/works"
 ARXIV_API_URL = "https://export.arxiv.org/api/query"
 REDDIT_BASE_URL = "https://www.reddit.com"
 DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/"
+BROWSER_USE_SEARCH_ENGINES = {
+    "google": "https://www.google.com/search",
+    "duckduckgo": "https://duckduckgo.com/html/",
+}
 IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
 LOCAL_DRIVE_SUPPORTED_EXTENSIONS = {
     ".txt",
@@ -78,11 +82,20 @@ def _is_transient_error(exc: Exception) -> bool:
     return any(marker in msg for marker in _TRANSIENT_ERROR_MARKERS)
 
 
+def _sanitize_unpaired_surrogates(text: str) -> str:
+    if not text:
+        return ""
+    return re.sub(r"[\ud800-\udfff]", "\uFFFD", text)
+
+
 def llm_text(prompt: str, *, max_retries: int = _LLM_MAX_RETRIES) -> str:
+    safe_prompt = _sanitize_unpaired_surrogates(prompt)
+    if safe_prompt != prompt:
+        logger.warning("llm_text sanitized unpaired surrogate characters from prompt before LLM call.")
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
-            response = llm.invoke(prompt)
+            response = llm.invoke(safe_prompt)
             return normalize_llm_text(response.content if hasattr(response, "content") else response).strip()
         except Exception as exc:
             last_exc = exc
@@ -148,6 +161,14 @@ def html_to_text(html: str) -> str:
 
 
 def fetch_url_content(url: str, timeout: int = 20) -> dict:
+    if _browser_use_view_enabled():
+        try:
+            browser_payload = browser_use_fetch_url(url, timeout=timeout)
+            if str(browser_payload.get("text", "") or "").strip():
+                return browser_payload
+        except Exception:
+            pass
+
     request = Request(
         url,
         headers={
@@ -166,6 +187,131 @@ def fetch_url_content(url: str, timeout: int = 20) -> dict:
         "content_type": content_type,
         "text": html_to_text(text) if "html" in content_type else text,
         "raw_text": text,
+    }
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    raw = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
+    if raw in {"", "1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _browser_use_search_enabled() -> bool:
+    return _env_flag("KENDR_BROWSER_USE_SEARCH_ENABLED", True)
+
+
+def _browser_use_view_enabled() -> bool:
+    return _env_flag("KENDR_BROWSER_USE_VIEW_ENABLED", True)
+
+
+def _browser_use_search_engine() -> str:
+    engine = str(os.getenv("KENDR_BROWSER_USE_SEARCH_ENGINE", "google") or "google").strip().lower()
+    return engine if engine in BROWSER_USE_SEARCH_ENGINES else "google"
+
+
+def _browser_use_server_enabled() -> bool:
+    if not _browser_use_search_enabled() and not _browser_use_view_enabled():
+        return False
+    try:
+        from kendr.mcp_manager import browser_use_server
+
+        return isinstance(browser_use_server(enabled_only=True), dict)
+    except Exception:
+        return False
+
+
+def _browser_use_result_text(payload: dict) -> str:
+    text = str(payload.get("text", "") or "").strip()
+    if text:
+        return text
+    content = payload.get("content")
+    if isinstance(content, list):
+        return "\n".join(str(item) for item in content).strip()
+    return str(content or "").strip()
+
+
+def _browser_use_search_url(query: str) -> str:
+    engine = _browser_use_search_engine()
+    base = BROWSER_USE_SEARCH_ENGINES.get(engine, BROWSER_USE_SEARCH_ENGINES["google"])
+    params = {"q": query}
+    if engine == "duckduckgo":
+        params["kl"] = "us-en"
+    return f"{base}?{urlencode(params)}"
+
+
+def _extract_browser_use_results(text: str, *, num: int, page_url: str) -> list[dict]:
+    results: list[dict] = []
+    seen: set[str] = set()
+    markdown_links = re.findall(r"\[([^\]]+)\]\((https?://[^)]+)\)", text or "")
+    plain_links = re.findall(r"(https?://[^\s)>\]]+)", text or "")
+
+    for title, url in markdown_links:
+        clean_url = _clean_search_result_url(url)
+        clean_title = re.sub(r"\s+", " ", str(title or "").strip())
+        if not clean_url or clean_url in seen:
+            continue
+        seen.add(clean_url)
+        results.append({
+            "title": clean_title or clean_url,
+            "url": clean_url,
+            "snippet": "",
+            "source": "browser-use MCP",
+            "date": "",
+        })
+        if len(results) >= num:
+            return results
+
+    for url in plain_links:
+        clean_url = _clean_search_result_url(url)
+        if not clean_url or clean_url in seen or clean_url == page_url:
+            continue
+        seen.add(clean_url)
+        results.append({
+            "title": clean_url,
+            "url": clean_url,
+            "snippet": "",
+            "source": "browser-use MCP",
+            "date": "",
+        })
+        if len(results) >= num:
+            break
+
+    return results[:num]
+
+
+def browser_use_fetch_url(url: str, *, timeout: int = 20) -> dict:
+    from kendr.mcp_manager import browser_use_server, call_tool
+
+    server = browser_use_server(enabled_only=True)
+    if not isinstance(server, dict):
+        raise RuntimeError("browser-use MCP server is not enabled")
+    server_id = str(server.get("id") or server.get("server_id") or "").strip()
+    navigate = call_tool(server_id, "browser_navigate", {"url": url}, timeout=max(20, timeout))
+    extracted = call_tool(server_id, "browser_extract_content", {}, timeout=max(20, timeout))
+    text = _browser_use_result_text(extracted)
+    return {
+        "url": url,
+        "content_type": "text/markdown",
+        "text": text,
+        "raw_text": text,
+        "provider": "browser_use_mcp",
+        "navigate_text": _browser_use_result_text(navigate),
+    }
+
+
+def browser_use_search(query: str, *, num: int = 10) -> dict:
+    search_url = _browser_use_search_url(query)
+    payload = browser_use_fetch_url(search_url, timeout=30)
+    text = str(payload.get("text", "") or "").strip()
+    results = _extract_browser_use_results(text, num=num, page_url=search_url)
+    return {
+        "results": results[:num],
+        "raw_text": text,
+        "search_url": search_url,
+        "engine": _browser_use_search_engine(),
     }
 
 
@@ -411,26 +557,40 @@ def fetch_search_results(
     raw_payload: dict | None = None
     errors: list[str] = []
 
-    try:
-        attempts.append("serpapi")
-        serp_payload = serp_search(query, num=num)
-        raw_payload = serp_payload
-        provider = "serpapi"
-        for item in serp_payload.get("organic_results", [])[:num]:
-            url = _clean_search_result_url(item.get("link", ""))
-            if not url:
-                continue
-            search_results.append(
-                {
-                    "title": str(item.get("title", "")).strip(),
-                    "url": url,
-                    "snippet": str(item.get("snippet", "")).strip(),
-                    "source": str(item.get("source", "")).strip(),
-                    "date": str(item.get("date", "")).strip(),
-                }
-            )
-    except Exception as exc:
-        errors.append(f"serpapi: {exc}")
+    serpapi_enabled = bool(os.getenv("SERP_API_KEY", "").strip())
+    browser_use_enabled = _browser_use_server_enabled()
+
+    if serpapi_enabled:
+        try:
+            attempts.append("serpapi")
+            serp_payload = serp_search(query, num=num)
+            raw_payload = serp_payload
+            provider = "serpapi"
+            for item in serp_payload.get("organic_results", [])[:num]:
+                url = _clean_search_result_url(item.get("link", ""))
+                if not url:
+                    continue
+                search_results.append(
+                    {
+                        "title": str(item.get("title", "")).strip(),
+                        "url": url,
+                        "snippet": str(item.get("snippet", "")).strip(),
+                        "source": str(item.get("source", "")).strip(),
+                        "date": str(item.get("date", "")).strip(),
+                    }
+                )
+        except Exception as exc:
+            errors.append(f"serpapi: {exc}")
+
+    if not search_results and browser_use_enabled:
+        try:
+            attempts.append("browser_use_mcp")
+            browser_use_payload = browser_use_search(query, num=num)
+            raw_payload = browser_use_payload
+            provider = "browser_use_mcp"
+            search_results = list(browser_use_payload.get("results", []) or [])
+        except Exception as exc:
+            errors.append(f"browser_use_mcp: {exc}")
 
     if not search_results:
         try:

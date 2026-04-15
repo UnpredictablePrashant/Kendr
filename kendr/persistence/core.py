@@ -62,6 +62,11 @@ _CORE_TABLES = (
     "monitor_rules",
     "monitor_events",
     "heartbeat_events",
+    "intent_candidates",
+    "execution_plans",
+    "plan_tasks",
+    "task_dependencies",
+    "orchestration_events",
     "setup_components",
     "setup_config_values",
     "setup_provider_tokens",
@@ -168,9 +173,12 @@ def _ensure_parent_dir(db_path: str):
 def _connect(db_path: str = DB_PATH):
     resolved_db_path = resolve_db_path(db_path)
     _ensure_parent_dir(resolved_db_path)
-    conn = sqlite3.connect(resolved_db_path)
+    conn = sqlite3.connect(resolved_db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
     try:
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         yield conn
         conn.commit()
     finally:
@@ -805,6 +813,111 @@ def initialize_db(db_path: str = DB_PATH):
                 ON assistants (workspace_id, status, updated_at);
             CREATE INDEX IF NOT EXISTS idx_assistants_workspace_slug
                 ON assistants (workspace_id, slug);
+
+            CREATE TABLE IF NOT EXISTS intent_candidates (
+                intent_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                objective_signature TEXT NOT NULL,
+                intent_type TEXT NOT NULL,
+                label TEXT NOT NULL,
+                score INTEGER NOT NULL DEFAULT 0,
+                selected INTEGER NOT NULL DEFAULT 0,
+                execution_mode TEXT NOT NULL DEFAULT 'adaptive',
+                requires_planner INTEGER NOT NULL DEFAULT 0,
+                risk_level TEXT NOT NULL DEFAULT 'low',
+                reasons_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(run_id) REFERENCES runs(run_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_intent_candidates_run_created
+                ON intent_candidates (run_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_intent_candidates_run_signature
+                ON intent_candidates (run_id, objective_signature);
+
+            CREATE TABLE IF NOT EXISTS execution_plans (
+                plan_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                intent_id TEXT DEFAULT '',
+                version INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'draft',
+                approval_status TEXT NOT NULL DEFAULT 'not_started',
+                needs_clarification INTEGER NOT NULL DEFAULT 0,
+                objective TEXT NOT NULL DEFAULT '',
+                summary TEXT NOT NULL DEFAULT '',
+                plan_markdown TEXT NOT NULL DEFAULT '',
+                plan_json TEXT NOT NULL DEFAULT '{}',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(run_id) REFERENCES runs(run_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_plans_run_version
+                ON execution_plans (run_id, version);
+            CREATE INDEX IF NOT EXISTS idx_execution_plans_run_updated
+                ON execution_plans (run_id, updated_at DESC);
+
+            CREATE TABLE IF NOT EXISTS plan_tasks (
+                plan_task_id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                parent_step_id TEXT DEFAULT '',
+                step_index INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL DEFAULT '',
+                agent_name TEXT NOT NULL DEFAULT '',
+                task_content TEXT NOT NULL DEFAULT '',
+                success_criteria TEXT NOT NULL DEFAULT '',
+                rationale TEXT NOT NULL DEFAULT '',
+                parallel_group TEXT NOT NULL DEFAULT '',
+                side_effect_level TEXT NOT NULL DEFAULT 'unknown',
+                conflict_keys_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                lease_owner TEXT DEFAULT '',
+                lease_expires_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                result_summary TEXT,
+                error_text TEXT,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(plan_id) REFERENCES execution_plans(plan_id),
+                FOREIGN KEY(run_id) REFERENCES runs(run_id)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_plan_tasks_plan_step
+                ON plan_tasks (plan_id, step_id);
+            CREATE INDEX IF NOT EXISTS idx_plan_tasks_run_status
+                ON plan_tasks (run_id, status, step_index);
+
+            CREATE TABLE IF NOT EXISTS task_dependencies (
+                plan_id TEXT NOT NULL,
+                step_id TEXT NOT NULL,
+                depends_on_step_id TEXT NOT NULL,
+                PRIMARY KEY (plan_id, step_id, depends_on_step_id),
+                FOREIGN KEY(plan_id) REFERENCES execution_plans(plan_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_task_dependencies_plan_step
+                ON task_dependencies (plan_id, step_id);
+
+            CREATE TABLE IF NOT EXISTS orchestration_events (
+                event_id TEXT PRIMARY KEY,
+                run_id TEXT NOT NULL,
+                plan_id TEXT DEFAULT '',
+                subject_type TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                timestamp TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(run_id) REFERENCES runs(run_id),
+                FOREIGN KEY(plan_id) REFERENCES execution_plans(plan_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_orchestration_events_run_time
+                ON orchestration_events (run_id, timestamp DESC);
+            CREATE INDEX IF NOT EXISTS idx_orchestration_events_subject
+                ON orchestration_events (subject_type, subject_id, timestamp DESC);
             """
         )
         _ensure_column(conn, "runs", "workflow_id", "TEXT")
@@ -819,4 +932,10 @@ def initialize_db(db_path: str = DB_PATH):
         _ensure_column(conn, "runs", "resumable", "INTEGER")
         _ensure_column(conn, "runs", "checkpoint_json", "TEXT")
         _ensure_column(conn, "agent_executions", "completed_at", "TEXT")
+        _ensure_column(conn, "plan_tasks", "side_effect_level", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(conn, "plan_tasks", "conflict_keys_json", "TEXT NOT NULL DEFAULT '[]'")
+        _ensure_column(conn, "plan_tasks", "lease_owner", "TEXT DEFAULT ''")
+        _ensure_column(conn, "plan_tasks", "lease_expires_at", "TEXT")
+        _ensure_column(conn, "plan_tasks", "attempt_count", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "plan_tasks", "last_attempt_at", "TEXT")
     _migrate_legacy_databases_once(resolved_db_path)

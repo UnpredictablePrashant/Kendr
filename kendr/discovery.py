@@ -391,6 +391,14 @@ def _register_mcp_tools(registry: Registry, *, strict: bool = False) -> None:
                         state["mcp_tool_name"] = tname
                         state["mcp_server_name"] = sname
                         state["mcp_tool_ok"] = True
+                        surfaces = state.setdefault("used_execution_surfaces", [])
+                        if isinstance(surfaces, list):
+                            surfaces.append({
+                                "kind": "mcp",
+                                "server": sname,
+                                "tool": tname,
+                                "label": f"{sname}/{tname}",
+                            })
                     except Exception as exc:
                         state["mcp_tool_ok"] = False
                         state["mcp_tool_error"] = str(exc)
@@ -518,6 +526,13 @@ def _register_skill_agents(registry: Registry, *, strict: bool = False) -> None:
                 state["skill_result"] = result
                 state["skill_slug"] = slug_
                 state[f"skill_result_{slug_}"] = result
+                surfaces = state.setdefault("used_execution_surfaces", [])
+                if isinstance(surfaces, list):
+                    surfaces.append({
+                        "kind": "skill",
+                        "skill": slug_,
+                        "label": str(result.get("source_surface") or f"skill:{slug_}"),
+                    })
 
                 if result.get("error_type") == "approval_required":
                     state["awaiting_user_input"] = True
