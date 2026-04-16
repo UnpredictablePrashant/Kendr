@@ -714,6 +714,70 @@ def _summarize_session(session: dict) -> str:
     )
 
 
+def _source_mix_summary_lines(source_summary: dict) -> list[str]:
+    if not isinstance(source_summary, dict) or not source_summary:
+        return ["- none"]
+
+    lines: list[str] = []
+    local = source_summary.get("local") if isinstance(source_summary.get("local"), dict) else {}
+    if local:
+        files = int(local.get("files", 0) or 0)
+        roots = len(local.get("roots") or []) if isinstance(local.get("roots"), list) else 0
+        lines.append(f"- local: {files} file(s) across {roots} root path(s)")
+
+    urls = source_summary.get("urls") if isinstance(source_summary.get("urls"), dict) else {}
+    if urls:
+        pages = int(urls.get("pages_with_text", 0) or 0)
+        requested = int(urls.get("requested_urls", 0) or 0)
+        lines.append(f"- urls: {pages} page(s) with text from {requested} seed URL(s)")
+
+    database = source_summary.get("database") if isinstance(source_summary.get("database"), dict) else {}
+    if database:
+        tables = int(database.get("tables_scanned", 0) or 0)
+        sampled = int(database.get("rows_sampled", 0) or 0)
+        lines.append(f"- database: {tables} table(s) scanned and {sampled} sampled row(s)")
+
+    onedrive = source_summary.get("onedrive") if isinstance(source_summary.get("onedrive"), dict) else {}
+    if onedrive:
+        docs = int(onedrive.get("documents_ingested", 0) or 0)
+        scanned = int(onedrive.get("items_scanned", 0) or 0)
+        lines.append(f"- onedrive: {docs} document(s) ingested from {scanned} scanned item(s)")
+
+    return lines or ["- none"]
+
+
+def _render_sources_section(citations: list[dict]) -> str:
+    seen: set[str] = set()
+    lines: list[str] = []
+    for citation in citations:
+        if not isinstance(citation, dict):
+            continue
+        source = str(citation.get("source", "") or "").strip()
+        if not source or source in seen:
+            continue
+        seen.add(source)
+        score = citation.get("score")
+        if isinstance(score, (int, float)):
+            lines.append(f"- {source} (score={float(score):.3f})")
+        else:
+            lines.append(f"- {source}")
+    if not lines:
+        return ""
+    return "Sources:\n" + "\n".join(lines)
+
+
+def _ensure_sources_section(answer: str, citations: list[dict]) -> str:
+    answer_text = str(answer or "").strip()
+    sources_block = _render_sources_section(citations)
+    if not sources_block:
+        return answer_text
+    if "sources:" in answer_text.lower():
+        return answer_text
+    if not answer_text:
+        return sources_block
+    return f"{answer_text}\n\n{sources_block}"
+
+
 def _build_mode(state: dict, task_content: str, call_number: int) -> tuple[str, dict]:
     requested_session = str(state.get("superrag_session_id") or _extract_session_from_text(task_content) or "").strip()
     if bool(state.get("superrag_new_session", False)):
@@ -905,18 +969,22 @@ def _build_mode(state: dict, task_content: str, call_number: int) -> tuple[str, 
     upsert_superrag_session(updated)
 
     resolved_session = get_superrag_session(session_id) or updated
+    source_mix_summary = _source_mix_summary_lines(source_summary)
     summary = (
         "superRAG build completed.\n"
         f"Session: {session_id}\n"
         f"Collection: {collection_name}\n"
         f"Documents: {stats['documents']}\n"
         f"Chunks indexed: {stats['indexed']}\n"
+        "Source mix:\n"
+        f"{chr(10).join(source_mix_summary)}\n"
         "You can now chat with this session by setting superrag_mode=chat and reusing the same superrag_session_id."
     )
     payload = {
         "mode": "build",
         "session": resolved_session,
         "source_summary": source_summary,
+        "source_mix_summary": source_mix_summary,
         "index_result": index_result,
         "stats": stats,
         "sample_sources": [item.get("source", "") for item in all_docs[:15]],
@@ -1120,6 +1188,7 @@ Rules:
             "created_at": now,
         }
     )
+    answer = _ensure_sources_section(answer, citations)
     insert_superrag_chat_message(
         {
             "message_id": f"chat_{uuid.uuid4().hex}",
@@ -1155,8 +1224,11 @@ Rules:
         "collection": collection,
         "query": query,
         "hits": hits,
+        "hit_count": len(hits),
         "citations": citations,
         "answer": answer,
+        "source_summary": session.get("source_summary", {}),
+        "source_mix_summary": _source_mix_summary_lines(session.get("source_summary", {})),
     }
     state["superrag_active_session_id"] = session_id
     state["superrag_session_id"] = session_id

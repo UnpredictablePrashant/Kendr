@@ -9,7 +9,7 @@ from openai import OpenAI
 from kendr.rag_manager import build_research_grounding
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.coding_tasks import _extract_output_text
-from tasks.research_infra import fetch_urls_content, llm_text, parse_documents
+from tasks.research_infra import fetch_url_content, llm_text, parse_documents
 from tasks.utils import OUTPUT_DIR, log_task_update, write_text_file
 
 
@@ -42,6 +42,7 @@ AGENT_METADATA = {
             "research_kb_hit_count",
             "research_kb_citations",
             "research_kb_warning",
+            "research_source_summary",
         ],
         "requirements": ["openai"],
         "display_name": "Deep Research Agent",
@@ -84,6 +85,61 @@ def _normalize_url_list(raw_value: Any) -> list[str]:
     return urls
 
 
+def _research_source_summary_lines(
+    state: dict,
+    *,
+    local_meta: dict,
+    kb_grounding: dict[str, Any],
+) -> list[str]:
+    lines: list[str] = []
+
+    kb_name = str((kb_grounding or {}).get("kb_name", "") or "").strip()
+    kb_hits = int((kb_grounding or {}).get("hit_count", 0) or 0)
+    kb_citations = list((kb_grounding or {}).get("citations", []) or [])
+    if kb_name or kb_hits or kb_citations:
+        label = kb_name or "active knowledge base"
+        hit_label = "hit" if kb_hits == 1 else "hits"
+        lines.append(f"- Knowledge base: {label} ({kb_hits} {hit_label})")
+        for citation in kb_citations[:5]:
+            source_id = str(
+                citation.get("source_id")
+                or citation.get("uri")
+                or citation.get("path")
+                or citation.get("title")
+                or ""
+            ).strip()
+            if source_id:
+                lines.append(f"- KB source: {source_id}")
+
+    local_file_count = int((local_meta or {}).get("local_file_count", 0) or 0)
+    if local_file_count > 0:
+        label = "file" if local_file_count == 1 else "files"
+        lines.append(f"- Local {label} reviewed: {local_file_count}")
+
+    provided_urls = _normalize_url_list(state.get("deep_research_source_urls", []))[:10]
+    if provided_urls:
+        for url in provided_urls:
+            lines.append(f"- Provided URL: {url}")
+    else:
+        provided_url_count = int((local_meta or {}).get("provided_url_count", 0) or 0)
+        if provided_url_count > 0:
+            label = "URL" if provided_url_count == 1 else "URLs"
+            lines.append(f"- Provided {label} reviewed: {provided_url_count}")
+
+    return lines
+
+
+def _ensure_sources_section(output_text: str, source_lines: list[str]) -> str:
+    text = str(output_text or "").strip()
+    if not source_lines:
+        return text
+    if "\nSources:\n" in text or text.startswith("Sources:\n"):
+        return text
+    if text:
+        return f"{text}\n\nSources:\n" + "\n".join(source_lines)
+    return "Sources:\n" + "\n".join(source_lines)
+
+
 def _build_local_source_context(state: dict, query: str, *, include_urls: bool) -> tuple[str, dict]:
     blocks: list[str] = []
     meta = {"local_file_count": 0, "provided_url_count": 0}
@@ -113,9 +169,8 @@ def _build_local_source_context(state: dict, query: str, *, include_urls: bool) 
 
     if include_urls:
         provided_urls = _normalize_url_list(state.get("deep_research_source_urls", []))[:10]
-        fetched_urls = fetch_urls_content(provided_urls, timeout=20) if provided_urls else []
-        for index, page in enumerate(fetched_urls, start=1):
-            url = str(page.get("url", "")).strip()
+        for index, url in enumerate(provided_urls, start=1):
+            page = dict(fetch_url_content(url, timeout=20) or {})
             if page.get("error"):
                 page_text = f"URL extraction failed: {page.get('error')}"
             else:
@@ -233,6 +288,7 @@ def deep_research_agent(state):
         for part in (kb_grounding.get("prompt_context", ""), local_context)
         if str(part).strip()
     ).strip()
+    source_summary = _research_source_summary_lines(state, local_meta=local_meta, kb_grounding=kb_grounding)
 
     if not web_search_enabled:
         local_only_prompt = f"""
@@ -250,7 +306,7 @@ Write a source-aware research memo that:
 - calls out gaps or uncertainty clearly
 - ends with a concise recommended next-steps section
 """
-        output_text = llm_text(local_only_prompt).strip()
+        output_text = _ensure_sources_section(llm_text(local_only_prompt).strip(), source_summary)
         payload = {
             "mode": "local_only",
             "query": query,
@@ -260,6 +316,7 @@ Write a source-aware research memo that:
             "research_kb": kb_grounding,
             "research_kb_used": bool(kb_grounding.get("prompt_context")),
             "research_kb_warning": kb_warning,
+            "source_summary": source_summary,
             "output_text": output_text,
         }
         raw_filename = f"deep_research_raw_{call_number}.json"
@@ -276,6 +333,7 @@ Write a source-aware research memo that:
         state["research_kb_hit_count"] = int((kb_grounding or {}).get("hit_count", 0) or 0)
         state["research_kb_citations"] = list((kb_grounding or {}).get("citations", []) or [])
         state["research_kb_warning"] = kb_warning
+        state["research_source_summary"] = source_summary
         state["draft_response"] = output_text
         log_task_update(
             "Deep Research",
@@ -353,7 +411,10 @@ Write a source-aware research memo that:
     payload["research_kb"] = kb_grounding
     payload["research_kb_used"] = bool(kb_grounding.get("prompt_context"))
     payload["research_kb_warning"] = kb_warning
+    payload["source_summary"] = source_summary
     output_text = getattr(response, "output_text", None) or _extract_output_text(payload)
+    output_text = _ensure_sources_section(output_text, source_summary)
+    payload["output_text"] = output_text
 
     raw_filename = f"deep_research_raw_{call_number}.json"
     output_filename = f"deep_research_output_{call_number}.txt"
@@ -371,6 +432,7 @@ Write a source-aware research memo that:
     state["research_kb_hit_count"] = int((kb_grounding or {}).get("hit_count", 0) or 0)
     state["research_kb_citations"] = list((kb_grounding or {}).get("citations", []) or [])
     state["research_kb_warning"] = kb_warning
+    state["research_source_summary"] = source_summary
     state["draft_response"] = output_text
 
     log_task_update(
