@@ -1490,15 +1490,11 @@ def _validate_run_workflows(
         raise SystemExit("One or more --drive paths do not exist:\n- " + "\n- ".join(missing_drive))
 
     deep_research_links = _normalize_url_inputs(list(getattr(args, "deep_research_link", []) or []))
-    if bool(getattr(args, "no_web_search", False)) and deep_research_links:
+    has_research_kb = bool(str(getattr(args, "research_kb", "") or "").strip() or bool(getattr(args, "research_use_active_kb", False)))
+    if bool(getattr(args, "no_web_search", False)) and not (drive_paths or deep_research_links or has_research_kb):
         raise SystemExit(
-            "--no-web-search cannot be combined with --deep-research-link.\n"
-            "Disable web search only when the report should rely strictly on local files/folders."
-        )
-    if bool(getattr(args, "no_web_search", False)) and not drive_paths:
-        raise SystemExit(
-            "--no-web-search requires local sources via --drive or --deep-research-path.\n"
-            "Add one or more local files/folders before requesting a local-only deep research run."
+            "--no-web-search requires at least one local source, explicit deep-research link, or research KB.\n"
+            "Add --drive/--deep-research-path, --deep-research-link, --research-kb, or --research-use-active-kb."
         )
 
     missing_superrag_paths = [
@@ -1906,6 +1902,22 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         type=int,
         default=0,
         help="Cap the total number of sources gathered for deep research mode.",
+    )
+    run_parser.add_argument(
+        "--research-kb",
+        default="",
+        help="Use a specific indexed knowledge base by name or id for deep research grounding.",
+    )
+    run_parser.add_argument(
+        "--research-use-active-kb",
+        action="store_true",
+        help="Use the active indexed knowledge base for deep research grounding.",
+    )
+    run_parser.add_argument(
+        "--research-kb-top-k",
+        type=int,
+        default=8,
+        help="Top-K KB chunks to retrieve for deep research grounding (default 8).",
     )
     run_parser.add_argument(
         "--checkpoint",
@@ -2794,6 +2806,22 @@ def _build_parser(style: _CliStyle) -> tuple[argparse.ArgumentParser, dict[str, 
         type=int,
         default=0,
         help="Cap total sources gathered during deep research.",
+    )
+    research_parser.add_argument(
+        "--research-kb",
+        default="",
+        help="Use a specific indexed knowledge base by name or id for deep research grounding.",
+    )
+    research_parser.add_argument(
+        "--research-use-active-kb",
+        action="store_true",
+        help="Use the active indexed knowledge base for deep research grounding.",
+    )
+    research_parser.add_argument(
+        "--research-kb-top-k",
+        type=int,
+        default=8,
+        help="Top-K KB chunks to retrieve for deep research grounding (default 8).",
     )
     research_parser.add_argument(
         "--checkpoint",
@@ -4909,6 +4937,10 @@ def _cmd_research(args: argparse.Namespace) -> int:
         base_ingest_payload["research_date_range"] = str(args.date_range).strip()
     if int(getattr(args, "max_sources", 0) or 0) > 0:
         base_ingest_payload["research_max_sources"] = int(args.max_sources)
+    if bool(getattr(args, "research_use_active_kb", False)) or str(getattr(args, "research_kb", "") or "").strip():
+        base_ingest_payload["research_kb_enabled"] = True
+        base_ingest_payload["research_kb_id"] = str(getattr(args, "research_kb", "") or "").strip()
+        base_ingest_payload["research_kb_top_k"] = int(getattr(args, "research_kb_top_k", 8) or 8)
     if bool(getattr(args, "checkpoint", False)):
         base_ingest_payload["research_checkpoint_enabled"] = True
     deep_research_links = _normalize_url_inputs(list(getattr(args, "deep_research_link", []) or []))
@@ -4918,15 +4950,11 @@ def _cmd_research(args: argparse.Namespace) -> int:
         base_ingest_payload["auto_approve"] = True
 
     drive_paths = _normalize_drive_paths(args.drive)
-    if bool(getattr(args, "no_web_search", False)) and deep_research_links:
-        raise SystemExit(
-            "--no-web-search cannot be combined with --deep-research-link.\n"
-            "Use local files/folders only for a local-only deep research run."
-        )
     if bool(getattr(args, "no_web_search", False)) and not drive_paths:
-        raise SystemExit(
-            "--no-web-search requires at least one --drive or --deep-research-path source."
-        )
+        if not deep_research_links and not bool(base_ingest_payload.get("research_kb_enabled")):
+            raise SystemExit(
+                "--no-web-search requires at least one --drive/--deep-research-path, --deep-research-link, or research KB."
+            )
     if drive_paths:
         base_ingest_payload["local_drive_paths"] = drive_paths
         base_ingest_payload["local_drive_recursive"] = True
@@ -5298,6 +5326,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         base_ingest_payload["research_date_range"] = str(args.date_range).strip()
     if int(getattr(args, "max_sources", 0) or 0) > 0:
         base_ingest_payload["research_max_sources"] = int(args.max_sources)
+    if bool(getattr(args, "research_use_active_kb", False)) or str(getattr(args, "research_kb", "") or "").strip():
+        base_ingest_payload["research_kb_enabled"] = True
+        base_ingest_payload["research_kb_id"] = str(getattr(args, "research_kb", "") or "").strip()
+        base_ingest_payload["research_kb_top_k"] = int(getattr(args, "research_kb_top_k", 8) or 8)
     if bool(getattr(args, "checkpoint", False)):
         base_ingest_payload["research_checkpoint_enabled"] = True
     deep_research_links = _normalize_url_inputs(list(getattr(args, "deep_research_link", []) or []))

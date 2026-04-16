@@ -8,6 +8,7 @@ os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 
 from kendr.persistence import initialize_db, list_execution_plans, list_orchestration_events, list_plan_tasks
 from tasks.planning_tasks import normalize_plan_data, planner_agent
+from tasks.project_blueprint_tasks import project_blueprint_agent
 from tasks.utils import model_selection_for_agent, runtime_model_override
 
 
@@ -214,6 +215,70 @@ class PlanningTaskTests(unittest.TestCase):
         self.assertIn("security request", result["pending_user_question"].lower())
         self.assertIn("security_scope_guard_agent", result["pending_user_question"])
         self.assertNotIn("worker_agent", result["pending_user_question"])
+
+    def test_planner_agent_sanitizes_project_build_steps_in_deep_research_mode(self):
+        state = {
+            "user_query": "Do deep research on chaos engineering failure simulation in AWS and export the report.",
+            "current_objective": "Do deep research on chaos engineering failure simulation in AWS and export the report.",
+            "workflow_type": "deep_research",
+            "deep_research_mode": True,
+        }
+        planner_payload = json.dumps(
+            {
+                "summary": "Research first, then create a project blueprint.",
+                "steps": [
+                    {
+                        "id": "step-1",
+                        "title": "Research topic",
+                        "agent": "long_document_agent",
+                        "task": "Research the topic and compile the report.",
+                        "success_criteria": "Research findings are compiled.",
+                    },
+                    {
+                        "id": "step-2",
+                        "title": "Create blueprint",
+                        "agent": "project_blueprint_agent",
+                        "task": "Create a project blueprint for the implementation.",
+                        "depends_on": ["step-1"],
+                        "success_criteria": "A blueprint is ready for approval.",
+                    },
+                ],
+            }
+        )
+
+        with (
+            patch("tasks.planning_tasks.begin_agent_session", return_value=("", state["user_query"], "")),
+            patch("tasks.planning_tasks.log_task_update"),
+            patch("tasks.planning_tasks.write_text_file"),
+            patch("tasks.planning_tasks.update_planning_file"),
+            patch("tasks.planning_tasks.publish_agent_output", side_effect=lambda current_state, *_args, **_kwargs: current_state),
+            patch("tasks.planning_tasks.model_selection_for_agent", return_value={"provider": "openai", "model": "gpt-4o-mini", "source": "OPENAI_MODEL_GENERAL"}),
+            patch("tasks.planning_tasks.provider_status", return_value={"provider": "openai", "ready": True, "note": "", "base_url": "", "model": "gpt-4o-mini"}),
+            patch("tasks.planning_tasks.llm.invoke", return_value=planner_payload),
+        ):
+            result = planner_agent(state)
+
+        self.assertEqual(len(result["plan_steps"]), 1)
+        self.assertEqual(result["plan_steps"][0]["agent"], "long_document_agent")
+        self.assertNotIn("project_blueprint_agent", result["plan"])
+
+    def test_project_blueprint_agent_refuses_to_run_in_deep_research_workflow(self):
+        state = {
+            "workflow_type": "deep_research",
+            "deep_research_mode": True,
+            "blueprint_request": "Build an AWS chaos engineering service.",
+        }
+
+        with (
+            patch("tasks.project_blueprint_tasks.begin_agent_session", return_value=("", state["blueprint_request"], "")),
+            patch("tasks.project_blueprint_tasks.log_task_update"),
+            patch("tasks.project_blueprint_tasks.publish_agent_output", side_effect=lambda current_state, *_args, **_kwargs: current_state),
+        ):
+            result = project_blueprint_agent(state)
+
+        self.assertEqual(result["blueprint_status"], "blocked_in_research_workflow")
+        self.assertFalse(result["blueprint_waiting_for_approval"])
+        self.assertIn("Project blueprint generation is disabled", result["draft_response"])
 
     def test_normalize_plan_data_keeps_non_security_fallback_behavior(self):
         plan_data = normalize_plan_data({}, "Build a fundraising report.")

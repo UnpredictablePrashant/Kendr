@@ -17,6 +17,7 @@ from kendr.http import (
     resume_candidate_requires_reply,
     session_id_for_payload,
 )
+from kendr.orchestration import state_awaiting_user_input
 from kendr.persistence import (
     get_run,
     get_task_session_by_run,
@@ -194,14 +195,22 @@ def _decorate_run_record(run_row: dict, task_session: dict | None = None) -> dic
             row["pending_user_input_kind"] = str(summary.get("pending_user_input_kind") or row.get("pending_user_input_kind") or "").strip()
             row["approval_pending_scope"] = str(summary.get("approval_pending_scope") or row.get("approval_pending_scope") or "").strip()
             row["pending_user_question"] = str(summary.get("pending_user_question") or row.get("pending_user_question") or "").strip()
-            if bool(summary.get("awaiting_user_input")) or row.get("pending_user_input_kind") or row.get("approval_pending_scope"):
-                row["status"] = "awaiting_user_input"
-                row["awaiting_user_input"] = True
+            summary_request = summary.get("approval_request")
+            if isinstance(summary_request, dict):
+                row["approval_request"] = summary_request
             summary_run_dir = str(summary.get("run_output_dir", "")).strip()
             if summary_run_dir and not run_output_dir:
                 row["run_output_dir"] = summary_run_dir
                 row["output_dir"] = summary_run_dir
                 row["log_paths"] = _run_log_paths(summary_run_dir)
+    awaiting = state_awaiting_user_input(row)
+    if awaiting:
+        row["awaiting_user_input"] = True
+        row["status"] = "awaiting_user_input"
+    else:
+        row.pop("awaiting_user_input", None)
+        if str(row.get("status") or "").strip().lower() == "awaiting_user_input":
+            row["status"] = "completed" if str(row.get("completed_at") or "").strip() else "running"
     return row
 
 
@@ -1208,6 +1217,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             "research_date_range",
             "research_max_sources",
             "research_checkpoint_enabled",
+            "research_kb_enabled",
+            "research_kb_id",
+            "research_kb_top_k",
             "local_drive_paths",
             "local_drive_recursive",
             "local_drive_include_hidden",
@@ -1267,19 +1279,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             state_overrides["security_scan_profile"] = str(payload.get("security_scan_profile")).strip().lower()
         try:
             result = RUNTIME.run_query(text, state_overrides=state_overrides)
-            awaiting_user_input = bool(
-                result.get("plan_needs_clarification", False)
-                or result.get("plan_waiting_for_approval", False)
-                or result.get("long_document_plan_waiting_for_approval", False)
-                or result.get("blueprint_waiting_for_approval", False)
-                or str(result.get("approval_pending_scope", "")).strip()
-                or (
-                    isinstance(result.get("approval_request"), dict)
-                    and bool(result.get("approval_request"))
-                )
-                or str(result.get("pending_user_question", "")).strip()
-                or str(result.get("pending_user_input_kind", "")).strip()
-            )
+            awaiting_user_input = state_awaiting_user_input(result)
             self._send_json(
                 200,
                 {

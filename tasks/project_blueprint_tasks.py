@@ -13,6 +13,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from kendr.workflow_contract import is_deep_research_workflow_type
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.utils import OUTPUT_DIR, llm, log_task_update, normalize_llm_text, write_text_file
 
@@ -613,6 +614,31 @@ def project_blueprint_agent(state):
     active_task, task_content, _ = begin_agent_session(state, "project_blueprint_agent")
     state["project_blueprint_agent_calls"] = state.get("project_blueprint_agent_calls", 0) + 1
     call_number = state["project_blueprint_agent_calls"]
+    workflow_type = str(state.get("workflow_type", "") or "").strip().lower()
+
+    if (
+        is_deep_research_workflow_type(workflow_type)
+        or bool(state.get("deep_research_mode", False))
+        or bool(state.get("long_document_mode", False))
+    ):
+        blocked_message = (
+            "Deep research mode only supports research, analysis, and document export. "
+            "Project blueprint generation is disabled for this workflow."
+        )
+        state["pending_user_question"] = ""
+        state["pending_user_input_kind"] = ""
+        state["approval_pending_scope"] = ""
+        state["blueprint_waiting_for_approval"] = False
+        state["blueprint_status"] = "blocked_in_research_workflow"
+        state["draft_response"] = blocked_message
+        log_task_update("Blueprint", blocked_message)
+        return publish_agent_output(
+            state,
+            "project_blueprint_agent",
+            blocked_message,
+            f"blueprint_blocked_{call_number}",
+            recipients=["orchestrator_agent", "planner_agent"],
+        )
 
     description = (
         state.get("blueprint_request")

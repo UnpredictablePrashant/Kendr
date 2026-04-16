@@ -356,6 +356,147 @@ class LocalDriveAgentTests(unittest.TestCase):
         self.assertEqual(duplicate_groups[0]["name"], "report.txt")
         self.assertEqual(duplicate_groups[0]["count"], 2)
 
+    def test_local_drive_agent_prioritizes_business_documents_over_package_noise(self):
+        with TemporaryDirectory() as tmp:
+            paths = {
+                "package": os.path.join(tmp, "package.txt"),
+                "readme": os.path.join(tmp, "readme.txt"),
+                "pdf": os.path.join(tmp, "aws-chaos-architecture.pdf"),
+                "pptx": os.path.join(tmp, "failure-simulation.pptx"),
+            }
+            for path in paths.values():
+                with open(path, "wb") as handle:
+                    handle.write(b"sample")
+
+            state = {
+                "user_query": "Research chaos engineering failure simulation on AWS from local files.",
+                "current_objective": "Research chaos engineering failure simulation on AWS from local files.",
+                "local_drive_paths": [tmp],
+                "local_drive_working_directory": tmp,
+                "local_drive_max_files": 2,
+                "local_drive_index_to_memory": False,
+            }
+
+            def _fake_parse(selected_paths, **_kwargs):
+                path = selected_paths[0]
+                suffix = os.path.splitext(path)[1].lstrip(".") or "unknown"
+                return [{"path": path, "text": f"content for {suffix}", "metadata": {"type": suffix, "error": ""}}]
+
+            with (
+                patch("tasks.a2a_agent_utils.record_work_note"),
+                patch("tasks.intelligence_tasks.log_task_update"),
+                patch("tasks.intelligence_tasks.write_text_file"),
+                patch("tasks.intelligence_tasks._maybe_upsert_memory"),
+                patch("tasks.intelligence_tasks.parse_documents", side_effect=_fake_parse),
+                patch("tasks.intelligence_tasks.llm_text", side_effect=["doc summary", "doc summary", "rollup"]),
+            ):
+                result = local_drive_agent(state)
+
+        self.assertEqual(len(result.get("local_drive_files", [])), 2)
+        self.assertIn(paths["pdf"], result["local_drive_files"])
+        self.assertIn(paths["pptx"], result["local_drive_files"])
+        self.assertNotIn(paths["package"], result["local_drive_files"])
+        self.assertNotIn(paths["readme"], result["local_drive_files"])
+        self.assertIn("deep_research_source_strategy", result)
+        self.assertIn("deep_research_intent", result)
+        self.assertTrue(result["local_drive_manifest"]["source_strategy"])
+        selected_entries = [
+            item for item in result["local_drive_manifest"]["files"]
+            if item.get("selected_for_processing")
+        ]
+        self.assertTrue(all(item.get("selection_reason") for item in selected_entries))
+        skipped_entries = [
+            item for item in result["local_drive_manifest"]["files"]
+            if not item.get("selected_for_processing") and item.get("exclusion_reason")
+        ]
+        self.assertTrue(any(item.get("skip_reason_detail") for item in skipped_entries))
+
+    def test_local_drive_agent_prioritizes_code_files_for_code_objectives(self):
+        with TemporaryDirectory() as tmp:
+            paths = {
+                "docx": os.path.join(tmp, "strategy.docx"),
+                "pdf": os.path.join(tmp, "overview.pdf"),
+                "py": os.path.join(tmp, "service.py"),
+                "ts": os.path.join(tmp, "api.ts"),
+            }
+            for path in paths.values():
+                with open(path, "wb") as handle:
+                    handle.write(b"sample")
+
+            state = {
+                "user_query": "Analyze the repository source code and architecture from local files.",
+                "current_objective": "Analyze the repository source code and architecture from local files.",
+                "local_drive_paths": [tmp],
+                "local_drive_working_directory": tmp,
+                "local_drive_max_files": 2,
+                "local_drive_index_to_memory": False,
+            }
+
+            def _fake_parse(selected_paths, **_kwargs):
+                path = selected_paths[0]
+                suffix = os.path.splitext(path)[1].lstrip(".") or "unknown"
+                return [{"path": path, "text": f"content for {suffix}", "metadata": {"type": suffix, "error": ""}}]
+
+            with (
+                patch("tasks.a2a_agent_utils.record_work_note"),
+                patch("tasks.intelligence_tasks.log_task_update"),
+                patch("tasks.intelligence_tasks.write_text_file"),
+                patch("tasks.intelligence_tasks._maybe_upsert_memory"),
+                patch("tasks.intelligence_tasks.parse_documents", side_effect=_fake_parse),
+                patch("tasks.intelligence_tasks.llm_text", side_effect=["doc summary", "doc summary", "rollup"]),
+            ):
+                result = local_drive_agent(state)
+
+        self.assertEqual(len(result.get("local_drive_files", [])), 2)
+        self.assertIn(paths["py"], result["local_drive_files"])
+        self.assertIn(paths["ts"], result["local_drive_files"])
+        self.assertNotIn(paths["docx"], result["local_drive_files"])
+        self.assertNotIn(paths["pdf"], result["local_drive_files"])
+
+    def test_local_drive_agent_skips_generated_artifacts_in_favor_of_primary_documents(self):
+        with TemporaryDirectory() as tmp:
+            paths = {
+                "log": os.path.join(tmp, "execution.log"),
+                "notes": os.path.join(tmp, "agent_work_notes.txt"),
+                "summary": os.path.join(tmp, "executive-summary.docx"),
+                "architecture": os.path.join(tmp, "architecture-overview.pdf"),
+            }
+            for path in paths.values():
+                with open(path, "wb") as handle:
+                    handle.write(b"sample")
+
+            state = {
+                "user_query": "Research the AWS failure architecture and summarize the main findings from local files.",
+                "current_objective": "Research the AWS failure architecture and summarize the main findings from local files.",
+                "local_drive_paths": [tmp],
+                "local_drive_working_directory": tmp,
+                "local_drive_max_files": 2,
+                "local_drive_index_to_memory": False,
+            }
+
+            def _fake_parse(selected_paths, **_kwargs):
+                path = selected_paths[0]
+                suffix = os.path.splitext(path)[1].lstrip(".") or "unknown"
+                return [{"path": path, "text": f"content for {suffix}", "metadata": {"type": suffix, "error": ""}}]
+
+            with (
+                patch("tasks.a2a_agent_utils.record_work_note"),
+                patch("tasks.intelligence_tasks.log_task_update"),
+                patch("tasks.intelligence_tasks.write_text_file"),
+                patch("tasks.intelligence_tasks._maybe_upsert_memory"),
+                patch("tasks.intelligence_tasks.parse_documents", side_effect=_fake_parse),
+                patch("tasks.intelligence_tasks.llm_text", side_effect=["doc summary", "doc summary", "rollup"]),
+            ):
+                result = local_drive_agent(state)
+
+        self.assertEqual(result.get("local_drive_files", []), [paths["architecture"], paths["summary"]])
+        manifest_files = result["local_drive_manifest"]["files"]
+        selected_entries = [item for item in manifest_files if item.get("selected_for_processing")]
+        skipped_entries = {item["path"]: item for item in manifest_files if not item.get("selected_for_processing")}
+        self.assertTrue(any(item.get("priority_boosts") for item in selected_entries))
+        self.assertIn("generated research artifact", skipped_entries[paths["log"]].get("skip_reason_detail", ""))
+        self.assertIn("generated research artifact", skipped_entries[paths["notes"]].get("skip_reason_detail", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

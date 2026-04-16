@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import cgi
 import html as _html
 import http.client
 import json
@@ -31,6 +30,7 @@ from kendr.chat_context import (
     normalize_chat_messages as _normalize_chat_messages,
     summary_file_path as _chat_summary_file_path,
 )
+from kendr.orchestration import state_awaiting_user_input
 from kendr.path_utils import bundled_resource_path, normalize_host_path_str
 
 from tasks.setup_config_store import (
@@ -52,6 +52,7 @@ try:
         delete_run as _db_delete_run,
         get_assistant as _db_get_assistant,
         get_channel_session as _db_get_channel_session,
+        get_task_session_by_run as _db_get_task_session_by_run,
         list_agent_executions_for_run as _list_run_steps,
         list_assistants as _db_list_assistants,
         list_artifacts_for_run as _list_run_artifacts,
@@ -77,6 +78,8 @@ except Exception:
     def _db_get_assistant(assistant_id, **kw):  # type: ignore[misc]
         return None
     def _db_get_channel_session(session_key, **kw):  # type: ignore[misc]
+        return None
+    def _db_get_task_session_by_run(run_id, **kw):  # type: ignore[misc]
         return None
     def _db_list_assistants(**kw):  # type: ignore[misc]
         return []
@@ -332,6 +335,42 @@ def _assistant_system_prompt(assistant: dict) -> str:
         lines.append("Additional instructions:")
         lines.append(system_prompt)
     return "\n".join(lines).strip()
+
+
+_TASK_REQUEST_ACTION_RE = re.compile(
+    r"^\s*(please\s+)?"
+    r"(search|find|list|open|read|scan|inspect|run|execute|edit|modify|change|create|add|update|fix|refactor|write|delete|remove|rename|move|install|start|stop|restart|build|test|deploy|commit|push|pull)\b"
+)
+_TASK_REQUEST_ASSISTANT_RE = re.compile(
+    r"\b(can you|could you|please|go ahead and|help me|i need you to)\s+"
+    r"(search|find|list|open|read|scan|inspect|run|execute|edit|modify|change|create|add|update|fix|refactor|write|delete|remove|rename|move|install|start|stop|restart|build|test|deploy|commit|push|pull)\b"
+)
+_TASK_REQUEST_INFO_RE = re.compile(
+    r"^\s*(what|why|how|where|which|who|when|can i|should i|is it possible|explain|summari[sz]e|tell me)\b"
+)
+_SIMPLE_CHAT_TASK_REDIRECT = (
+    "In Studio Chat mode, I can answer questions but I cannot execute tasks on your machine. "
+    "Switch to Agent mode to search files, run commands, or edit code."
+)
+_PROJECT_ASK_TASK_REDIRECT = (
+    "In Studio Chat mode, I can answer questions about the project but I cannot execute project tasks. "
+    "Switch to AI Mode to edit files, run commands, or perform git actions."
+)
+
+
+def _looks_like_machine_task_request(text: str) -> bool:
+    body = re.sub(r"\s+", " ", str(text or "").lower()).strip()
+    if not body:
+        return False
+    if _TASK_REQUEST_INFO_RE.search(body):
+        return False
+    if _TASK_REQUEST_ASSISTANT_RE.search(body):
+        return True
+    if _TASK_REQUEST_ACTION_RE.search(body):
+        return True
+    if "on my machine" in body and re.search(r"\b(search|find|run|edit|scan|open|read|install)\b", body):
+        return True
+    return False
 
 
 def _normalize_mcp_add_payload(body: dict) -> list[dict]:
@@ -1714,20 +1753,28 @@ def _is_cancelled_error_message(message: str) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _normalized_run_status(value: object) -> str:
+    lowered = str(value or "").strip().lower()
+    if lowered == "canceled":
+        return "cancelled"
+    if lowered in {"running", "started", "cancelling", "awaiting_user_input", "cancelled", "failed", "completed"}:
+        return lowered
+    return ""
+
+
+def _fallback_non_awaiting_run_status(*candidates: object, completed: bool = False) -> str:
+    for candidate in candidates:
+        status = _normalized_run_status(candidate)
+        if status and status != "awaiting_user_input":
+            return status
+    return "completed" if completed else "running"
+
+
 def _terminal_run_status(*, result: dict | None = None, error: str = "", default: str = "completed") -> str:
     if _is_cancelled_error_message(error):
         return "cancelled"
     payload = result if isinstance(result, dict) else {}
-    approval_request = payload.get("approval_request")
-    if bool(
-        payload.get("awaiting_user_input")
-        or payload.get("plan_waiting_for_approval")
-        or payload.get("plan_needs_clarification")
-        or str(payload.get("approval_pending_scope", "")).strip()
-        or (isinstance(approval_request, dict) and bool(approval_request))
-        or str(payload.get("pending_user_question", "")).strip()
-        or str(payload.get("pending_user_input_kind", "")).strip()
-    ):
+    if state_awaiting_user_input(payload):
         return "awaiting_user_input"
     explicit = str(payload.get("status", "")).strip().lower()
     if explicit in {"cancelled", "canceled", "failed", "completed", "cancelling"}:
@@ -1850,8 +1897,10 @@ def _overlay_run_with_pending(run_row: dict | None, pending: dict | None) -> dic
     if not run_row and not pending:
         return None
     base = dict(run_row or {})
+    persisted_status = _normalized_run_status(base.get("status"))
     pending = pending or {}
     payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
+    pending_status = _normalized_run_status(pending.get("status"))
     if pending:
         base["run_id"] = base.get("run_id") or pending.get("run_id")
         base["workflow_id"] = (
@@ -1908,10 +1957,17 @@ def _overlay_run_with_pending(run_row: dict | None, pending: dict | None) -> dic
         if not isinstance(base.get("log_paths"), dict) or not base.get("log_paths"):
             base["log_paths"] = _run_log_paths(str(base.get("run_output_dir") or ""))
     result = base.get("result") if isinstance(base.get("result"), dict) else {}
+    result_status = _normalized_run_status(result.get("status")) if result else ""
     if result:
         base["workflow_id"] = base.get("workflow_id") or result.get("workflow_id") or base.get("run_id") or ""
         base["attempt_id"] = base.get("attempt_id") or result.get("attempt_id") or base.get("run_id") or ""
         base["workflow_type"] = base.get("workflow_type") or result.get("workflow_type") or ""
+        if not base.get("pending_user_input_kind"):
+            base["pending_user_input_kind"] = str(result.get("pending_user_input_kind", "") or "").strip()
+        if not base.get("approval_pending_scope"):
+            base["approval_pending_scope"] = str(result.get("approval_pending_scope", "") or "").strip()
+        if not base.get("pending_user_question"):
+            base["pending_user_question"] = str(result.get("pending_user_question", "") or "").strip()
         if isinstance(result.get("approval_request"), dict):
             base["approval_request"] = result.get("approval_request")
     task_session_summary = _task_session_summary(base.get("task_session") if isinstance(base.get("task_session"), dict) else None)
@@ -1926,21 +1982,17 @@ def _overlay_run_with_pending(run_row: dict | None, pending: dict | None) -> dic
             summary_request = task_session_summary.get("approval_request")
             if isinstance(summary_request, dict):
                 base["approval_request"] = summary_request
-        if task_session_summary.get("awaiting_user_input"):
-            base["awaiting_user_input"] = True
-    awaiting = bool(
-        base.get("awaiting_user_input")
-        or str(base.get("pending_user_input_kind", "")).strip()
-        or str(base.get("approval_pending_scope", "")).strip()
-        or (isinstance(base.get("approval_request"), dict) and bool(base.get("approval_request")))
-        or result.get("awaiting_user_input")
-        or result.get("plan_waiting_for_approval")
-        or result.get("plan_needs_clarification")
-        or str(result.get("pending_user_input_kind", "")).strip()
-    )
+    awaiting = state_awaiting_user_input(base)
+    base["awaiting_user_input"] = awaiting
     if awaiting:
         base["status"] = "awaiting_user_input"
-        base["awaiting_user_input"] = True
+    elif _normalized_run_status(base.get("status")) == "awaiting_user_input":
+        base["status"] = _fallback_non_awaiting_run_status(
+            result_status,
+            pending_status,
+            persisted_status,
+            completed=bool(str(base.get("completed_at") or "").strip()),
+        )
     return base
 
 
@@ -2020,6 +2072,8 @@ def _is_chat_control_reply(text: str) -> bool:
     return value in {
         "approve",
         "approved",
+        "cancel",
+        "stop",
         "reject",
         "rejected",
         "continue",
@@ -2028,6 +2082,24 @@ def _is_chat_control_reply(text: str) -> bool:
         "okay",
         "quick summary",
     }
+
+
+def _resume_status_message(text: str) -> str:
+    lowered = str(text or "").strip().lower()
+    if not lowered:
+        return "Resuming paused run..."
+    if lowered in {"approve", "approved", "yes", "y", "ok", "okay", "continue"}:
+        return "Continuing approved plan..."
+    if any(marker in lowered for marker in ("quick summary", "summary only", "brief summary", "just summarize")):
+        return "Switching to quick summary..."
+    if any(marker in lowered for marker in ("cancel", "stop", "abort", "reject")):
+        return "Applying your cancellation..."
+    if any(
+        marker in lowered
+        for marker in ("change", "modify", "revise", "update", "fix", "adjust", "do not", "don't", "instead")
+    ):
+        return "Applying your feedback..."
+    return "Applying your reply..."
 
 
 def _live_recent_chat_threads(runs: list[dict] | None, sessions: list[dict] | None = None) -> list[dict]:
@@ -2212,6 +2284,253 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_RUN_LOG_LINE_RE = re.compile(
+    r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3}) - (?P<level>[A-Z]+) - (?P<message>.*)$"
+)
+_RUN_LOG_SECRET_RE = re.compile(
+    r"(?i)\b((?:api[-_ ]?key|token|secret|password)\s*[:=]\s*)([^\s,;]+)"
+)
+_RUN_LOG_OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{10,}\b")
+
+
+def _run_log_clock_label(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d %H:%M:%S,%f").strftime("%H:%M:%S")
+    except Exception:
+        return raw
+
+
+def _run_log_display_name(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return text.replace("_agent", "").replace("_", " ").strip().title()
+
+
+def _mask_run_log_secrets(value: str) -> str:
+    text = str(value or "")
+    text = _RUN_LOG_OPENAI_KEY_RE.sub(lambda m: m.group(0)[:6] + "..." + m.group(0)[-4:], text)
+    text = _RUN_LOG_SECRET_RE.sub(r"\1<redacted>", text)
+    return text
+
+
+def _compact_run_log_text(value: str, *, limit: int = 220) -> str:
+    text = " ".join(_mask_run_log_secrets(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _basename_for_log_display(value: str) -> str:
+    text = str(value or "").strip().strip("\"'")
+    if not text:
+        return ""
+    normalized = text.replace("\\", "/").rstrip("/")
+    return normalized.rsplit("/", 1)[-1] if "/" in normalized else normalized
+
+
+def _summarize_run_log_message(message: str) -> tuple[str, str]:
+    raw = str(message or "").strip()
+    if not raw or raw == "[LLM Prompt]":
+        return "", ""
+    if raw.startswith("[LLM Call]"):
+        agent = re.search(r"agent=([^|]+)", raw)
+        model = re.search(r"model=([^|]+)", raw)
+        prompt_chars = re.search(r"prompt_chars=(\d+)", raw)
+        provider = re.search(r"provider=([^|]+)", raw)
+        parts = ["LLM call"]
+        if agent:
+            parts.append(_run_log_display_name(agent.group(1).strip()))
+        if model:
+            parts.append(model.group(1).strip())
+        if provider:
+            parts.append(provider.group(1).strip())
+        if prompt_chars:
+            parts.append(f"{int(prompt_chars.group(1)):,} prompt chars")
+        return " · ".join(part for part in parts if part), "llm_call"
+    if raw.startswith("[LLM OK]"):
+        agent = re.search(r"agent=([^|]+)", raw)
+        model = re.search(r"model=([^|]+)", raw)
+        elapsed_ms = re.search(r"elapsed_ms=(\d+)", raw)
+        tokens_in = re.search(r"tokens in:(\d+|\?)", raw)
+        tokens_out = re.search(r"out:(\d+|\?)", raw)
+        parts = ["LLM response"]
+        if agent:
+            parts.append(_run_log_display_name(agent.group(1).strip()))
+        if model:
+            parts.append(model.group(1).strip())
+        if elapsed_ms:
+            parts.append(_duration_label(int(elapsed_ms.group(1))))
+        token_bits: list[str] = []
+        if tokens_in:
+            token_bits.append(f"in {tokens_in.group(1)}")
+        if tokens_out:
+            token_bits.append(f"out {tokens_out.group(1)}")
+        if token_bits:
+            parts.append("tokens " + " / ".join(token_bits))
+        return " · ".join(part for part in parts if part), "llm_ok"
+    if raw.startswith("[files] wrote:"):
+        path = raw.split(":", 1)[1].strip()
+        name = _basename_for_log_display(path)
+        return f"Wrote artifact · {name or _compact_run_log_text(path)}", "artifact"
+    cleaned = _compact_run_log_text(raw)
+    cleaned = re.sub(r"^\[([^\]]+)\]\s*", lambda m: f"{m.group(1)} · ", cleaned, count=1)
+    return cleaned, "info"
+
+
+def _summarize_run_log_continuation(line: str) -> tuple[str, str]:
+    text = str(line or "").strip()
+    if not text:
+        return "", ""
+    if re.match(r"^[A-Za-z]:[\\/]", text) or text.startswith("/"):
+        name = _basename_for_log_display(text)
+        return (f"File · {name}" if name else ""), "file"
+    lowered = text.lower()
+    if lowered.startswith("characters:"):
+        return _compact_run_log_text(text, limit=120), "meta"
+    if lowered.startswith("reason:"):
+        detail = text.split(":", 1)[1].strip()
+        return f"Reason · {_compact_run_log_text(detail, limit=160)}", "meta"
+    return "", ""
+
+
+def _parse_run_log_line(line: str, state: dict | None = None) -> dict | None:
+    parser_state = state if isinstance(state, dict) else {}
+    raw = str(line or "").rstrip("\r\n")
+    if not raw.strip():
+        return None
+    match = _RUN_LOG_LINE_RE.match(raw)
+    if match:
+        parser_state["skip_multiline"] = False
+        parser_state["last_timestamp"] = match.group("ts")
+        message = str(match.group("message") or "").strip()
+        if message == "[LLM Prompt]":
+            parser_state["skip_multiline"] = True
+            return None
+        text, category = _summarize_run_log_message(message)
+        if not text:
+            return None
+        return {
+            "timestamp": parser_state.get("last_timestamp", ""),
+            "clock": _run_log_clock_label(parser_state.get("last_timestamp", "")),
+            "text": text,
+            "category": category or "info",
+        }
+    if parser_state.get("skip_multiline"):
+        return None
+    text, category = _summarize_run_log_continuation(raw)
+    if not text:
+        return None
+    timestamp = str(parser_state.get("last_timestamp") or "").strip()
+    return {
+        "timestamp": timestamp,
+        "clock": _run_log_clock_label(timestamp),
+        "text": text,
+        "category": category or "info",
+    }
+
+
+def _resolve_execution_log_path(run_id: str) -> str:
+    with _pending_lock:
+        current = dict(_pending_runs.get(run_id, {})) if run_id in _pending_runs else {}
+    payload = current.get("payload") if isinstance(current.get("payload"), dict) else {}
+    result = current.get("result") if isinstance(current.get("result"), dict) else {}
+    candidates = [
+        str(result.get("run_output_dir") or "").strip(),
+        str(result.get("output_dir") or "").strip(),
+        str(payload.get("output_folder") or "").strip(),
+        str(payload.get("resume_output_dir") or "").strip(),
+    ]
+    try:
+        run_row = _live_run(_db_get_run(run_id))
+    except Exception:
+        run_row = None
+    if isinstance(run_row, dict):
+        candidates.extend([
+            str(run_row.get("run_output_dir") or "").strip(),
+            str(run_row.get("output_dir") or "").strip(),
+            str(run_row.get("resume_output_dir") or "").strip(),
+        ])
+        log_paths = run_row.get("log_paths") if isinstance(run_row.get("log_paths"), dict) else {}
+        direct_path = str(log_paths.get("execution_log") or "").strip()
+        if direct_path:
+            return direct_path
+    manifest_dir = _get_run_output_dir_from_manifest(run_id)
+    if manifest_dir:
+        candidates.append(str(manifest_dir).strip())
+    for base in candidates:
+        if not base:
+            continue
+        log_path = _run_log_paths(base).get("execution_log", "")
+        if log_path:
+            return log_path
+    return ""
+
+
+def _launch_execution_log_poller(run_id: str, interval_seconds: float = 0.8) -> threading.Thread:
+    """Tail execution.log for a run and stream sanitized entries over SSE."""
+
+    def _poll() -> None:
+        parser_state: dict[str, object] = {}
+        current_log_path = ""
+        offset = 0
+        buffered = ""
+        last_signature = ""
+        terminal_statuses = {"completed", "failed", "cancelled", "awaiting_user_input"}
+        while True:
+            with _pending_lock:
+                current = dict(_pending_runs.get(run_id, {})) if run_id in _pending_runs else {}
+            current_status = str(current.get("status") or "").strip().lower()
+            log_path = _resolve_execution_log_path(run_id)
+            emitted = False
+            if log_path and os.path.isfile(log_path):
+                if log_path != current_log_path:
+                    current_log_path = log_path
+                    offset = 0
+                    buffered = ""
+                    parser_state = {}
+                    last_signature = ""
+                try:
+                    size = os.path.getsize(log_path)
+                    if size < offset:
+                        offset = 0
+                        buffered = ""
+                        parser_state = {}
+                        last_signature = ""
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+                        handle.seek(offset)
+                        chunk = handle.read()
+                        offset = handle.tell()
+                    if chunk:
+                        emitted = True
+                        buffered += chunk
+                        lines = buffered.splitlines(keepends=True)
+                        buffered = ""
+                        if lines and not lines[-1].endswith(("\n", "\r")):
+                            buffered = lines.pop()
+                        for line in lines:
+                            entry = _parse_run_log_line(line, parser_state)
+                            if not entry:
+                                continue
+                            signature = f"{entry.get('timestamp','')}|{entry.get('text','')}"
+                            if signature == last_signature:
+                                continue
+                            last_signature = signature
+                            _push_event(run_id, "log", entry)
+                except Exception as exc:
+                    _log.debug("Log poll error for run %s: %s", run_id, exc)
+            if current_status in terminal_statuses and not emitted and not buffered:
+                break
+            time.sleep(interval_seconds)
+
+    poller = threading.Thread(target=_poll, daemon=True)
+    poller.start()
+    return poller
+
+
 def _project_activity_event(
     *,
     kind: str,
@@ -2332,6 +2651,53 @@ def _step_stream_signature(step: dict) -> tuple[str, str, str, str]:
     )
 
 
+def _trace_stream_event_type(event: dict) -> str:
+    kind = str(event.get("kind") or "").strip().lower()
+    return {
+        "intent": "intent",
+        "source_strategy": "source_strategy",
+        "coverage": "coverage",
+        "artifact_created": "artifact_created",
+        "quality_gate": "quality_gate",
+        "gap_detected": "gap_detected",
+    }.get(kind, "activity")
+
+
+def _launch_trace_stream_poller(run_id: str, interval_seconds: float = 1.0) -> threading.Thread:
+    def _poll() -> None:
+        seen_ids: set[str] = set()
+        terminal_statuses = {"completed", "failed", "cancelled", "awaiting_user_input"}
+        while True:
+            with _pending_lock:
+                current = _pending_runs.get(run_id, {})
+            current_status = str(current.get("status") or "").strip().lower()
+            should_stop = current_status in terminal_statuses
+            try:
+                task_session = _db_get_task_session_by_run(run_id) if _HAS_PERSISTENCE else None
+                summary = _task_session_summary(task_session)
+                events = summary.get("execution_trace", []) if isinstance(summary.get("execution_trace", []), list) else []
+                for item in events:
+                    if not isinstance(item, dict):
+                        continue
+                    event_id = str(item.get("id") or "").strip()
+                    if not event_id or event_id in seen_ids:
+                        continue
+                    seen_ids.add(event_id)
+                    event_type = _trace_stream_event_type(item)
+                    _push_event(run_id, event_type, item)
+                    if event_type != "activity":
+                        _push_event(run_id, "activity", item)
+            except Exception as _trace_exc:
+                _log.debug("Trace poll error for run %s: %s", run_id, _trace_exc)
+            if should_stop:
+                break
+            time.sleep(interval_seconds)
+
+    poller = threading.Thread(target=_poll, daemon=True)
+    poller.start()
+    return poller
+
+
 def _launch_step_stream_poller(run_id: str, interval_seconds: float = 0.6) -> threading.Thread:
     """Emit SSE step updates for a run while it is active, including status changes."""
 
@@ -2388,6 +2754,8 @@ def _start_run_background(run_id: str, payload: dict) -> None:
     def _run() -> None:
         _push_event(run_id, "status", {"status": "running", "message": "Agents mobilizing..."})
         _launch_step_stream_poller(run_id)
+        _launch_trace_stream_poller(run_id)
+        _launch_execution_log_poller(run_id)
         try:
             result = _gateway_ingest(payload)
             db_artifacts, file_list = _collect_artifacts(run_id, result.get("output_dir", ""))
@@ -2653,6 +3021,25 @@ def _start_simple_chat_stream_background(run_id: str, payload: dict) -> None:
             from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
             text = str(payload.get("text") or payload.get("message") or "").strip()
+            if _looks_like_machine_task_request(text):
+                answer = _SIMPLE_CHAT_TASK_REDIRECT
+                result = {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "answer": answer,
+                    "final_output": answer,
+                }
+                with _pending_lock:
+                    _pending_runs[run_id] = _pending_run_state(run_id, payload=payload, status="completed", result=result)
+                _persist_channel_chat_turn(
+                    payload,
+                    user_text=text,
+                    assistant_text=answer,
+                    context_limit=payload.get("context_limit"),
+                )
+                _push_event(run_id, "result", result)
+                _push_event(run_id, "done", {"run_id": run_id, "status": "completed", "awaiting_user_input": False})
+                return
             model_override = str(payload.get("model") or "").strip() or None
             provider_override = str(payload.get("provider") or "").strip() or None
             local_paths = payload.get("local_drive_paths") or []
@@ -2692,7 +3079,10 @@ def _start_simple_chat_stream_background(run_id: str, payload: dict) -> None:
             system_ctx = (
                 "You are Kendr in simple chat mode. "
                 "Answer directly and helpfully. "
-                "Do not mention agents, orchestration, runs, artifacts, plans, or internal workflows. "
+                "Do not mention orchestration, runs, artifacts, plans, or internal workflows. "
+                "If the user asks you to execute machine tasks (for example searching files, running commands, editing code, or taking actions on their system), "
+                "state clearly that this must be done in Agent mode and ask them to switch to Agent mode. "
+                "Do not claim you performed those actions in simple chat mode. "
                 "Only provide a plain assistant answer. "
                 "If attached local files or folders are available, use their excerpts or path summaries when relevant."
             )
@@ -2989,14 +3379,32 @@ a:hover { text-decoration: underline; }
 .input-box:focus { border-color: var(--teal); }
 .input-box::placeholder { color: var(--muted); }
 .input-box.locked { opacity: 0.75; cursor: not-allowed; }
-.send-btn { width: 48px; min-height: 48px; border-radius: 12px; background: var(--teal); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; transition: background 0.15s, opacity 0.15s; color: #0d0f14; align-self: flex-end; }
+.composer-state { display:none; margin:0 0 10px; padding:10px 12px; border-radius:10px; border:1px solid rgba(255,255,255,0.08); background:rgba(255,255,255,0.03); font-size:12px; line-height:1.5; color:var(--muted); }
+.composer-state.visible { display:block; }
+.composer-state strong { color:var(--text); }
+.send-btn { min-width: 48px; min-height: 48px; padding: 0 14px; border-radius: 12px; background: var(--teal); border: none; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 18px; flex-shrink: 0; transition: background 0.15s, opacity 0.15s; color: #0d0f14; align-self: flex-end; }
 .send-btn:hover { background: #00b396; }
 .send-btn.stop-mode { background: rgba(255,71,87,0.92); color: #fff; }
 .send-btn.stop-mode:hover { background: rgba(255,71,87,1); }
 .send-btn.cancelling { background: rgba(255,179,71,0.95); color: #0d0f14; }
 .send-btn.cancelling:hover { background: rgba(255,179,71,0.95); }
+.send-btn.stop-mode, .send-btn.cancelling { font-size: 13px; font-weight: 700; letter-spacing: 0.02em; }
 .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.attach-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .input-hint { font-size: 11px; color: var(--muted); margin-top: 8px; }
+.run-log-card { margin:10px 0 12px; padding:12px 14px; background:rgba(0,201,167,0.05); border:1px solid rgba(0,201,167,0.18); border-radius:10px; }
+.run-log-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; margin-bottom:8px; }
+.run-log-title { font-size:11px; font-weight:700; color:var(--teal); letter-spacing:.08em; text-transform:uppercase; }
+.run-log-summary { margin-top:4px; font-size:12px; color:var(--muted); line-height:1.45; }
+.run-log-toggle { border:1px solid rgba(0,201,167,0.2); background:rgba(0,0,0,0.18); color:var(--text); border-radius:999px; padding:6px 10px; font-size:11px; font-weight:700; cursor:pointer; }
+.run-log-toggle:hover { border-color:rgba(0,201,167,0.4); color:var(--teal); }
+.run-log-card.collapsed .run-log-head { margin-bottom:0; }
+.run-log-card.collapsed .run-log-body { display:none; }
+.run-log-lines { display:flex; flex-direction:column; gap:6px; max-height:180px; overflow:auto; }
+.run-log-line { display:flex; align-items:flex-start; gap:8px; padding:4px 0; border-bottom:1px solid rgba(255,255,255,0.04); }
+.run-log-line:last-child { border-bottom:none; }
+.run-log-clock { font-size:10px; color:var(--muted); font-family:ui-monospace,SFMono-Regular,Menlo,monospace; min-width:58px; flex-shrink:0; }
+.run-log-text { font-size:12px; color:var(--text); line-height:1.5; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; word-break:break-word; }
 ::-webkit-scrollbar { width: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
@@ -3304,9 +3712,10 @@ a:hover { text-decoration: underline; }
       </div>
     </div>
     <div id="mainChatAttachChips" class="chat-attach-chips"></div>
+    <div id="chatComposerState" class="composer-state"></div>
     <div class="input-row">
       <input type="file" id="mainChatFileInput" multiple style="display:none" onchange="handleMainChatFileSelect(this)">
-      <button class="attach-btn" onclick="document.getElementById('mainChatFileInput').click()" title="Attach files">&#x1F4CE;</button>
+      <button class="attach-btn" id="mainChatAttachBtn" onclick="document.getElementById('mainChatFileInput').click()" title="Attach files">&#x1F4CE;</button>
       <textarea class="input-box" id="userInput" placeholder="Ask kendr anything &#x2014; research, code, deploy, analyze..." rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)"></textarea>
       <button class="send-btn" id="sendBtn" onclick="handleSendButton()" title="Send (Enter)">&#x27A4;</button>
     </div>
@@ -3396,6 +3805,8 @@ let _chatPlanState = { total: 0, completed: 0, running: 0, failed: 0 };
 let _chatRunState = { runId: '', status: 'idle', title: '', task: '', startedAt: '', completedAt: '', lastCommand: '', lastCommandMeta: '' };
 let _runStepJournal = {};
 let _runLiveUpdates = {};
+let _runLogFeed = {};
+let _runLogPanels = {};
 let _runTraceFeed = {};
 let _runWorkingTimers = {};
 let _runRecoveryAttempts = {};
@@ -3417,6 +3828,8 @@ function _defaultChatPlaceholder() {
 function _setChatComposerState() {
   const input = document.getElementById('userInput');
   const button = document.getElementById('sendBtn');
+  const attachBtn = document.getElementById('mainChatAttachBtn');
+  const composerState = document.getElementById('chatComposerState');
   if (!input || !button) return;
   const locked = isRunning;
   const modeButtons = [
@@ -3426,8 +3839,10 @@ function _setChatComposerState() {
     'modeDeepResearchBtn',
     'modeSecurityBtn',
   ];
-  input.readOnly = locked;
+  input.disabled = locked;
+  input.readOnly = false;
   input.classList.toggle('locked', locked);
+  if (attachBtn) attachBtn.disabled = locked;
   button.disabled = isStopping;
   button.classList.toggle('stop-mode', locked && !isStopping);
   button.classList.toggle('cancelling', isStopping);
@@ -3438,17 +3853,30 @@ function _setChatComposerState() {
     el.title = locked ? 'Mode changes are disabled while a run is active.' : '';
   });
   if (locked) {
-    button.innerHTML = '&#x25A0;';
+    button.textContent = isStopping ? 'Wait...' : 'Stop';
     button.title = isStopping ? 'Stopping active run…' : 'Stop active run';
     input.placeholder = isStopping
       ? 'Stopping the active run…'
       : 'Kendr is working on this run. Stop it before typing a new request.';
+    if (composerState) {
+      composerState.classList.add('visible');
+      composerState.innerHTML = '<strong>Run active.</strong> Live status and execution.log updates are streaming in the run card above. Use Stop before sending a new message.';
+    }
   } else {
     button.innerHTML = '&#x27A4;';
     button.title = 'Send (Enter)';
     input.placeholder = isAwaitingInput
       ? 'Type your response to continue…'
       : _defaultChatPlaceholder();
+    if (composerState) {
+      if (isAwaitingInput) {
+        composerState.classList.add('visible');
+        composerState.innerHTML = '<strong>Run paused for your input.</strong> Reply here to continue the same workflow.';
+      } else {
+        composerState.classList.remove('visible');
+        composerState.textContent = '';
+      }
+    }
   }
 }
 
@@ -3567,6 +3995,52 @@ function _recordRunTraceEvents(runId, items, defaults = {}) {
   _runTraceFeed[runId] = deduped;
 }
 
+function _researchTimelineDetail(item, fallbackDetail = '') {
+  const detail = String(fallbackDetail || (item && item.detail) || '').trim();
+  const metadata = (item && typeof item.metadata === 'object' && item.metadata) ? item.metadata : {};
+  const coverageReport = metadata.coverage_report && typeof metadata.coverage_report === 'object'
+    ? metadata.coverage_report
+    : null;
+  if (!coverageReport) return detail;
+  const failedExtractions = Array.isArray(coverageReport.failed_extractions)
+    ? coverageReport.failed_extractions.filter(entry => entry && typeof entry === 'object')
+    : [];
+  const revisitPlan = Array.isArray(coverageReport.revisit_plan)
+    ? coverageReport.revisit_plan.filter(entry => entry && typeof entry === 'object')
+    : [];
+  const parts = [];
+  if (detail) parts.push(detail);
+  if (failedExtractions.length) {
+    parts.push('Extraction failures: ' + failedExtractions.slice(0, 2).map(entry => {
+      const target = String(entry.target || 'source').trim();
+      const reason = String(entry.reason || 'extract_failed').trim().replace(/_/g, ' ');
+      const message = String(entry.message || '').trim();
+      return target + ' (' + reason + (message ? ': ' + message : '') + ')';
+    }).join('; '));
+  }
+  if (revisitPlan.length) {
+    parts.push('Revisit next: ' + revisitPlan.slice(0, 2).map(entry => {
+      const target = String(entry.target || 'coverage gap').trim();
+      const action = String(entry.action || '').trim();
+      return target + (action ? ' → ' + action : '');
+    }).join('; '));
+  }
+  const remainingWork = Number(coverageReport.remaining_work || 0);
+  if (remainingWork > 0) {
+    parts.push('Remaining work: ' + remainingWork + ' selected file(s).');
+  }
+  const kbName = String(coverageReport.kb_name || '').trim();
+  const kbWarning = String(coverageReport.kb_warning || '').trim();
+  const kbHits = Number(coverageReport.kb_hit_count || 0);
+  if (coverageReport.kb_enabled) {
+    parts.push('Private knowledge: ' + (kbName || 'enabled') + ' (' + kbHits + ' hit' + (kbHits === 1 ? '' : 's') + ').');
+  }
+  if (kbWarning) {
+    parts.push('KB note: ' + kbWarning);
+  }
+  return parts.filter(Boolean).join('\n');
+}
+
 function _runTraceListHtml(items) {
   const normalized = Array.isArray(items) ? items.slice(0, 10) : [];
   if (!normalized.length) {
@@ -3585,6 +4059,15 @@ function _runTraceListHtml(items) {
     const candidateUrls = Array.isArray(metadata.candidate_urls) ? metadata.candidate_urls.filter(Boolean) : [];
     const viewedUrls = Array.isArray(metadata.viewed_urls) ? metadata.viewed_urls.filter(Boolean) : [];
     const failedUrls = Array.isArray(metadata.failed_urls) ? metadata.failed_urls.filter(Boolean) : [];
+    const coverageReport = metadata.coverage_report && typeof metadata.coverage_report === 'object'
+      ? metadata.coverage_report
+      : null;
+    const revisitPlan = coverageReport && Array.isArray(coverageReport.revisit_plan)
+      ? coverageReport.revisit_plan.filter(entry => entry && typeof entry === 'object')
+      : [];
+    const failedExtractions = coverageReport && Array.isArray(coverageReport.failed_extractions)
+      ? coverageReport.failed_extractions.filter(entry => entry && typeof entry === 'object')
+      : [];
     const displayCommand = command || searchQuery;
     const meta = _chatActivityMetaParts(item).map(esc).join(' &middot; ');
     const color = status === 'failed' ? 'var(--crimson)' : status === 'completed' ? 'var(--teal)' : status === 'running' ? 'var(--amber)' : '#9aa4b2';
@@ -3599,6 +4082,35 @@ function _runTraceListHtml(items) {
       : '';
     const detailHtml = detail && detail !== displayCommand
       ? '<div style="margin-top:6px;font-size:11px;color:var(--muted);line-height:1.5;white-space:pre-wrap;word-break:break-word">' + esc(detail) + '</div>'
+      : '';
+    const coverageSummaryHtml = coverageReport
+      ? '<div style="margin-top:8px;display:flex;gap:6px;flex-wrap:wrap">'
+        + '<span style="padding:4px 8px;border-radius:999px;background:rgba(125,211,252,0.10);border:1px solid rgba(125,211,252,0.22);font-size:10px;color:#bae6fd">coverage ' + esc(String(coverageReport.status || 'unknown')) + '</span>'
+        + '<span style="padding:4px 8px;border-radius:999px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.22);font-size:10px;color:#fde68a">' + esc(String((coverageReport.gaps || []).length || 0)) + ' gap(s)</span>'
+        + '<span style="padding:4px 8px;border-radius:999px;background:rgba(248,113,113,0.10);border:1px solid rgba(248,113,113,0.22);font-size:10px;color:#fecaca">' + esc(String(coverageReport.failed_selected_files || 0)) + ' failed extraction(s)</span>'
+        + '</div>'
+      : '';
+    const failedExtractionsHtml = failedExtractions.length
+      ? '<div style="margin-top:8px;padding:9px 10px;border-radius:9px;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.18)">'
+        + '<div style="font-size:10px;color:#fecaca;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Extraction Failures</div>'
+        + failedExtractions.slice(0, 3).map(entry => {
+          const target = String(entry.target || 'source').trim();
+          const reason = String(entry.reason || 'extract_failed').trim().replace(/_/g, ' ');
+          const message = String(entry.message || '').trim();
+          return '<div style="font-size:11px;color:#fee2e2;line-height:1.5;margin-top:4px"><strong>' + esc(target) + '</strong>: ' + esc(reason) + (message ? '<div style="color:#fecaca;margin-top:2px">' + esc(message) + '</div>' : '') + '</div>';
+        }).join('')
+        + '</div>'
+      : '';
+    const revisitPlanHtml = revisitPlan.length
+      ? '<div style="margin-top:8px;padding:9px 10px;border-radius:9px;background:rgba(45,212,191,0.08);border:1px solid rgba(45,212,191,0.18)">'
+        + '<div style="font-size:10px;color:#99f6e4;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Coverage Revisit Plan</div>'
+        + revisitPlan.slice(0, 3).map(entry => {
+          const target = String(entry.target || 'coverage gap').trim();
+          const reason = String(entry.reason || '').trim();
+          const action = String(entry.action || '').trim();
+          return '<div style="font-size:11px;color:#d1fae5;line-height:1.5;margin-top:4px"><strong>' + esc(target) + '</strong>' + (reason ? ': ' + esc(reason) : '') + (action ? '<div style="color:#99f6e4;margin-top:2px">' + esc(action) + '</div>' : '') + '</div>';
+        }).join('')
+        + '</div>'
       : '';
     const listBlock = (label, urls, tone) => {
       if (!urls.length) return '';
@@ -3619,6 +4131,9 @@ function _runTraceListHtml(items) {
       + providerHtml
       + detailHtml
       + commandHtml
+      + coverageSummaryHtml
+      + failedExtractionsHtml
+      + revisitPlanHtml
       + listBlock('Search results', candidateUrls, 'good')
       + listBlock('Viewed links', viewedUrls, 'good')
       + listBlock('Failed links', failedUrls, 'bad')
@@ -3668,6 +4183,7 @@ function _resetChatInspectorState() {
   _chatActivityFeed = [];
   _chatPlanState = { total: 0, completed: 0, running: 0, failed: 0 };
   _chatRunState = { runId: '', workflowId: '', attemptId: '', status: 'idle', title: '', task: '', startedAt: '', completedAt: '', lastCommand: '', lastCommandMeta: '' };
+  _runLogFeed = {};
   _runTraceFeed = {};
   _runRecoveryAttempts = {};
   _renderChatActivityList();
@@ -4937,6 +5453,8 @@ function createStreamingRow(runId, taskText = '') {
   if (w) w.remove();
   _runStepJournal[runId] = {};
   _runLiveUpdates[runId] = [];
+  _runLogFeed[runId] = [];
+  _runLogPanels[runId] = { collapsed: false, userToggled: false };
   _runTraceFeed[runId] = [];
   const msgs = document.getElementById('messages');
   const row = document.createElement('div');
@@ -4956,15 +5474,36 @@ function createStreamingRow(runId, taskText = '') {
     + '<div id="run-working-' + runId + '" style="font-size:12px;color:var(--muted);margin-bottom:8px">Working for 0s</div>'
     + '<div id="run-work-items-' + runId + '" style="display:flex;flex-direction:column"></div>'
     + '</div>'
+    + '<div class="run-log-card" id="run-log-' + runId + '">'
+    + '<div class="run-log-head">'
+    + '<div style="min-width:0;flex:1">'
+    + '<div class="run-log-title">Live Execution Log</div>'
+    + '<div class="run-log-summary" id="run-log-summary-' + runId + '">Streaming execution.log in real time...</div>'
+    + '</div>'
+    + '<button type="button" class="run-log-toggle" id="run-log-toggle-' + runId + '" onclick="_toggleRunLogPanel(\'' + runId + '\')">Collapse</button>'
+    + '</div>'
+    + '<div class="run-log-body" id="run-log-body-' + runId + '">'
+    + '<div class="run-log-lines" id="run-log-lines-' + runId + '"></div>'
+    + '</div>'
+    + '</div>'
     + '<div id="stream-trace-' + runId + '" style="margin:10px 0 12px;padding:12px 14px;background:rgba(255,179,71,0.05);border:1px solid rgba(255,179,71,0.2);border-radius:10px"></div>'
     + '<div class="steps-wrapper" id="stream-steps-' + runId + '" style="display:flex;flex-direction:column;gap:6px"></div>'
     + '<div id="stream-result-' + runId + '"></div></div>';
   msgs.appendChild(row);
   _startRunWorkingTimer(runId);
   _pushRunLiveUpdate(runId, 'Run started', taskText || 'Preparing execution context.');
+  _renderRunLogFeed(runId);
   _upsertRunTracePanel(runId);
   scrollDown();
   return row;
+}
+
+function _toggleRunLogPanel(runId) {
+  if (!runId) return;
+  if (!_runLogPanels[runId]) _runLogPanels[runId] = { collapsed: false, userToggled: false };
+  _runLogPanels[runId].collapsed = !_runLogPanels[runId].collapsed;
+  _runLogPanels[runId].userToggled = true;
+  _renderRunLogFeed(runId);
 }
 
 function updateStreamStatus(runId, msg) {
@@ -5037,11 +5576,42 @@ function _renderRunLiveUpdates(runId) {
   }
   container.innerHTML = entries.map(item => {
     const detail = item.detail
-      ? '<div style="margin-top:2px;font-size:12px;color:var(--muted);line-height:1.45">' + esc(item.detail) + '</div>'
+      ? '<div style="margin-top:2px;font-size:12px;color:var(--muted);line-height:1.45;white-space:pre-wrap;word-break:break-word">' + esc(item.detail) + '</div>'
       : '';
     return '<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05)">'
       + '<div style="font-size:13px;color:var(--text);line-height:1.45">' + esc(item.text) + '</div>'
       + detail
+      + '</div>';
+  }).join('');
+}
+
+function _renderRunLogFeed(runId) {
+  const card = document.getElementById('run-log-' + runId);
+  const summaryEl = document.getElementById('run-log-summary-' + runId);
+  const toggleEl = document.getElementById('run-log-toggle-' + runId);
+  const container = document.getElementById('run-log-lines-' + runId);
+  if (!container) return;
+  if (!_runLogPanels[runId]) _runLogPanels[runId] = { collapsed: false, userToggled: false };
+  const panelState = _runLogPanels[runId];
+  const entries = (_runLogFeed[runId] || []).slice(0, 14);
+  const latest = entries[0] ? String(entries[0].text || '').trim() : '';
+  const summary = !entries.length
+    ? 'execution.log connected. Waiting for the first entry...'
+    : entries.length + ' update' + (entries.length === 1 ? '' : 's') + ' captured. Latest: ' + (latest.length > 120 ? latest.slice(0, 117) + '...' : latest);
+  if (summaryEl) summaryEl.textContent = summary;
+  if (toggleEl) toggleEl.textContent = panelState.collapsed ? 'Expand' : 'Collapse';
+  if (card) card.classList.toggle('collapsed', !!panelState.collapsed);
+  if (!entries.length) {
+    container.innerHTML = '<div style="font-size:12px;color:var(--muted)">Waiting for execution log output...</div>';
+    return;
+  }
+  container.innerHTML = entries.map(item => {
+    const clock = item.clock
+      ? '<span class="run-log-clock">' + esc(item.clock) + '</span>'
+      : '';
+    return '<div class="run-log-line">'
+      + clock
+      + '<div class="run-log-text">' + esc(item.text || '') + '</div>'
       + '</div>';
   }).join('');
 }
@@ -5058,6 +5628,25 @@ function _pushRunLiveUpdate(runId, text, detail = '') {
   feed.unshift({ text: summary, detail: extra, ts: Date.now() });
   if (feed.length > 14) feed.length = 14;
   _renderRunLiveUpdates(runId);
+}
+
+function _appendRunLogEntry(runId, entry) {
+  if (!runId || !entry || typeof entry !== 'object') return;
+  const text = String(entry.text || '').trim();
+  if (!text) return;
+  if (!_runLogFeed[runId]) _runLogFeed[runId] = [];
+  const feed = _runLogFeed[runId];
+  const next = {
+    clock: String(entry.clock || '').trim(),
+    timestamp: String(entry.timestamp || '').trim(),
+    text,
+    category: String(entry.category || 'info').trim(),
+  };
+  const previous = feed[0];
+  if (previous && previous.text === next.text && previous.timestamp === next.timestamp) return;
+  feed.unshift(next);
+  if (feed.length > 30) feed.length = 30;
+  _renderRunLogFeed(runId);
 }
 
 function _startRunWorkingTimer(runId) {
@@ -5448,11 +6037,156 @@ function renderDeepResearchCard(card, runId) {
       }
       html += '</div></div>';
     }
+    const coverageGaps = Array.isArray(card.coverage_gaps) ? card.coverage_gaps : [];
+    const coverageRevisitPlan = Array.isArray(card.coverage_revisit_plan)
+      ? card.coverage_revisit_plan.filter(item => item && typeof item === 'object')
+      : [];
+    const failedExtractions = Array.isArray(card.failed_extractions)
+      ? card.failed_extractions.filter(item => item && typeof item === 'object')
+      : [];
+    const qualityFlags = Array.isArray(card.quality_flags) ? card.quality_flags : [];
+    const kbCitations = Array.isArray(card.research_kb_citations)
+      ? card.research_kb_citations.filter(item => item && typeof item === 'object')
+      : [];
+    const kbName = String(card.research_kb_name || '').trim();
+    const kbWarning = String(card.research_kb_warning || '').trim();
+    const kbEnabled = !!(kbName || kbWarning || card.research_kb_used || Number(card.research_kb_hit_count || 0) > 0 || kbCitations.length);
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px">';
+    html += '<div style="padding:10px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase">Coverage</div><div style="font-size:15px;font-weight:700;color:var(--text);margin-top:3px">' + esc(String(card.coverage_status || 'n/a')) + '</div></div>';
+    html += '<div style="padding:10px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px"><div style="font-size:10px;color:var(--muted);text-transform:uppercase">Quality Gate</div><div style="font-size:15px;font-weight:700;color:var(--text);margin-top:3px">' + esc(String(card.quality_status || 'n/a')) + '</div></div>';
+    html += '</div>';
+    if (kbEnabled) {
+      html += '<div style="margin-top:14px;padding:12px;background:rgba(59,130,246,0.08);border:1px solid rgba(96,165,250,0.20);border-radius:10px">';
+      html += '<div style="font-size:11px;font-weight:700;color:#93c5fd;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Private Knowledge</div>';
+      html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+      html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(125,211,252,0.10);border:1px solid rgba(125,211,252,0.22);font-size:12px;color:#dbeafe">' + esc(kbName || 'Active KB') + '</span>';
+      html += '<span style="padding:6px 10px;border-radius:999px;background:' + (card.research_kb_used ? 'rgba(74,222,128,0.10);border:1px solid rgba(74,222,128,0.22);color:#bbf7d0' : 'rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.22);color:#fde68a') + ';font-size:12px">' + (card.research_kb_used ? 'used in report' : 'grounding requested') + '</span>';
+      html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(196,181,253,0.10);border:1px solid rgba(196,181,253,0.22);font-size:12px;color:#ddd6fe">' + esc(String(card.research_kb_hit_count || 0)) + ' hit(s)</span>';
+      html += '</div>';
+      if (kbWarning) {
+        html += '<div style="margin-top:10px;padding:9px 10px;border-radius:9px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.18);font-size:12px;color:#fde68a">' + esc(kbWarning) + '</div>';
+      }
+      if (kbCitations.length) {
+        html += '<div style="margin-top:10px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Grounding Sources</div>';
+        html += '<div style="display:flex;flex-direction:column;gap:6px;margin-top:8px">';
+        kbCitations.slice(0, 4).forEach(item => {
+          const label = String(item.label || item.path || item.url || item.source_id || 'knowledge source').trim();
+          const provenance = item.kb_provenance && typeof item.kb_provenance === 'object'
+            ? String(item.kb_provenance.kb_name || '').trim()
+            : '';
+          html += '<div style="padding:8px 10px;border-radius:8px;background:rgba(255,255,255,0.04);border:1px solid var(--border);font-size:12px;color:var(--text)">';
+          html += esc(label);
+          if (provenance) html += '<div style="margin-top:3px;font-size:11px;color:var(--muted)">via ' + esc(provenance) + '</div>';
+          html += '</div>';
+        });
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+    if (coverageGaps.length) {
+      html += '<div style="margin-top:12px;font-size:11px;font-weight:700;color:#fbbf24;text-transform:uppercase;letter-spacing:0.08em">Coverage Gaps</div>';
+      html += '<div style="display:flex;flex-direction:column;gap:6px;margin-top:8px">';
+      coverageGaps.slice(0, 4).forEach(gap => {
+        html += '<div style="padding:8px 10px;border-radius:8px;background:rgba(251,191,36,0.08);border:1px solid rgba(251,191,36,0.18);font-size:12px;color:#fde68a">' + esc(String(gap)) + '</div>';
+      });
+      html += '</div>';
+    }
+    if (failedExtractions.length) {
+      html += '<div style="margin-top:12px;font-size:11px;font-weight:700;color:#f87171;text-transform:uppercase;letter-spacing:0.08em">Extraction Failures</div>';
+      html += '<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">';
+      failedExtractions.slice(0, 4).forEach(item => {
+        const target = String(item.target || 'source');
+        const reason = String(item.reason || 'extract_failed').replace(/_/g, ' ');
+        const message = String(item.message || '');
+        html += '<div style="padding:10px 12px;border-radius:9px;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.20)">';
+        html += '<div style="font-size:12px;font-weight:700;color:#fee2e2">' + esc(target) + '</div>';
+        html += '<div style="font-size:12px;color:#fecaca;margin-top:4px">' + esc(reason) + '</div>';
+        if (message) html += '<div style="font-size:11px;color:#fca5a5;margin-top:4px;white-space:pre-wrap;word-break:break-word">' + esc(message) + '</div>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    if (coverageRevisitPlan.length) {
+      html += '<div style="margin-top:12px;font-size:11px;font-weight:700;color:#2dd4bf;text-transform:uppercase;letter-spacing:0.08em">Coverage Revisit Plan</div>';
+      html += '<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">';
+      coverageRevisitPlan.slice(0, 4).forEach(item => {
+        const target = String(item.target || 'coverage gap');
+        const reason = String(item.reason || '');
+        const action = String(item.action || '');
+        html += '<div style="padding:10px 12px;border-radius:9px;background:rgba(45,212,191,0.08);border:1px solid rgba(45,212,191,0.20)">';
+        html += '<div style="font-size:12px;font-weight:700;color:#ccfbf1">' + esc(target) + '</div>';
+        if (reason) html += '<div style="font-size:11px;color:#99f6e4;margin-top:4px">' + esc(reason) + '</div>';
+        if (action) html += '<div style="font-size:11px;color:#5eead4;margin-top:4px;white-space:pre-wrap;word-break:break-word">' + esc(action) + '</div>';
+        html += '</div>';
+      });
+      html += '</div>';
+    }
+    if (qualityFlags.length) {
+      html += '<div style="margin-top:12px;font-size:11px;font-weight:700;color:#f87171;text-transform:uppercase;letter-spacing:0.08em">Quality Flags</div>';
+      html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">';
+      qualityFlags.slice(0, 6).forEach(flag => {
+        html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(248,113,113,0.10);border:1px solid rgba(248,113,113,0.24);font-size:12px;color:#fecaca">' + esc(String(flag).replace(/_/g, ' ')) + '</span>';
+      });
+      html += '</div>';
+    }
+    const createdArtifacts = Array.isArray(card.created_artifacts) ? card.created_artifacts.filter(item => item && item.path) : [];
+    if (createdArtifacts.length) {
+      html += '<div style="margin-top:14px"><div style="font-size:11px;font-weight:700;color:#2dd4bf;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Created Artifacts</div>';
+      html += '<div style="display:flex;flex-direction:column;gap:8px">';
+      createdArtifacts.slice(0, 8).forEach(item => {
+        const artifactName = String(item.name || (String(item.path || '').replace(/\\\\/g, '/').split('/').pop()) || 'artifact');
+        html += '<div style="padding:10px 12px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:9px">';
+        html += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px">';
+        html += '<div style="font-size:12px;font-weight:700;color:var(--text)">' + esc(artifactName) + '</div>';
+        html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        html += '<a href="/api/artifacts/download?run_id=' + encodeURIComponent(runId) + '&name=' + encodeURIComponent(artifactName) + '" download="' + esc(artifactName) + '" style="padding:6px 10px;background:rgba(45,212,191,0.10);border:1px solid rgba(45,212,191,0.25);border-radius:999px;color:#7dd3fc;text-decoration:none;font-size:11px;font-weight:700">Download</a>';
+        html += '<a href="/api/artifacts/view?run_id=' + encodeURIComponent(runId) + '&name=' + encodeURIComponent(artifactName) + '" target="_blank" rel="noopener" style="padding:6px 10px;background:rgba(255,255,255,0.05);border:1px solid var(--border);border-radius:999px;color:var(--text);text-decoration:none;font-size:11px;font-weight:700">Open</a>';
+        html += '</div></div>';
+        html += '<div style="font-size:11px;color:var(--muted);margin-top:4px;word-break:break-all">' + esc(String(item.path || '')) + '</div>';
+        html += '</div>';
+      });
+      html += '</div></div>';
+    }
+  }
+  const sourceNeeds = Array.isArray(card.source_needs) ? card.source_needs : [];
+  const selectionRationale = Array.isArray(card.selection_rationale) ? card.selection_rationale : [];
+  const familyBudgets = card.family_budgets && typeof card.family_budgets === 'object' ? Object.entries(card.family_budgets).filter(([, val]) => Number(val || 0) > 0) : [];
+  if (card.intent_summary || card.strategy_summary || sourceNeeds.length || familyBudgets.length) {
+    html += '<div style="margin-top:14px;padding:12px;background:rgba(255,255,255,0.03);border:1px solid var(--border);border-radius:10px">';
+    html += '<div style="font-size:11px;font-weight:700;color:#2dd4bf;text-transform:uppercase;letter-spacing:0.1em;margin-bottom:8px">Research Profile</div>';
+    if (card.intent_summary) html += '<div style="font-size:12px;color:var(--text);margin-bottom:6px">' + esc(String(card.intent_summary)) + '</div>';
+    if (card.strategy_summary) html += '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">' + esc(String(card.strategy_summary)) + '</div>';
+    html += '<div style="display:flex;gap:8px;flex-wrap:wrap">';
+    if (card.research_kind) html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(125,211,252,0.10);border:1px solid rgba(125,211,252,0.22);font-size:12px;color:#bae6fd">' + esc(String(card.research_kind)) + '</span>';
+    if (card.target_deliverable) html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(196,181,253,0.10);border:1px solid rgba(196,181,253,0.22);font-size:12px;color:#ddd6fe">' + esc(String(card.target_deliverable)) + '</span>';
+    if (card.strategy_mode) html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(74,222,128,0.10);border:1px solid rgba(74,222,128,0.22);font-size:12px;color:#bbf7d0">' + esc(String(card.strategy_mode).replace(/_/g, ' ')) + '</span>';
+    if (card.risk_level) html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.22);font-size:12px;color:#fde68a">' + esc(String(card.risk_level)) + '</span>';
+    sourceNeeds.slice(0, 6).forEach(item => {
+      html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(255,255,255,0.05);border:1px solid var(--border);font-size:12px;color:var(--text)">' + esc(String(item)) + '</span>';
+    });
+    html += '</div>';
+    if (familyBudgets.length) {
+      html += '<div style="margin-top:10px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.06em">Planned File Budget</div>';
+      html += '<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:8px">';
+      familyBudgets.slice(0, 7).forEach(([family, val]) => {
+        html += '<span style="padding:6px 10px;border-radius:999px;background:rgba(255,255,255,0.05);border:1px solid var(--border);font-size:12px;color:var(--text)">' + esc(String(family)) + ': ' + esc(String(val)) + '</span>';
+      });
+      html += '</div>';
+    }
+    if (selectionRationale.length) {
+      html += '<div style="display:flex;flex-direction:column;gap:6px;margin-top:10px">';
+      selectionRationale.slice(0, 4).forEach(item => {
+        html += '<div style="font-size:12px;color:var(--muted)">• ' + esc(String(item)) + '</div>';
+      });
+      html += '</div>';
+    }
+    html += '</div>';
   }
   html += '<div style="margin-top:12px;font-size:12px;color:var(--muted)">';
   html += 'Web search: <strong style="color:var(--text)">' + (card.web_search_enabled === false ? 'disabled' : 'enabled') + '</strong>';
   if (card.local_sources != null) html += ' · Local files: <strong style="color:var(--text)">' + esc(String(card.local_sources)) + '</strong>';
   if (card.provided_urls != null) html += ' · Explicit URLs: <strong style="color:var(--text)">' + esc(String(card.provided_urls)) + '</strong>';
+  if (kbEnabled) html += ' · Private KB: <strong style="color:var(--text)">' + esc(kbName || 'active') + '</strong>';
   html += '</div>';
   html += '</div>';
   return html;
@@ -5749,6 +6483,22 @@ function _markRunDisconnected(runId, reason = '') {
   _setChatComposerState();
 }
 
+function _handleResearchTimelineEvent(runId, raw, fallbackTitle) {
+  try {
+    const item = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!item || typeof item !== 'object') return;
+    const title = String(item.title || fallbackTitle || item.kind || 'Research update').trim();
+    const detail = _researchTimelineDetail(item, String(item.detail || '').trim());
+    _pushRunLiveUpdate(runId, title, detail);
+    _recordRunTraceEvents(runId, [item], { run_id: runId, task: _chatRunState.task || _chatRunState.title });
+    _upsertRunTracePanel(runId);
+    _recordChatActivity(Object.assign({}, item, { run_id: runId, task: _chatRunState.task || _chatRunState.title }));
+    if (detail && String(_chatRunState.status || '').toLowerCase() === 'running') {
+      updateStreamStatus(runId, detail.split('\n')[0]);
+    }
+  } catch(_) {}
+}
+
 function openEventStream(runId) {
   if (activeEvtSource) { activeEvtSource.close(); activeEvtSource = null; }
   const evtSrc = new EventSource(API + '/api/stream?run_id=' + encodeURIComponent(runId));
@@ -5790,6 +6540,24 @@ function openEventStream(runId) {
       _recordRunTraceEvents(runId, [item], { run_id: runId, task: _chatRunState.task || _chatRunState.title });
       _upsertRunTracePanel(runId);
       _recordChatActivity(Object.assign({}, item, { run_id: runId, task: _chatRunState.task || _chatRunState.title }));
+    } catch(_) {}
+  });
+
+  evtSrc.addEventListener('intent', e => _handleResearchTimelineEvent(runId, e.data, 'Research intent discovered'));
+  evtSrc.addEventListener('source_strategy', e => _handleResearchTimelineEvent(runId, e.data, 'Source strategy planned'));
+  evtSrc.addEventListener('coverage', e => _handleResearchTimelineEvent(runId, e.data, 'Coverage updated'));
+  evtSrc.addEventListener('artifact_created', e => _handleResearchTimelineEvent(runId, e.data, 'Artifact created'));
+  evtSrc.addEventListener('quality_gate', e => _handleResearchTimelineEvent(runId, e.data, 'Quality gate updated'));
+  evtSrc.addEventListener('gap_detected', e => _handleResearchTimelineEvent(runId, e.data, 'Coverage gap detected'));
+
+  evtSrc.addEventListener('log', e => {
+    try {
+      const entry = JSON.parse(e.data);
+      _appendRunLogEntry(runId, entry);
+      const latest = String(entry.text || '').trim();
+      if (latest && String(_chatRunState.status || '').toLowerCase() === 'running') {
+        updateStreamStatus(runId, latest);
+      }
     } catch(_) {}
   });
 
@@ -6283,6 +7051,14 @@ async function sendMessage() {
           _runLiveUpdates[streamRunId] = _runLiveUpdates[runId];
           delete _runLiveUpdates[runId];
         }
+        if (_runLogFeed[runId]) {
+          _runLogFeed[streamRunId] = _runLogFeed[runId];
+          delete _runLogFeed[runId];
+        }
+        if (_runLogPanels[runId]) {
+          _runLogPanels[streamRunId] = _runLogPanels[runId];
+          delete _runLogPanels[runId];
+        }
         if (_runTraceFeed[runId]) {
           _runTraceFeed[streamRunId] = _runTraceFeed[runId];
           delete _runTraceFeed[runId];
@@ -6303,6 +7079,19 @@ async function sendMessage() {
         if (working) working.id = 'run-working-' + streamRunId;
         const workItems = document.getElementById('run-work-items-' + runId);
         if (workItems) workItems.id = 'run-work-items-' + streamRunId;
+        const runLog = document.getElementById('run-log-' + runId);
+        if (runLog) runLog.id = 'run-log-' + streamRunId;
+        const runLogSummary = document.getElementById('run-log-summary-' + runId);
+        if (runLogSummary) runLogSummary.id = 'run-log-summary-' + streamRunId;
+        const runLogToggle = document.getElementById('run-log-toggle-' + runId);
+        if (runLogToggle) {
+          runLogToggle.id = 'run-log-toggle-' + streamRunId;
+          runLogToggle.setAttribute('onclick', "_toggleRunLogPanel('" + streamRunId + "')");
+        }
+        const runLogBody = document.getElementById('run-log-body-' + runId);
+        if (runLogBody) runLogBody.id = 'run-log-body-' + streamRunId;
+        const runLogLines = document.getElementById('run-log-lines-' + runId);
+        if (runLogLines) runLogLines.id = 'run-log-lines-' + streamRunId;
         const trace = document.getElementById('stream-trace-' + runId);
         if (trace) trace.id = 'stream-trace-' + streamRunId;
         const steps = document.getElementById('stream-steps-' + runId);
@@ -8678,6 +9467,25 @@ function _streamProjectRuntime(runId, bubble) {
       } catch(_) {}
     });
 
+    evtSrc.addEventListener('log', event => {
+      try {
+        const data = JSON.parse(event.data);
+        const detail = String(data.text || '').trim();
+        if (!detail) return;
+        _setProjectChatProgress(bubble, detail);
+        _recordProjectActivity({
+          kind: 'runtime_log',
+          title: 'Execution log',
+          status: 'running',
+          detail,
+          started_at: new Date().toISOString(),
+          task: 'Execute project task',
+          subtask: runId,
+          run_id: runId,
+        });
+      } catch(_) {}
+    });
+
     evtSrc.addEventListener('result', event => {
       try {
         const data = JSON.parse(event.data);
@@ -9984,14 +10792,27 @@ const SOURCE_ICONS = {folder:'📂',file:'📄',url:'🌐',database:'🗄️',on
 
 // ── Bootstrap ──────────────────────────────────────────────────────────────
 async function init() {
-  await loadKbList();
+  const params = new URLSearchParams(window.location.search || '');
+  const requestedKb = params.get('kb') || '';
+  const quick = params.get('quick') === '1';
+  const suggestedName = (params.get('name') || '').trim();
+  if (suggestedName) document.getElementById('newKbName').value = suggestedName;
+  await loadKbList(requestedKb);
+  if (quick) showCreateModal();
 }
 
 // ── KB List ────────────────────────────────────────────────────────────────
-async function loadKbList() {
+async function loadKbList(preferredKbId = '') {
   const r = await fetch(API + '/api/rag/kbs').then(r => r.json()).catch(() => []);
   const el = document.getElementById('kbList');
   el.innerHTML = '';
+  if (preferredKbId && Array.isArray(r) && r.some(kb => kb.id === preferredKbId)) {
+    _activeKbId = preferredKbId;
+  }
+  if (!_activeKbId) {
+    const active = Array.isArray(r) ? r.find(kb => !!kb.is_active) : null;
+    if (active && active.id) _activeKbId = active.id;
+  }
   if (!r.length) {
     el.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:12px">No knowledge bases yet. Click + New to create one.</div>';
     return;
@@ -10006,6 +10827,10 @@ async function loadKbList() {
     d.innerHTML = `<div class="kb-item-name">${kb.name}</div>
       <div class="kb-item-meta"><span class="kb-badge ${badgeCls}">${status}</span> ${kb.stats?.total_chunks||0} chunks · ${(kb.sources||[]).length} sources</div>`;
     el.appendChild(d);
+  }
+  if (_activeKbId) {
+    await renderKb();
+    switchTab(_currentTab);
   }
 }
 
@@ -13469,6 +14294,7 @@ strong { color: var(--text); }
 
         project_build_mode = bool(body.get("project_build_mode") or body.get("standalone"))
 
+        explicit_working_directory = str(body.get("working_directory") or "").strip()
         working_directory = str(
             body.get("working_directory") or os.getenv("KENDR_WORKING_DIR", "")
         ).strip()
@@ -13503,6 +14329,7 @@ strong { color: var(--text); }
                     "research_output_formats", "research_citation_style",
                     "research_enable_plagiarism_check", "research_web_search_enabled", "research_date_range",
                     "research_sources", "research_max_sources", "research_checkpoint_enabled",
+                    "research_kb_enabled", "research_kb_id", "research_kb_top_k",
                     "deep_research_source_urls", "local_drive_paths", "local_drive_recursive",
                     "local_drive_force_long_document",
                     "communication_authorized",
@@ -13546,7 +14373,9 @@ strong { color: var(--text); }
             if project_path:
                 if not payload.get("project_root"):
                     payload["project_root"] = project_path
-                if not payload.get("working_directory"):
+                if project_path and not explicit_working_directory:
+                    payload["working_directory"] = project_path
+                elif not payload.get("working_directory"):
                     payload["working_directory"] = project_path
             if project_name and not payload.get("project_name"):
                 payload["project_name"] = project_name
@@ -13688,8 +14517,10 @@ strong { color: var(--text); }
             )
 
         def _run() -> None:
-            _push_event(run_id, "status", {"status": "running", "message": "Continuing approved plan..."})
+            _push_event(run_id, "status", {"status": "running", "message": _resume_status_message(text)})
             _launch_step_stream_poller(run_id)
+            _launch_trace_stream_poller(run_id)
+            _launch_execution_log_poller(run_id)
             heartbeat_stop = threading.Event()
 
             def _heartbeat() -> None:
@@ -13731,6 +14562,7 @@ strong { color: var(--text); }
                     "privileged_approval_mode", "privileged_require_approvals", "privileged_read_only",
                     "privileged_allow_root", "privileged_allow_destructive", "privileged_enable_backup",
                     "privileged_allowed_paths", "privileged_allowed_domains",
+                    "research_kb_enabled", "research_kb_id", "research_kb_top_k",
                 ):
                     value = body.get(key)
                     if value is not None and str(value).strip():
@@ -13867,23 +14699,16 @@ strong { color: var(--text); }
 
         if q is None and run_data:
             result_payload = dict(run_data.get("result", {})) if isinstance(run_data.get("result"), dict) else {}
-            status_value = str(run_data.get("status", "") or result_payload.get("status", "")).strip().lower()
-            awaiting = bool(
-                run_data.get("awaiting_user_input")
-                or result_payload.get("awaiting_user_input")
-                or result_payload.get("plan_waiting_for_approval")
-                or result_payload.get("plan_needs_clarification")
-                or str(result_payload.get("approval_pending_scope", "")).strip()
-                or (
-                    isinstance(result_payload.get("approval_request"), dict)
-                    and bool(result_payload.get("approval_request"))
-                )
-                or str(result_payload.get("pending_user_question", "")).strip()
-                or str(result_payload.get("pending_user_input_kind", "")).strip()
-                or status_value == "awaiting_user_input"
-            )
+            status_value = _normalized_run_status(run_data.get("status") or result_payload.get("status"))
+            awaiting = state_awaiting_user_input(result_payload)
             if awaiting and status_value != "awaiting_user_input":
                 status_value = "awaiting_user_input"
+            elif not awaiting and status_value == "awaiting_user_input":
+                status_value = _fallback_non_awaiting_run_status(
+                    result_payload.get("status"),
+                    run_data.get("status"),
+                    completed=bool(str(run_data.get("completed_at") or "").strip()),
+                )
             if result_payload:
                 if status_value:
                     result_payload["status"] = status_value
@@ -14275,6 +15100,35 @@ strong { color: var(--text); }
                     _log.debug("Project chat history save failed for %s: %s", proj_id, persist_exc)
 
             activities: list[dict] = []
+            if _looks_like_machine_task_request(text):
+                answer = _PROJECT_ASK_TASK_REDIRECT
+                if proj_id:
+                    try:
+                        _append_project_chat_messages(
+                            proj_id,
+                            project_path=proj_root,
+                            project_name=proj_name,
+                            messages=[{
+                                "role": "agent",
+                                "content": answer,
+                                "content_format": "text",
+                            }],
+                        )
+                    except Exception as persist_exc:
+                        _log.debug("Project chat history save failed for %s: %s", proj_id, persist_exc)
+                emit("result", {
+                    "answer": answer,
+                    "model": "",
+                    "provider": "",
+                    "context_tokens": 0,
+                    "model_context_limit": 0,
+                    "context_pct": 0.0,
+                    "kendr_md_loaded": False,
+                    "kendr_md_generated": False,
+                    "activities": activities,
+                })
+                emit("done", {})
+                return
             task_title = f"Inspect {proj_name or 'the project'} and answer the question"
 
             emit("log", {"msg": "\U0001f4c1 Checking project directory...", "step": "init"})
@@ -14540,7 +15394,8 @@ strong { color: var(--text); }
                 "\n\nAnswer the user's question concisely and accurately. "
                 "If asked about what the project is or does, summarise from the kendr.md context above. "
                 "Ground the answer in the observed files, git state, and service status when relevant. "
-                "Do NOT generate execution plans or project scaffolds - just answer the question."
+                "Do NOT generate execution plans or project scaffolds - just answer the question. "
+                "If the user asks for edits, commands, or other machine actions, tell them to switch to AI Mode to execute tasks."
             )
 
             provider = provider_override or get_active_provider()
@@ -14676,6 +15531,15 @@ strong { color: var(--text); }
             "workspace_id": str(body.get("workspace_id") or ""),
             "context_limit": body.get("context_limit"),
         }
+        if _looks_like_machine_task_request(text):
+            _persist_channel_chat_turn(
+                payload,
+                user_text=text,
+                assistant_text=_SIMPLE_CHAT_TASK_REDIRECT,
+                context_limit=body.get("context_limit"),
+            )
+            self._json(200, {"answer": _SIMPLE_CHAT_TASK_REDIRECT, "provider": "", "model": ""})
+            return
 
         try:
             from kendr.llm_router import build_llm, get_active_provider, get_model_for_provider
@@ -14713,7 +15577,10 @@ strong { color: var(--text); }
             system_ctx = (
                 "You are Kendr in simple chat mode. "
                 "Answer directly and helpfully. "
-                "Do not mention agents, orchestration, runs, artifacts, plans, or internal workflows. "
+                "Do not mention orchestration, runs, artifacts, plans, or internal workflows. "
+                "If the user asks you to execute machine tasks (for example searching files, running commands, editing code, or taking actions on their system), "
+                "state clearly that this must be done in Agent mode and ask them to switch to Agent mode. "
+                "Do not claim you performed those actions in simple chat mode. "
                 "Only provide a plain assistant answer. "
                 "If attached local files or folders are available, use their excerpts or path summaries when relevant."
             )
@@ -15523,6 +16390,8 @@ strong { color: var(--text); }
 
     def _parse_multipart_form(self):
         try:
+            import cgi
+
             return cgi.FieldStorage(
                 fp=self.rfile,
                 headers=self.headers,

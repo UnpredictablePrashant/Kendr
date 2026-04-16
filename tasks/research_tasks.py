@@ -6,9 +6,10 @@ from typing import Any
 
 from openai import OpenAI
 
+from kendr.rag_manager import build_research_grounding
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.coding_tasks import _extract_output_text
-from tasks.research_infra import fetch_url_content, llm_text, parse_documents
+from tasks.research_infra import fetch_urls_content, llm_text, parse_documents
 from tasks.utils import OUTPUT_DIR, log_task_update, write_text_file
 
 
@@ -27,12 +28,20 @@ AGENT_METADATA = {
             "research_web_search_enabled",
             "deep_research_source_urls",
             "local_drive_paths",
+            "research_kb_enabled",
+            "research_kb_id",
+            "research_kb_top_k",
         ],
         "output_keys": [
             "research_result",
             "research_status",
             "research_response_id",
             "research_raw",
+            "research_kb_used",
+            "research_kb_name",
+            "research_kb_hit_count",
+            "research_kb_citations",
+            "research_kb_warning",
         ],
         "requirements": ["openai"],
         "display_name": "Deep Research Agent",
@@ -103,12 +112,14 @@ def _build_local_source_context(state: dict, query: str, *, include_urls: bool) 
         )
 
     if include_urls:
-        for index, url in enumerate(_normalize_url_list(state.get("deep_research_source_urls", []))[:10], start=1):
-            try:
-                page = fetch_url_content(url, timeout=20)
+        provided_urls = _normalize_url_list(state.get("deep_research_source_urls", []))[:10]
+        fetched_urls = fetch_urls_content(provided_urls, timeout=20) if provided_urls else []
+        for index, page in enumerate(fetched_urls, start=1):
+            url = str(page.get("url", "")).strip()
+            if page.get("error"):
+                page_text = f"URL extraction failed: {page.get('error')}"
+            else:
                 page_text = str(page.get("text", "")).strip()[:2500]
-            except Exception as exc:
-                page_text = f"URL extraction failed: {exc}"
             meta["provided_url_count"] += 1
             blocks.append(
                 "\n".join(
@@ -164,14 +175,64 @@ def deep_research_agent(state):
     background = state.get("research_background", True)
     poll_interval_seconds = int(state.get("research_poll_interval_seconds", 5))
     max_wait_seconds = int(state.get("research_max_wait_seconds", 600))
+    kb_enabled = bool(state.get("research_kb_enabled", False))
+    kb_ref = str(state.get("research_kb_id", "") or "").strip()
+    kb_top_k = max(1, int(state.get("research_kb_top_k", 8) or 8))
 
-    local_context, local_meta = _build_local_source_context(state, query, include_urls=web_search_enabled)
+    local_context, local_meta = _build_local_source_context(state, query, include_urls=True)
+    has_non_kb_evidence = bool(
+        web_search_enabled
+        or int(local_meta.get("local_file_count", 0) or 0) > 0
+        or int(local_meta.get("provided_url_count", 0) or 0) > 0
+    )
+    kb_warning = ""
+    kb_grounding: dict[str, Any] = {}
+    if kb_enabled:
+        try:
+            kb_grounding = build_research_grounding(
+                query,
+                kb_ref=kb_ref,
+                top_k=kb_top_k,
+                use_active_if_empty=True,
+                require_indexed=True,
+            )
+        except Exception as exc:
+            kb_warning = str(exc)
+            if has_non_kb_evidence:
+                log_task_update(
+                    "Deep Research",
+                    f"Knowledge base grounding unavailable; continuing with other sources. {kb_warning}",
+                )
+            else:
+                raise ValueError(
+                    f"Knowledge base grounding failed and no other evidence sources are available. {kb_warning}"
+                ) from exc
+        else:
+            if int(kb_grounding.get("hit_count", 0) or 0) <= 0:
+                kb_warning = (
+                    f"Knowledge base '{kb_grounding.get('kb_name', 'unknown')}' returned no relevant results for this query."
+                )
+            if kb_grounding.get("prompt_context"):
+                instructions = (
+                    f"{instructions}\n\n"
+                    "Prioritize the supplied knowledge-base grounding and explicitly reconcile it with any other findings.\n\n"
+                    f"{kb_grounding['prompt_context']}"
+                )
+            elif not has_non_kb_evidence and not web_search_enabled:
+                raise ValueError(
+                    f"{kb_warning} No other evidence sources are available for this local-only run."
+                )
     if local_context:
         instructions = (
             f"{instructions}\n\n"
             "Prioritize the supplied local source context and explicitly reconcile it with any additional findings.\n\n"
             f"Local source context:\n{local_context}"
         )
+    combined_source_context = "\n\n".join(
+        part
+        for part in (kb_grounding.get("prompt_context", ""), local_context)
+        if str(part).strip()
+    ).strip()
 
     if not web_search_enabled:
         local_only_prompt = f"""
@@ -181,10 +242,10 @@ Research query:
 {query}
 
 Available source context:
-{local_context or "No local file context was provided."}
+{combined_source_context or "No local file context was provided."}
 
 Write a source-aware research memo that:
-- uses only the provided local file context
+- uses only the provided source context
 - does not invent external citations
 - calls out gaps or uncertainty clearly
 - ends with a concise recommended next-steps section
@@ -193,9 +254,12 @@ Write a source-aware research memo that:
         payload = {
             "mode": "local_only",
             "query": query,
-            "local_context": local_context,
+            "local_context": combined_source_context,
             "local_source_count": local_meta.get("local_file_count", 0),
-            "provided_url_count": 0,
+            "provided_url_count": local_meta.get("provided_url_count", 0),
+            "research_kb": kb_grounding,
+            "research_kb_used": bool(kb_grounding.get("prompt_context")),
+            "research_kb_warning": kb_warning,
             "output_text": output_text,
         }
         raw_filename = f"deep_research_raw_{call_number}.json"
@@ -207,10 +271,20 @@ Write a source-aware research memo that:
         state["research_result"] = output_text
         state["research_model"] = "local-only-synthesis"
         state["research_raw"] = payload
+        state["research_kb_used"] = bool(payload.get("research_kb_used"))
+        state["research_kb_name"] = str((kb_grounding or {}).get("kb_name", "") or "")
+        state["research_kb_hit_count"] = int((kb_grounding or {}).get("hit_count", 0) or 0)
+        state["research_kb_citations"] = list((kb_grounding or {}).get("citations", []) or [])
+        state["research_kb_warning"] = kb_warning
         state["draft_response"] = output_text
         log_task_update(
             "Deep Research",
-            f"Completed local-only deep research run #{call_number} using {local_meta.get('local_file_count', 0)} local file(s).",
+            (
+                f"Completed local-only deep research run #{call_number} using "
+                f"{local_meta.get('local_file_count', 0)} local file(s), "
+                f"{local_meta.get('provided_url_count', 0)} provided URL(s), and "
+                f"{int((kb_grounding or {}).get('hit_count', 0) or 0)} KB hit(s)."
+            ),
             output_text,
         )
         state = publish_agent_output(
@@ -276,6 +350,9 @@ Write a source-aware research memo that:
             )
 
     payload = _serialize_response(response)
+    payload["research_kb"] = kb_grounding
+    payload["research_kb_used"] = bool(kb_grounding.get("prompt_context"))
+    payload["research_kb_warning"] = kb_warning
     output_text = getattr(response, "output_text", None) or _extract_output_text(payload)
 
     raw_filename = f"deep_research_raw_{call_number}.json"
@@ -289,11 +366,20 @@ Write a source-aware research memo that:
     state["research_result"] = output_text
     state["research_model"] = model
     state["research_raw"] = payload
+    state["research_kb_used"] = bool(payload.get("research_kb_used"))
+    state["research_kb_name"] = str((kb_grounding or {}).get("kb_name", "") or "")
+    state["research_kb_hit_count"] = int((kb_grounding or {}).get("hit_count", 0) or 0)
+    state["research_kb_citations"] = list((kb_grounding or {}).get("citations", []) or [])
+    state["research_kb_warning"] = kb_warning
     state["draft_response"] = output_text
 
     log_task_update(
         "Deep Research",
-        f"Deep research finished with status '{state['research_status']}'. Saved artifacts to {OUTPUT_DIR}/{output_filename}.",
+        (
+            f"Deep research finished with status '{state['research_status']}'. "
+            f"Saved artifacts to {OUTPUT_DIR}/{output_filename}. "
+            f"KB hits: {int((kb_grounding or {}).get('hit_count', 0) or 0)}."
+        ),
         output_text,
     )
     state = publish_agent_output(

@@ -26,6 +26,7 @@ from kendr.orchestration import (
     state_awaiting_user_input,
 )
 from kendr.execution_trace import append_execution_event, render_execution_event_line
+from kendr.domain.deep_research import build_source_strategy, discover_research_intent
 from kendr.direct_tools import run_direct_tool_loop
 from kendr.persistence import (
     claim_plan_task,
@@ -96,6 +97,24 @@ from tasks.utils import (
 from .recovery import write_recovery_files
 
 from .registry import Registry
+
+
+_DEEP_RESEARCH_OUTPUT_ONLY_BLOCKED_AGENTS = {
+    "project_blueprint_agent",
+    "master_coding_agent",
+    "coding_agent",
+    "dev_pipeline_agent",
+    "project_scaffold_agent",
+    "database_architect_agent",
+    "auth_security_agent",
+    "backend_builder_agent",
+    "frontend_builder_agent",
+    "dependency_manager_agent",
+    "test_agent",
+    "devops_agent",
+    "project_verifier_agent",
+    "post_setup_agent",
+}
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -491,6 +510,8 @@ class AgentRuntime:
     def _is_agent_available(self, state: dict, agent_name: str) -> bool:
         if agent_name in (state.get("_circuit_broken_agents") or {}):
             return False
+        if self._is_deep_research_workflow(dict(state)) and agent_name in _DEEP_RESEARCH_OUTPUT_ONLY_BLOCKED_AGENTS:
+            return False
         return agent_name in set(state.get("available_agents", []))
 
     def _effective_available_agents(self, state: Mapping[str, Any]) -> list[str]:
@@ -835,6 +856,8 @@ class AgentRuntime:
     def _policy_blocked_agents(self, state: Mapping[str, Any]) -> set[str]:
         blocked: set[str] = set()
         available = set(state.get("available_agents", []) or [])
+        if self._is_deep_research_workflow(dict(state)):
+            blocked.update(name for name in _DEEP_RESEARCH_OUTPUT_ONLY_BLOCKED_AGENTS if name in available)
         if "planner_agent" in available and not state.get("plan_steps") and not bool(state.get("plan_ready", False)):
             run_planner, _, _ = self._should_run_planner(state)
             if not run_planner:
@@ -1013,6 +1036,39 @@ class AgentRuntime:
         if not raw:
             return {"action": "unclear", "feedback": ""}
 
+        cancel_exact_markers = {
+            "cancel",
+            "cancel this",
+            "stop",
+            "stop this",
+            "abort",
+            "abort this",
+            "reject",
+            "reject this",
+            "rejected",
+            "decline",
+            "declined",
+            "never mind",
+            "nevermind",
+        }
+        cancel_phrase_markers = (
+            "cancel the run",
+            "stop the run",
+            "abort the run",
+            "reject this",
+            "reject it",
+            "dont create",
+            "don't create",
+            "do not create",
+            "dont build",
+            "don't build",
+            "do not build",
+            "dont implement",
+            "don't implement",
+            "do not implement",
+            "no need to create",
+            "no existing files need to be changed",
+        )
         revise_markers = (
             "change",
             "modify",
@@ -1030,6 +1086,7 @@ class AgentRuntime:
             "rewrite",
             "fix",
             "not ",
+            "dont",
             "don't",
             "do not",
         )
@@ -1052,6 +1109,8 @@ class AgentRuntime:
             "quick answer",
         )
         cleaned = lowered.strip(" \n\t.!?")
+        if cleaned in cancel_exact_markers or any(marker in lowered for marker in cancel_phrase_markers):
+            return {"action": "cancel", "feedback": raw}
         if any(marker in lowered for marker in quick_summary_markers):
             return {"action": "quick_summary", "feedback": raw}
         if cleaned in {"no", "n"} or any(marker in lowered for marker in revise_markers):
@@ -1251,6 +1310,74 @@ class AgentRuntime:
         if workflow_type:
             state["workflow_type"] = workflow_type
         return workflow_type
+
+    def _prime_deep_research_plan(self, state: RuntimeState, *, record_trace: bool = True) -> None:
+        if not self._is_deep_research_workflow(dict(state)):
+            return
+        objective = str(state.get("current_objective") or state.get("user_query") or "").strip()
+        if not objective:
+            return
+        max_files = max(20, int(state.get("local_drive_max_files", 200) or 200))
+        local_paths_present = bool(
+            state.get("local_drive_paths")
+            or state.get("local_drive_files")
+            or state.get("local_drive_document_summaries")
+        )
+        intent = state.get("deep_research_intent", {})
+        if not isinstance(intent, dict) or not intent:
+            intent = discover_research_intent(objective, state)
+            state["deep_research_intent"] = intent
+        strategy = state.get("deep_research_source_strategy", {})
+        if not isinstance(strategy, dict) or not strategy:
+            strategy = build_source_strategy(
+                intent,
+                max_files=max_files,
+                allow_web_search=bool(state.get("research_web_search_enabled", True)),
+                local_paths_present=local_paths_present,
+            )
+            state["deep_research_source_strategy"] = strategy
+        state["deep_research_execution_plan"] = {
+            "objective": objective,
+            "summary": " ".join(
+                part for part in [
+                    str(intent.get("summary", "")).strip(),
+                    str(strategy.get("summary", "")).strip(),
+                ] if part
+            ).strip(),
+            "intent": intent,
+            "source_strategy": strategy,
+            "banned_actions": list(intent.get("banned_actions", []) or []),
+            "max_files": max_files,
+            "local_paths_present": local_paths_present,
+            "phases": [
+                {"id": "intent", "title": "Discover research intent"},
+                {"id": "source_strategy", "title": "Plan source strategy"},
+                {"id": "evidence", "title": "Collect prioritized evidence"},
+                {"id": "draft", "title": "Draft grounded report"},
+                {"id": "exports", "title": "Export report artifacts"},
+            ],
+        }
+        if not record_trace or bool(state.get("_deep_research_bootstrap_trace_written", False)):
+            return
+        self._record_execution_trace(
+            state,
+            kind="intent",
+            actor="runtime",
+            status="completed",
+            title="Research intent discovered",
+            detail=str(intent.get("summary", "")).strip(),
+            metadata={"phase": "intent", "intent": intent},
+        )
+        self._record_execution_trace(
+            state,
+            kind="source_strategy",
+            actor="runtime",
+            status="completed",
+            title="Source strategy planned",
+            detail=str(strategy.get("summary", "")).strip(),
+            metadata={"phase": "source_strategy", "strategy": strategy},
+        )
+        state["_deep_research_bootstrap_trace_written"] = True
 
     _PROJECT_WORKBENCH_RE = re.compile(
         r"(?:"  # explicit codebase inspection / modification requests from the project workbench
@@ -1673,6 +1800,9 @@ class AgentRuntime:
                 "long_document_plan_version": int(state.get("long_document_plan_version", 0) or 0),
                 "long_document_outline": state.get("long_document_outline", {}),
                 "superrag_active_session_id": state.get("superrag_active_session_id", ""),
+                "research_kb_enabled": bool(state.get("research_kb_enabled", False)),
+                "research_kb_id": str(state.get("research_kb_id", "") or ""),
+                "research_kb_top_k": int(state.get("research_kb_top_k", 8) or 8),
                 "execution_mode": str(state.get("execution_mode", "adaptive") or "adaptive").strip().lower(),
                 "adaptive_agent_selection": _truthy(state.get("adaptive_agent_selection"), True),
                 "planner_policy_mode": str(state.get("planner_policy_mode", "adaptive") or "adaptive").strip().lower(),
@@ -1771,6 +1901,14 @@ class AgentRuntime:
         policy_blocked = set(state.get("_policy_blocked_agents", []) or [])
         if agent_name == "finish" or (agent_name not in policy_blocked and self._is_agent_available(state, agent_name)):
             return agent_name, reason
+        if self._is_deep_research_workflow(dict(state)) and agent_name in _DEEP_RESEARCH_OUTPUT_ONLY_BLOCKED_AGENTS:
+            deep_reason = (
+                f"{reason} Deep research is output-only, so {agent_name} is blocked. "
+                "Continue with long_document_agent and produce research artifacts instead of code or project scaffolding."
+            )
+            if self._is_agent_available(state, "long_document_agent"):
+                return "long_document_agent", deep_reason
+            return "finish", deep_reason
         if agent_name in policy_blocked:
             reason = f"{reason} Requested agent {agent_name} is currently gated by the adaptive policy."
         setup_actions = json.dumps(state.get("setup_actions", []), ensure_ascii=False)
@@ -4519,6 +4657,9 @@ Return ONLY valid JSON in this exact schema:
             "deep_research_tier": 0,
             "deep_research_confirmed": False,
             "deep_research_analysis": {},
+            "deep_research_intent": {},
+            "deep_research_source_strategy": {},
+            "deep_research_execution_plan": {},
             "deep_research_result_card": {},
             "deep_research_source_urls": [],
             "workflow_type": "",
@@ -4529,6 +4670,9 @@ Return ONLY valid JSON in this exact schema:
             "research_date_range": "all_time",
             "research_max_sources": 0,
             "research_checkpoint_enabled": False,
+            "research_kb_enabled": False,
+            "research_kb_id": "",
+            "research_kb_top_k": 8,
             "resume_requested": False,
             "resume_ready": False,
             "resume_blocked": False,
@@ -4739,6 +4883,21 @@ Return ONLY valid JSON in this exact schema:
                 initial_state["deep_research_tier"] = int(prior_channel_state.get("deep_research_tier", 0) or 0)
                 initial_state["deep_research_confirmed"] = bool(prior_channel_state.get("deep_research_confirmed", False))
                 initial_state["deep_research_analysis"] = prior_channel_state.get("deep_research_analysis", {})
+                initial_state["deep_research_intent"] = (
+                    prior_channel_state.get("deep_research_intent", {})
+                    if isinstance(prior_channel_state.get("deep_research_intent", {}), dict)
+                    else {}
+                )
+                initial_state["deep_research_source_strategy"] = (
+                    prior_channel_state.get("deep_research_source_strategy", {})
+                    if isinstance(prior_channel_state.get("deep_research_source_strategy", {}), dict)
+                    else {}
+                )
+                initial_state["deep_research_execution_plan"] = (
+                    prior_channel_state.get("deep_research_execution_plan", {})
+                    if isinstance(prior_channel_state.get("deep_research_execution_plan", {}), dict)
+                    else {}
+                )
                 initial_state["deep_research_result_card"] = prior_channel_state.get("deep_research_result_card", {})
                 initial_state["deep_research_source_urls"] = list(prior_channel_state.get("deep_research_source_urls", []) or [])
                 initial_state["research_output_formats"] = list(prior_channel_state.get("research_output_formats", initial_state.get("research_output_formats", [])) or initial_state.get("research_output_formats", []))
@@ -4748,6 +4907,9 @@ Return ONLY valid JSON in this exact schema:
                 initial_state["research_date_range"] = str(prior_channel_state.get("research_date_range", initial_state.get("research_date_range", "")) or initial_state.get("research_date_range", ""))
                 initial_state["research_max_sources"] = int(prior_channel_state.get("research_max_sources", 0) or 0)
                 initial_state["research_checkpoint_enabled"] = bool(prior_channel_state.get("research_checkpoint_enabled", False))
+                initial_state["research_kb_enabled"] = bool(prior_channel_state.get("research_kb_enabled", initial_state.get("research_kb_enabled", False)))
+                initial_state["research_kb_id"] = str(prior_channel_state.get("research_kb_id", initial_state.get("research_kb_id", "")) or initial_state.get("research_kb_id", ""))
+                initial_state["research_kb_top_k"] = int(prior_channel_state.get("research_kb_top_k", initial_state.get("research_kb_top_k", 8)) or initial_state.get("research_kb_top_k", 8))
                 initial_state["workflow_type"] = str(prior_channel_state.get("workflow_type", initial_state.get("workflow_type", "")) or initial_state.get("workflow_type", ""))
                 if prior_channel_state.get("long_document_outline"):
                     initial_state["long_document_outline"] = prior_channel_state.get("long_document_outline", {})
@@ -4897,6 +5059,7 @@ Return ONLY valid JSON in this exact schema:
                 initial_state["repo_scan_summary"] = f"Repository scan failed: {exc}"
         ensure_a2a_state(initial_state, initial_state.get("available_agent_cards") or self._agent_cards())
         initial_state = bootstrap_file_memory(initial_state)
+        self._prime_deep_research_plan(initial_state, record_trace=True)
         update_session_file(initial_state, status="initialized")
         update_planning_file(
             initial_state,

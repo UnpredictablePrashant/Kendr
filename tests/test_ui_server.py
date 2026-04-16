@@ -8,11 +8,33 @@ import tempfile
 import threading
 import time
 import unittest
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as _ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
+
+
+def _require_loopback_socket() -> None:
+    probe = None
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        probe.bind(("127.0.0.1", 0))
+    except PermissionError as exc:
+        raise unittest.SkipTest(f"Loopback sockets unavailable in this environment: {exc}") from exc
+    finally:
+        if probe is not None:
+            probe.close()
+
+
+def _make_http_server(handler_cls):
+    _require_loopback_socket()
+    return _ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+
+
+def ThreadingHTTPServer(*args, **kwargs):
+    _require_loopback_socket()
+    return _ThreadingHTTPServer(*args, **kwargs)
 
 
 class TestSecretSentinelHandling(unittest.TestCase):
@@ -144,6 +166,7 @@ class TestUICmdHealthProbe(unittest.TestCase):
         self.assertFalse(result, "Must not detect non-kendr service as kendr-ui")
 
     def test_returns_false_when_nothing_listening(self):
+        _require_loopback_socket()
         tmp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         tmp.bind(("127.0.0.1", 0))
         _, port = tmp.getsockname()
@@ -408,9 +431,48 @@ class TestChatHtmlExecutionLens(unittest.TestCase):
         self.assertIn("/api/runs/stop", ui_server._CHAT_HTML)
         self.assertIn("Stop active run", ui_server._CHAT_HTML)
         self.assertIn(".send-btn.stop-mode", ui_server._CHAT_HTML)
+        self.assertIn("chatComposerState", ui_server._CHAT_HTML)
+        self.assertIn("button.textContent = isStopping ? 'Wait...' : 'Stop';", ui_server._CHAT_HTML)
+        self.assertIn("mainChatAttachBtn", ui_server._CHAT_HTML)
+
+    def test_chat_html_includes_smart_research_timeline_hooks(self):
+        import kendr.ui_server as ui_server
+
+        self.assertIn("evtSrc.addEventListener('intent'", ui_server._CHAT_HTML)
+        self.assertIn("evtSrc.addEventListener('source_strategy'", ui_server._CHAT_HTML)
+        self.assertIn("evtSrc.addEventListener('coverage'", ui_server._CHAT_HTML)
+        self.assertIn("evtSrc.addEventListener('artifact_created'", ui_server._CHAT_HTML)
+        self.assertIn("Created Artifacts", ui_server._CHAT_HTML)
+        self.assertIn("Download</a>", ui_server._CHAT_HTML)
+        self.assertIn("/api/artifacts/view?run_id=", ui_server._CHAT_HTML)
+        self.assertIn("Research Profile", ui_server._CHAT_HTML)
+        self.assertIn("Planned File Budget", ui_server._CHAT_HTML)
+        self.assertIn("Coverage Revisit Plan", ui_server._CHAT_HTML)
+        self.assertIn("Extraction Failures", ui_server._CHAT_HTML)
+        self.assertIn("failed_extractions", ui_server._CHAT_HTML)
 
 
 class TestRunCancellationHelpers(unittest.TestCase):
+    def test_trace_stream_event_type_maps_smart_research_kinds(self):
+        import kendr.ui_server as ui_server
+
+        self.assertEqual(ui_server._trace_stream_event_type({"kind": "intent"}), "intent")
+        self.assertEqual(ui_server._trace_stream_event_type({"kind": "source_strategy"}), "source_strategy")
+        self.assertEqual(ui_server._trace_stream_event_type({"kind": "coverage"}), "coverage")
+        self.assertEqual(ui_server._trace_stream_event_type({"kind": "quality_gate"}), "quality_gate")
+        self.assertEqual(ui_server._trace_stream_event_type({"kind": "artifact_created"}), "artifact_created")
+        self.assertEqual(ui_server._trace_stream_event_type({"kind": "unknown"}), "activity")
+
+    def test_resume_status_message_reflects_feedback_and_cancel(self):
+        import kendr.ui_server as ui_server
+
+        self.assertEqual(ui_server._resume_status_message("approve"), "Continuing approved plan...")
+        self.assertEqual(ui_server._resume_status_message("cancel"), "Applying your cancellation...")
+        self.assertEqual(
+            ui_server._resume_status_message("do not create the project; give pdf output"),
+            "Applying your feedback...",
+        )
+
     def test_terminal_run_status_handles_cancelling_and_cancelled(self):
         import kendr.ui_server as ui_server
 
@@ -736,6 +798,76 @@ class TestSseReplayBehavior(unittest.TestCase):
         self.assertIn('event: done', stream)
 
 
+class TestRunLogStreaming(unittest.TestCase):
+    def test_chat_html_wires_live_log_panel_and_event_handler(self):
+        import kendr.ui_server as ui_server
+
+        self.assertIn("Live Execution Log", ui_server._CHAT_HTML)
+        self.assertIn("evtSrc.addEventListener('log'", ui_server._CHAT_HTML)
+        self.assertIn("_appendRunLogEntry", ui_server._CHAT_HTML)
+        self.assertIn("_toggleRunLogPanel", ui_server._CHAT_HTML)
+        self.assertIn("run-log-summary-", ui_server._CHAT_HTML)
+        self.assertIn("Streaming execution.log in real time...", ui_server._CHAT_HTML)
+
+    def test_parse_run_log_line_summarizes_llm_calls_and_skips_prompt_body(self):
+        import kendr.ui_server as ui_server
+
+        state: dict[str, object] = {}
+        entry = ui_server._parse_run_log_line(
+            "2026-04-16 10:56:58,489 - INFO - [LLM Call] agent=local_drive_agent | role=general | provider=openai | model=gpt-4o-mini | endpoint=https://api.openai.com/v1 | key=sk-proj-secret-1234567890 | prompt_chars=2293",
+            state,
+        )
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["category"], "llm_call")
+        self.assertIn("LLM call", entry["text"])
+        self.assertIn("Local Drive", entry["text"])
+        self.assertIn("gpt-4o-mini", entry["text"])
+        self.assertIn("2,293 prompt chars", entry["text"])
+        self.assertNotIn("sk-proj-secret", entry["text"])
+
+        self.assertIsNone(
+            ui_server._parse_run_log_line(
+                "2026-04-16 10:56:58,490 - INFO - [LLM Prompt]",
+                state,
+            )
+        )
+        self.assertIsNone(
+            ui_server._parse_run_log_line(
+                "OPENAI_API_KEY=sk-proj-should-not-be-streamed",
+                state,
+            )
+        )
+
+        follow_up = ui_server._parse_run_log_line(
+            "2026-04-16 10:57:06,269 - INFO - [LLM OK] agent=local_drive_agent | model=gpt-4o-mini | elapsed_ms=7781 | tokens in:706 out:384/total:1090",
+            state,
+        )
+        self.assertIsNotNone(follow_up)
+        self.assertEqual(follow_up["category"], "llm_ok")
+        self.assertIn("7.8s", follow_up["text"])
+        self.assertIn("tokens in 706 / out 384", follow_up["text"])
+
+    def test_parse_run_log_line_reduces_paths_to_filenames(self):
+        import kendr.ui_server as ui_server
+
+        state: dict[str, object] = {}
+        ui_server._parse_run_log_line(
+            "2026-04-16 10:56:58,328 - INFO - [Local Drive] [1/200] Scanning file.",
+            state,
+        )
+        path_entry = ui_server._parse_run_log_line(r"D:\Mckinsey\AIOps (AutoRecovered).docx", state)
+        artifact_entry = ui_server._parse_run_log_line(
+            r"2026-04-16 10:56:58,330 - INFO - [files] wrote: D:\superagentTasks\runs\ui-mo11e1nc_gg9ptl5i\local_drive_doc_summary_1_002_aiops_autorecovered.txt",
+            state,
+        )
+
+        self.assertEqual(path_entry["text"], "File · AIOps (AutoRecovered).docx")
+        self.assertEqual(
+            artifact_entry["text"],
+            "Wrote artifact · local_drive_doc_summary_1_002_aiops_autorecovered.txt",
+        )
+
+
 class TestProjectsHtmlApprovalModal(unittest.TestCase):
     def test_projects_html_includes_approval_modal(self):
         import kendr.ui_server as ui_server
@@ -929,7 +1061,7 @@ class TestLiveRunOverlay(unittest.TestCase):
             "chat-abc123",
         )
 
-    def test_live_run_marks_awaiting_input_from_pending_result(self):
+    def test_live_run_ignores_pending_result_without_concrete_prompt(self):
         import kendr.ui_server as ui_server
 
         run_row = {
@@ -951,6 +1083,37 @@ class TestLiveRunOverlay(unittest.TestCase):
         }
 
         with patch.dict("kendr.ui_server._pending_runs", {"run-2": pending}, clear=True):
+            merged = ui_server._live_run(run_row)
+
+        self.assertEqual(merged["status"], "completed")
+        self.assertFalse(merged["awaiting_user_input"])
+
+    def test_live_run_marks_awaiting_input_from_pending_question(self):
+        import kendr.ui_server as ui_server
+
+        run_row = {
+            "run_id": "run-2b",
+            "user_query": "Need approval",
+            "status": "running",
+            "started_at": "2026-04-03T10:00:00+00:00",
+            "updated_at": "2026-04-03T10:01:00+00:00",
+            "completed_at": "",
+        }
+        pending = {
+            "run_id": "run-2b",
+            "status": "completed",
+            "started_at": "2026-04-03T10:00:00+00:00",
+            "updated_at": "2026-04-03T10:02:00+00:00",
+            "completed_at": "2026-04-03T10:02:00+00:00",
+            "payload": {"text": "Need approval"},
+            "result": {
+                "awaiting_user_input": True,
+                "pending_user_input_kind": "approval",
+                "pending_user_question": "Reply approve to continue.",
+            },
+        }
+
+        with patch.dict("kendr.ui_server._pending_runs", {"run-2b": pending}, clear=True):
             merged = ui_server._live_run(run_row)
 
         self.assertEqual(merged["status"], "awaiting_user_input")
@@ -1446,6 +1609,13 @@ class TestOllamaPullProgressHelpers(unittest.TestCase):
 
 
 class TestUIChatPayloads(unittest.TestCase):
+    def test_machine_task_intent_detection_for_chat_mode(self):
+        import kendr.ui_server as ui_server
+
+        self.assertTrue(ui_server._looks_like_machine_task_request("Search files on my machine for TODOs"))
+        self.assertTrue(ui_server._looks_like_machine_task_request("Can you run tests and fix failures"))
+        self.assertFalse(ui_server._looks_like_machine_task_request("How do I run tests in this repo?"))
+
     def test_chat_endpoint_forwards_provider_and_model_to_runtime_payload(self):
         from kendr.ui_server import KendrUIHandler
         from http.client import HTTPConnection
@@ -1492,8 +1662,11 @@ class TestUIChatPayloads(unittest.TestCase):
         from kendr.ui_server import KendrUIHandler
         from http.client import HTTPConnection
 
+        captured_messages = {}
+
         class _LLM:
             def invoke(self, messages):
+                captured_messages["messages"] = messages
                 class _Resp:
                     content = "Direct answer"
                 return _Resp()
@@ -1530,6 +1703,32 @@ class TestUIChatPayloads(unittest.TestCase):
         self.assertEqual(body.get("answer"), "Direct answer")
         self.assertEqual(body.get("provider"), "ollama")
         self.assertEqual(body.get("model"), "llama3.2")
+        system_text = str(captured_messages["messages"][0].content)
+        self.assertIn("must be done in Agent mode", system_text)
+        self.assertIn("Do not claim you performed those actions in simple chat mode", system_text)
+
+    def test_simple_chat_endpoint_redirects_machine_task_requests_to_agent_mode(self):
+        import kendr.ui_server as ui_server
+
+        handler = object.__new__(ui_server.KendrUIHandler)
+        responses: list[tuple[int, dict]] = []
+
+        def _json(code, payload):
+            responses.append((code, payload))
+
+        handler._json = _json
+        with patch("kendr.ui_server._persist_channel_chat_turn") as persist_turn:
+            handler._handle_simple_chat(
+                {
+                    "text": "Search files on my machine for secrets",
+                    "channel": "webchat",
+                    "chat_id": "chat-1",
+                }
+            )
+
+        self.assertEqual(responses[0][0], 200)
+        self.assertIn("Switch to Agent mode", str(responses[0][1].get("answer") or ""))
+        persist_turn.assert_called_once()
 
     def test_webchat_does_not_auto_inject_active_project_context(self):
         from kendr.ui_server import KendrUIHandler
@@ -1839,6 +2038,9 @@ class TestDeepResearchChatPayload(unittest.TestCase):
             "long_document_mode": True,
             "long_document_pages": 40,
             "research_web_search_enabled": False,
+            "research_kb_enabled": True,
+            "research_kb_id": "kb-123",
+            "research_kb_top_k": 11,
             "deep_research_source_urls": ["https://example.com/ignored-when-local-only"],
             "local_drive_paths": ["/tmp/work/research-inputs"],
             "local_drive_recursive": True,
@@ -1867,10 +2069,33 @@ class TestDeepResearchChatPayload(unittest.TestCase):
         self.assertTrue(forwarded["deep_research_mode"])
         self.assertTrue(forwarded["long_document_mode"])
         self.assertFalse(forwarded["research_web_search_enabled"])
+        self.assertTrue(forwarded["research_kb_enabled"])
+        self.assertEqual(forwarded["research_kb_id"], "kb-123")
+        self.assertEqual(forwarded["research_kb_top_k"], 11)
         self.assertEqual(forwarded["deep_research_source_urls"], ["https://example.com/ignored-when-local-only"])
         self.assertEqual(forwarded["local_drive_paths"], ["/tmp/work/research-inputs"])
         self.assertTrue(forwarded["local_drive_recursive"])
         self.assertTrue(forwarded["local_drive_force_long_document"])
+
+    def test_handle_rag_list_kbs_preserves_active_flag(self):
+        import kendr.ui_server as ui_server
+
+        handler = object.__new__(ui_server.KendrUIHandler)
+        handler._json = MagicMock()
+
+        with patch("kendr.ui_server._HAS_RAG", True), patch(
+            "kendr.ui_server._rag_list_kbs",
+            return_value=[
+                {"id": "kb-active", "name": "Active KB", "status": "indexed", "is_active": True},
+                {"id": "kb-idle", "name": "Idle KB", "status": "empty", "is_active": False},
+            ],
+        ):
+            handler._handle_rag_list_kbs()
+
+        handler._json.assert_called_once()
+        payload = handler._json.call_args.args[1]
+        self.assertTrue(payload[0]["is_active"])
+        self.assertFalse(payload[1]["is_active"])
 
     def test_handle_chat_project_ui_starts_runtime_and_persists_request(self):
         from kendr.ui_server import KendrUIHandler

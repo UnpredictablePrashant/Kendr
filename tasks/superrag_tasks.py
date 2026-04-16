@@ -66,7 +66,7 @@ AGENT_METADATA = {
             "superrag_status",
             "draft_response",
         ],
-        "requirements": ["openai", "qdrant"],
+        "requirements": ["openai"],
         "display_name": "Super-RAG",
         "category": "data",
         "intent_patterns": [
@@ -289,7 +289,7 @@ def _format_eta(seconds: int) -> str:
 
 def _superrag_dependency_error(stage: str, exc: Exception) -> ValueError:
     return ValueError(
-        f"superRAG {stage} failed. Confirm OPENAI_API_KEY and a reachable QDRANT_URL, then re-run `kendr setup status`. Root cause: {exc}"
+        f"superRAG {stage} failed. Confirm OPENAI_API_KEY and local ChromaDB access (or a reachable QDRANT_URL), then re-run `kendr setup status`. Root cause: {exc}"
     )
 
 

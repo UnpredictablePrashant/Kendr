@@ -29,6 +29,7 @@ from typing import Any
 _CONFIG_DIR = Path(os.getenv("KENDR_CONFIG_DIR", "~/.kendr")).expanduser()
 _RAG_CONFIG_PATH = _CONFIG_DIR / "rag_config.json"
 _UPLOADS_DIR = _CONFIG_DIR / "rag_uploads"
+_DEFAULT_CHROMA_PATH = _CONFIG_DIR / "rag" / "chroma"
 
 _CONFIG_LOCK = threading.Lock()
 
@@ -90,7 +91,13 @@ def _collection_name(kb_id: str) -> str:
 def list_kbs() -> list[dict]:
     with _CONFIG_LOCK:
         cfg = _load_config()
-    return list(cfg.get("knowledge_bases", {}).values())
+    active_id = str(cfg.get("active_kb_id", "") or "").strip()
+    results: list[dict] = []
+    for kb in cfg.get("knowledge_bases", {}).values():
+        item = dict(kb)
+        item["is_active"] = bool(active_id and str(item.get("id", "")).strip() == active_id)
+        results.append(item)
+    return results
 
 
 def get_kb(kb_id: str) -> dict | None:
@@ -107,6 +114,34 @@ def get_active_kb() -> dict | None:
         kbs = list(cfg.get("knowledge_bases", {}).values())
         return kbs[0] if kbs else None
     return cfg.get("knowledge_bases", {}).get(active_id)
+
+
+def resolve_kb(kb_ref: str = "", *, use_active_if_empty: bool = True, require_indexed: bool = False) -> dict:
+    """Resolve a KB by id or name, optionally falling back to the active KB."""
+    kb_ref = str(kb_ref or "").strip()
+    if not kb_ref:
+        if not use_active_if_empty:
+            raise ValueError("Knowledge base reference is required.")
+        kb = get_active_kb()
+        if not kb:
+            raise ValueError("No active knowledge base is configured.")
+    else:
+        kb = get_kb(kb_ref)
+        if not kb:
+            kb_lower = kb_ref.lower()
+            matches = [item for item in list_kbs() if str(item.get("name", "")).strip().lower() == kb_lower]
+            if not matches:
+                raise ValueError(f"Knowledge base not found: {kb_ref}")
+            if len(matches) > 1:
+                raise ValueError(f"Knowledge base name is ambiguous: {kb_ref}")
+            kb = matches[0]
+
+    status = str(kb.get("status", "") or "").strip().lower()
+    if require_indexed and status != "indexed":
+        raise ValueError(
+            f"Knowledge base '{kb.get('name', kb.get('id', 'unknown'))}' is not indexed yet."
+        )
+    return kb
 
 
 def set_active_kb(kb_id: str) -> None:
@@ -131,7 +166,7 @@ def create_kb(name: str, description: str = "") -> dict:
         "updated_at": now,
         "vector_config": {
             "backend": "chromadb",
-            "chromadb_path": str(_CONFIG_DIR / "chroma"),
+            "chromadb_path": str(_DEFAULT_CHROMA_PATH),
             "qdrant_url": os.getenv("QDRANT_URL", ""),
             "qdrant_api_key": "",
             "pgvector_url": "",
@@ -371,7 +406,7 @@ def _get_backend_for_kb(kb: dict):
     # Default: chromadb (local path)
     import chromadb as _chromadb
     from tasks.vector_backends import ChromaBackend
-    path = vc.get("chromadb_path") or str(_CONFIG_DIR / "chroma")
+    path = vc.get("chromadb_path") or str(_DEFAULT_CHROMA_PATH)
     Path(path).mkdir(parents=True, exist_ok=True)
     b = ChromaBackend.__new__(ChromaBackend)
     b._client = _chromadb.PersistentClient(path=path)
@@ -702,6 +737,117 @@ def query_kb(kb_id: str, query: str, top_k: int | None = None) -> dict:
         "citations": citations,
         "total_hits": len(hits),
         "algorithm": reranker_cfg.get("algorithm", "none"),
+    }
+
+
+def build_research_grounding(
+    query: str,
+    *,
+    kb_ref: str = "",
+    top_k: int = 8,
+    use_active_if_empty: bool = True,
+    require_indexed: bool = True,
+) -> dict:
+    """Resolve a KB and return a prompt-ready grounding packet for research flows."""
+    kb = resolve_kb(kb_ref, use_active_if_empty=use_active_if_empty, require_indexed=require_indexed)
+    result = query_kb(str(kb.get("id", "")).strip(), query, top_k=top_k)
+    hits = result.get("hits", []) if isinstance(result.get("hits", []), list) else []
+
+    normalized_citations: list[dict[str, Any]] = []
+    seen_sources: set[str] = set()
+    deduped_source_ids: list[str] = []
+    context_blocks: list[str] = []
+    seen_hit_keys: set[tuple[str, str]] = set()
+
+    for rank, hit in enumerate(hits, start=1):
+        meta = hit.get("metadata") or hit.get("payload") or {}
+        source_ref = str(hit.get("source", "") or meta.get("source", "") or "").strip()
+        if not source_ref:
+            source_ref = f"kb://{kb.get('id', '')}/hit/{rank}"
+        chunk_index = str(meta.get("chunk_index", "")).strip()
+        hit_key = (source_ref, chunk_index)
+        if hit_key in seen_hit_keys:
+            continue
+        seen_hit_keys.add(hit_key)
+        if source_ref not in seen_sources:
+            seen_sources.add(source_ref)
+            deduped_source_ids.append(source_ref)
+
+        source_type = str(meta.get("source_type", "") or "").strip()
+        label = source_ref
+        path_value = ""
+        url_value = ""
+        if source_ref.startswith("file://"):
+            path_value = source_ref[7:]
+            label = Path(path_value).name or source_ref
+            url_value = source_ref
+        elif "://" in source_ref:
+            url_value = source_ref
+            try:
+                parsed = re.sub(r"\s+", " ", source_ref).strip()
+                label = parsed if parsed.startswith("db://") else source_ref
+            except Exception:
+                label = source_ref
+        else:
+            path_value = source_ref
+            try:
+                url_value = Path(source_ref).expanduser().resolve().as_uri()
+                label = Path(source_ref).name or source_ref
+            except Exception:
+                url_value = source_ref
+                label = source_ref
+
+        preview = str(hit.get("text", "") or "").strip()
+        normalized = {
+            "rank": rank,
+            "source_id": source_ref,
+            "url": url_value,
+            "path": path_value,
+            "label": label,
+            "score": round(float(hit.get("score") or 0), 4),
+            "source_type": source_type,
+            "chunk_index": meta.get("chunk_index"),
+            "text_preview": preview[:240],
+            "kb_provenance": {
+                "kb_id": str(kb.get("id", "")).strip(),
+                "kb_name": str(kb.get("name", "")).strip(),
+            },
+        }
+        normalized_citations.append(normalized)
+        context_blocks.append(
+            "\n".join(
+                [
+                    f"[KB Source {rank}] {label}",
+                    f"Source ref: {source_ref}",
+                    f"KB: {kb.get('name', '')}",
+                    f"Source type: {source_type or 'unknown'}",
+                    f"Score: {normalized['score']}",
+                    preview[:1800] or "No retrieved text.",
+                ]
+            )
+        )
+
+    prompt_context = ""
+    if context_blocks:
+        prompt_context = (
+            "Knowledge Base Grounding:\n"
+            f"- KB: {kb.get('name', '')}\n"
+            f"- Hits: {len(hits)}\n\n"
+            + "\n\n".join(context_blocks[:8])
+        )
+
+    return {
+        "kb_id": str(kb.get("id", "")).strip(),
+        "kb_name": str(kb.get("name", "")).strip(),
+        "kb_status": str(kb.get("status", "")).strip(),
+        "query": query,
+        "top_k": int(top_k or 8),
+        "raw_hits": hits,
+        "citations": normalized_citations,
+        "deduped_source_ids": deduped_source_ids,
+        "prompt_context": prompt_context,
+        "hit_count": len(hits),
+        "used": bool(hits),
     }
 
 

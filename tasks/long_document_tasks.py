@@ -6,18 +6,21 @@ import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 from urllib.parse import urlparse
 import textwrap
 
 from openai import OpenAI
 
+from kendr.domain.deep_research import build_source_strategy, discover_research_intent
 from kendr.execution_trace import append_execution_event
+from kendr.rag_manager import build_research_grounding
 from kendr.workflow_contract import approval_request_to_text, build_approval_request
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.coding_tasks import _extract_output_text
@@ -143,10 +146,19 @@ AGENT_METADATA = {
             "research_date_range",
             "research_max_sources",
             "research_checkpoint_enabled",
+            "research_kb_enabled",
+            "research_kb_id",
+            "research_kb_top_k",
             "deep_research_source_urls",
         ],
         "output_keys": [
             "deep_research_analysis",
+            "deep_research_intent",
+            "deep_research_source_strategy",
+            "deep_research_coverage_report",
+            "deep_research_evidence_ledger",
+            "deep_research_quality_report",
+            "deep_research_artifacts_manifest",
             "deep_research_result_card",
             "long_document_title",
             "long_document_outline",
@@ -164,6 +176,11 @@ AGENT_METADATA = {
             "long_document_visual_index_path",
             "long_document_visual_index_json_path",
             "long_document_summary",
+            "research_kb_used",
+            "research_kb_name",
+            "research_kb_hit_count",
+            "research_kb_citations",
+            "research_kb_warning",
             "draft_response",
         ],
         "requirements": ["openai"],
@@ -241,6 +258,351 @@ def _normalize_citation_style(raw_value: Any) -> str:
     if style in SUPPORTED_CITATION_STYLES:
         return style
     return "apa"
+
+
+def _deep_research_strategy(state: dict[str, Any], *, objective: str, max_files: int) -> tuple[dict[str, Any], dict[str, Any]]:
+    intent = state.get("deep_research_intent", {}) if isinstance(state.get("deep_research_intent"), dict) else {}
+    if not intent:
+        intent = discover_research_intent(objective, state)
+        state["deep_research_intent"] = intent
+    strategy = state.get("deep_research_source_strategy", {}) if isinstance(state.get("deep_research_source_strategy"), dict) else {}
+    if not strategy:
+        strategy = build_source_strategy(
+            intent,
+            max_files=max_files,
+            allow_web_search=bool(state.get("research_web_search_enabled", True)),
+            local_paths_present=bool(state.get("local_drive_paths") or state.get("local_drive_files") or state.get("local_drive_document_summaries")),
+        )
+        state["deep_research_source_strategy"] = strategy
+    return intent, strategy
+
+
+def _copy_artifact_alias(source_path: str, destination_path: str) -> str:
+    source = str(source_path or "").strip()
+    destination = str(destination_path or "").strip()
+    if not source or not destination:
+        return ""
+    try:
+        src = Path(source)
+        dst = Path(destination)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        return str(dst)
+    except Exception:
+        return ""
+
+
+def _normalize_reference_identity(reference: Mapping[str, Any], fallback_index: int) -> tuple[str, str, str]:
+    url = str(reference.get("url", "")).strip()
+    label = str(reference.get("label", "")).strip() or str(reference.get("title", "")).strip() or f"Source {fallback_index}"
+    source_type = str(reference.get("type", "")).strip() or ("local_file" if url.startswith("file:") else "web")
+    return url, label, source_type
+
+
+def _build_evidence_ledger(
+    *,
+    consolidated_references: list[dict[str, Any]],
+    section_outputs: list[dict[str, Any]],
+    local_entries: list[dict[str, Any]],
+    url_entries: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    by_key: dict[str, dict[str, Any]] = {}
+    section_reference_keys: dict[str, set[str]] = {}
+    for section in section_outputs or []:
+        if not isinstance(section, dict):
+            continue
+        section_key = f"section-{int(section.get('index', 0) or 0):02d}"
+        refs = section.get("references", []) if isinstance(section.get("references", []), list) else []
+        normalized_keys: set[str] = set()
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            ref_url = str(ref.get("url", "")).strip().lower()
+            ref_label = str(ref.get("label", "")).strip().lower()
+            if ref_url:
+                normalized_keys.add(ref_url)
+            if ref_label:
+                normalized_keys.add(ref_label)
+        section_reference_keys[section_key] = normalized_keys
+    for index, reference in enumerate(consolidated_references or [], start=1):
+        if not isinstance(reference, dict):
+            continue
+        url, label, source_type = _normalize_reference_identity(reference, index)
+        key = url or label.lower()
+        entry = by_key.get(key)
+        if entry is None:
+            entry = {
+                "source_id": str(reference.get("id", "")).strip() or f"S{index}",
+                "path": url if url.startswith("file:") else "",
+                "url": "" if url.startswith("file:") else url,
+                "label": label,
+                "type": source_type,
+                "extract_quality": "high" if url or label else "low",
+                "used_in_sections": [],
+                "claim_links": [],
+                "confidence": 0.92 if url else 0.65,
+                "reader": str(reference.get("reader", "")).strip(),
+                "char_count": int(reference.get("char_count", 0) or 0),
+                "error_kind": str(reference.get("error_kind", "")).strip(),
+            }
+            by_key[key] = entry
+        normalized_keys = {url.lower(), label.lower()} - {""}
+        for section_key, ref_keys in section_reference_keys.items():
+            if normalized_keys & ref_keys:
+                if section_key not in entry["used_in_sections"]:
+                    entry["used_in_sections"].append(section_key)
+                if section_key not in entry["claim_links"]:
+                    entry["claim_links"].append(section_key)
+
+    start_index = len(by_key) + 1
+    for item in local_entries or []:
+        path_value = str(item.get("path", "")).strip()
+        if not path_value:
+            continue
+        key = path_value.lower()
+        error_text = str(item.get("error", "")).strip()
+        error_kind = str(item.get("error_kind", "")).strip()
+        char_count = int(item.get("char_count", 0) or 0)
+        extract_quality = "failed" if error_text else "high" if char_count > 400 else "medium" if char_count > 80 else "low"
+        confidence = 0.18 if error_text and error_kind == "corrupt" else 0.35 if error_text else 0.9 if char_count > 400 else 0.72 if char_count > 80 else 0.55
+        entry = by_key.setdefault(
+            key,
+            {
+                "source_id": f"L{start_index}",
+                "path": path_value,
+                "url": _file_source_url(path_value),
+                "label": str(item.get("file_name", "")).strip() or Path(path_value).name,
+                "type": str(item.get("type", "")).strip() or "local_file",
+                "extract_quality": extract_quality,
+                "used_in_sections": [],
+                "claim_links": [],
+                "confidence": confidence,
+                "reader": str(item.get("reader", "")).strip(),
+                "char_count": char_count,
+                "error_kind": error_kind,
+            },
+        )
+        start_index += 1
+        if error_text:
+            entry["extract_quality"] = extract_quality
+            entry["confidence"] = confidence
+
+    for item in url_entries or []:
+        url = str(item.get("url", "")).strip()
+        if not url:
+            continue
+        key = url.lower()
+        error_text = str(item.get("error", "")).strip()
+        char_count = int(item.get("char_count", 0) or 0)
+        entry = by_key.setdefault(
+            key,
+            {
+                "source_id": f"U{start_index}",
+                "path": "",
+                "url": url,
+                "label": str(item.get("label", "")).strip() or _source_label(url),
+                "type": str(item.get("source_type", "")).strip() or "provided_url",
+                "extract_quality": "failed" if error_text else "high" if char_count > 400 else "medium" if char_count > 80 else "low",
+                "used_in_sections": [],
+                "claim_links": [],
+                "confidence": 0.9 if not error_text and char_count > 400 else 0.78 if not error_text else 0.3,
+                "reader": str(item.get("content_type", "")).strip(),
+                "char_count": char_count,
+                "error_kind": "fetch_failed" if error_text else "",
+            },
+        )
+        start_index += 1
+        if error_text:
+            entry["extract_quality"] = "failed"
+
+    return sorted(by_key.values(), key=lambda item: str(item.get("source_id", "")))
+
+
+def _build_coverage_report(
+    *,
+    objective: str,
+    intent: Mapping[str, Any],
+    source_strategy: Mapping[str, Any],
+    local_manifest: Mapping[str, Any],
+    local_entries: list[dict[str, Any]],
+    url_entries: list[dict[str, Any]],
+    kb_grounding: Mapping[str, Any],
+    kb_warning: str,
+    evidence_sources: list[dict[str, Any]],
+    consolidated_references: list[dict[str, Any]],
+) -> dict[str, Any]:
+    discovered = int(local_manifest.get("file_count", 0) or 0)
+    selected = int(local_manifest.get("selected_file_count", 0) or 0)
+    selected_family_counts = local_manifest.get("selected_family_counts", {}) if isinstance(local_manifest.get("selected_family_counts", {}), Mapping) else {}
+    excluded_reason_counts = local_manifest.get("excluded_reason_counts", {}) if isinstance(local_manifest.get("excluded_reason_counts", {}), Mapping) else {}
+    manifest_files = local_manifest.get("files", []) if isinstance(local_manifest.get("files", []), list) else []
+    failed_local_entries = [item for item in (local_entries or []) if str(item.get("error", "")).strip()]
+    missing_families: list[str] = []
+    gaps: list[str] = []
+    needs = [str(item).strip().lower() for item in (intent.get("source_needs", []) or []) if str(item).strip()]
+    if "tables" in needs and int(selected_family_counts.get("spreadsheet", 0) or 0) == 0:
+        gaps.append("Table-heavy objective detected, but no spreadsheet sources were selected.")
+        missing_families.append("spreadsheet")
+    if "images" in needs and int(selected_family_counts.get("presentation", 0) or 0) == 0 and int(selected_family_counts.get("image", 0) or 0) == 0:
+        gaps.append("Visual-heavy objective detected, but no slide or image sources were selected.")
+        missing_families.append("presentation/image")
+    if "code" in needs and int(selected_family_counts.get("code", 0) or 0) == 0 and int(selected_family_counts.get("config", 0) or 0) == 0:
+        gaps.append("Technical objective detected, but no code/config sources were selected.")
+        missing_families.append("code/config")
+    if bool(source_strategy.get("web_search_needed", False)) and not evidence_sources and not url_entries:
+        gaps.append("Web research was expected, but no external evidence sources were collected yet.")
+        missing_families.append("web")
+    if bool(kb_grounding.get("requested", False)) and int(kb_grounding.get("hit_count", 0) or 0) <= 0:
+        gaps.append(
+            "Knowledge base grounding was requested, but no relevant KB hits were retrieved."
+            if not kb_warning
+            else f"Knowledge base grounding warning: {kb_warning}"
+        )
+    if selected <= 0 and discovered > 0:
+        gaps.append("Files were discovered locally, but none were selected for processing.")
+    if failed_local_entries:
+        gaps.append(f"{len(failed_local_entries)} selected file(s) failed extraction and may need alternate readers or user replacement.")
+
+    skipped_examples: dict[str, list[str]] = {}
+    for item in manifest_files:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("exclusion_reason", "")).strip()
+        if not reason:
+            continue
+        name = str(item.get("name", "")).strip() or str(item.get("relative_path", "")).strip()
+        if not name:
+            continue
+        bucket = skipped_examples.setdefault(reason, [])
+        if len(bucket) < 5:
+            bucket.append(name)
+
+    revisit_plan: list[dict[str, Any]] = []
+    failed_extractions: list[dict[str, Any]] = []
+    for family in missing_families:
+        revisit_plan.append(
+            {
+                "target": family,
+                "reason": f"Missing evidence family: {family}.",
+                "action": (
+                    "Expand local selection toward this family or enable web sources for a second pass."
+                    if family != "web"
+                    else "Enable web search or provide explicit URLs for a second pass."
+                ),
+            }
+        )
+    for item in failed_local_entries[:5]:
+        target = str(item.get("file_name", "")).strip() or Path(str(item.get("path", "")).strip()).name
+        reason = str(item.get("error_kind", "")).strip() or "extract_failed"
+        message = str(item.get("error", "")).strip()
+        failed_extractions.append({"target": target, "reason": reason, "message": message})
+        revisit_plan.append(
+            {
+                "target": target,
+                "reason": reason,
+                "action": "Retry with alternate parser/OCR or replace the damaged/protected file.",
+            }
+        )
+
+    status = "good"
+    if gaps:
+        status = "needs_attention"
+    if discovered > 0 and selected == 0:
+        status = "blocked"
+    elif failed_local_entries and status == "good":
+        status = "needs_attention"
+
+    return {
+        "objective": objective,
+        "status": status,
+        "discovered_files": discovered,
+        "selected_files": selected,
+        "read_files": len(local_entries),
+        "failed_selected_files": len(failed_local_entries),
+        "explicit_urls": len(url_entries),
+        "evidence_sources": len(evidence_sources),
+        "citations": len(consolidated_references),
+        "selected_family_counts": dict(selected_family_counts),
+        "excluded_reason_counts": dict(excluded_reason_counts),
+        "remaining_work": max(0, selected - len(local_entries)),
+        "kb_enabled": bool(kb_grounding.get("requested", False)),
+        "kb_name": str(kb_grounding.get("kb_name", "")).strip(),
+        "kb_status": str(kb_grounding.get("kb_status", "")).strip(),
+        "kb_hit_count": int(kb_grounding.get("hit_count", 0) or 0),
+        "kb_source_count": len(_sources_from_kb_grounding(kb_grounding)),
+        "kb_warning": kb_warning,
+        "missing_families": missing_families,
+        "failed_extractions": failed_extractions,
+        "skipped_examples": skipped_examples,
+        "revisit_plan": revisit_plan,
+        "gaps": gaps,
+        "strategy_summary": str(source_strategy.get("summary", "")).strip(),
+        "why_selected": dict(source_strategy.get("selection_notes", {})) if isinstance(source_strategy.get("selection_notes", {}), Mapping) else {},
+        "why_skipped": dict(source_strategy.get("skip_notes", {})) if isinstance(source_strategy.get("skip_notes", {}), Mapping) else {},
+    }
+
+
+def _build_quality_report(
+    *,
+    section_outputs: list[dict[str, Any]],
+    evidence_ledger: list[dict[str, Any]],
+    coverage_report: Mapping[str, Any],
+    consolidated_references: list[dict[str, Any]],
+) -> dict[str, Any]:
+    weak_sections: list[dict[str, Any]] = []
+    unsupported_sections: list[dict[str, Any]] = []
+    for section in section_outputs or []:
+        refs = section.get("references", []) if isinstance(section.get("references", []), list) else []
+        title = str(section.get("title", "")).strip() or f"Section {section.get('index', '?')}"
+        if not refs:
+            unsupported_sections.append({"section": title, "issue": "No supporting references were attached."})
+        elif len(refs) < 2:
+            weak_sections.append({"section": title, "issue": "Only one supporting reference was attached."})
+
+    duplicate_keys: set[str] = set()
+    seen_keys: set[str] = set()
+    for ref in consolidated_references or []:
+        if not isinstance(ref, dict):
+            continue
+        key = str(ref.get("url", "")).strip().lower() or str(ref.get("label", "")).strip().lower()
+        if not key:
+            continue
+        if key in seen_keys:
+            duplicate_keys.add(key)
+        seen_keys.add(key)
+    flags: list[str] = []
+    if unsupported_sections:
+        flags.append("unsupported_claim_risk")
+    if weak_sections:
+        flags.append("weak_section_grounding")
+    if duplicate_keys:
+        flags.append("duplicate_sources")
+    if coverage_report.get("gaps"):
+        flags.append("coverage_gaps")
+    if int(coverage_report.get("failed_selected_files", 0) or 0) > 0:
+        flags.append("failed_extractions")
+
+    status = "pass"
+    if unsupported_sections or coverage_report.get("status") == "blocked":
+        status = "fail"
+    elif weak_sections or duplicate_keys or coverage_report.get("gaps") or int(coverage_report.get("failed_selected_files", 0) or 0) > 0:
+        status = "warn"
+
+    return {
+        "status": status,
+        "flags": flags,
+        "unsupported_sections": unsupported_sections,
+        "weak_sections": weak_sections,
+        "duplicate_source_count": len(duplicate_keys),
+        "coverage_gap_count": len(coverage_report.get("gaps", []) or []),
+        "failed_extraction_count": int(coverage_report.get("failed_selected_files", 0) or 0),
+        "ledger_source_count": len(evidence_ledger),
+        "summary": (
+            "Quality gate passed."
+            if status == "pass"
+            else "Quality gate found grounding or coverage risks that should be reviewed."
+        ),
+    }
 
 
 def _tier_budget(tier: int) -> dict[str, Any]:
@@ -840,6 +1202,46 @@ def _sources_from_url_entries(entries: list[dict]) -> list[dict]:
     return sources
 
 
+def _sources_from_kb_grounding(grounding: Mapping[str, Any], *, prefix: str = "K") -> list[dict]:
+    entries: list[dict] = []
+    citations = grounding.get("citations", []) if isinstance(grounding.get("citations", []), list) else []
+    for index, item in enumerate(citations, start=1):
+        if not isinstance(item, Mapping):
+            continue
+        source_id = str(item.get("source_id", "")).strip()
+        url = str(item.get("url", "")).strip()
+        path_value = str(item.get("path", "")).strip()
+        ref = url or path_value or source_id
+        if not ref:
+            continue
+        label = str(item.get("label", "")).strip() or Path(path_value or source_id).name or ref
+        entries.append(
+            {
+                "id": f"{prefix}{index}",
+                "url": ref,
+                "label": label,
+                "path": path_value,
+                "source_id": source_id,
+                "type": str(item.get("source_type", "")).strip() or "knowledge_base",
+                "source_type": str(item.get("source_type", "")).strip(),
+                "kb_provenance": dict(item.get("kb_provenance", {}) or {}),
+                "chunk_index": item.get("chunk_index"),
+                "score": item.get("score"),
+            }
+        )
+    return entries
+
+
+def _kb_grounding_summary(grounding: Mapping[str, Any]) -> str:
+    context = str(grounding.get("prompt_context", "") or "").strip()
+    if context:
+        return _trim_text(context, 12000)
+    kb_name = str(grounding.get("kb_name", "") or "").strip()
+    if not kb_name:
+        return ""
+    return f"Knowledge Base Grounding:\n- KB: {kb_name}\n- Hits: {int(grounding.get('hit_count', 0) or 0)}"
+
+
 def _collect_single_user_url_entry(objective: str, url: str) -> dict:
     try:
         page = fetch_url_content(url, timeout=20)
@@ -1341,16 +1743,27 @@ def _merge_sources(primary: list[dict], secondary: list[dict], *, max_sources: i
     merged: list[dict] = []
     for item in (primary or []) + (secondary or []):
         url = str(item.get("url", "")).strip()
-        if not url or url in seen:
+        path_value = str(item.get("path", "")).strip()
+        source_id = str(item.get("source_id", "")).strip()
+        dedupe_key = source_id or path_value or url
+        if not dedupe_key or dedupe_key in seen:
             continue
-        seen.add(url)
+        seen.add(dedupe_key)
         merged.append(item)
         if len(merged) >= max_sources:
             break
     # Re-number sequentially
     renumbered = []
     for index, item in enumerate(merged, start=1):
-        renumbered.append({"id": f"S{index}", "url": item["url"], "label": item.get("label", "") or _source_label(item["url"])})
+        ref = str(item.get("url", "")).strip() or str(item.get("path", "")).strip()
+        renumbered.append(
+            {
+                **item,
+                "id": f"S{index}",
+                "url": ref,
+                "label": item.get("label", "") or _source_label(ref),
+            }
+        )
     return renumbered
 
 
@@ -1359,6 +1772,8 @@ def _format_evidence_bank_markdown(
     objective: str,
     local_entries: list[dict],
     url_entries: list[dict],
+    kb_grounding: Mapping[str, Any],
+    kb_warning: str,
     search_results: dict,
     research_notes_text: str,
     source_ledger: list[dict],
@@ -1403,6 +1818,18 @@ def _format_evidence_bank_markdown(
                 lines.append(f"  - Summary: {entry['summary']}")
     else:
         lines.append("- No explicit URL sources were provided.")
+    lines.append("")
+
+    lines.append("## Knowledge Base Sources")
+    if kb_grounding and int(kb_grounding.get("hit_count", 0) or 0) > 0:
+        lines.append(f"- KB: {kb_grounding.get('kb_name', 'unknown')}")
+        lines.append(f"- Retrieved hits: {int(kb_grounding.get('hit_count', 0) or 0)}")
+        for item in _sources_from_kb_grounding(kb_grounding)[:12]:
+            lines.append(f"  - {item.get('label', '')} ({item.get('url', '')})")
+    elif kb_warning:
+        lines.append(f"- KB warning: {kb_warning}")
+    else:
+        lines.append("- No knowledge base grounding was used.")
     lines.append("")
 
     lines.append("## Web Search Results (Google via SerpAPI)")
@@ -2681,10 +3108,10 @@ def _build_plagiarism_report(section_outputs: list[dict], source_texts: list[dic
 def _format_citation(entry: dict, *, style: str, index: int) -> str:
     label = str(entry.get("label", "Untitled source")).strip() or "Untitled source"
     url = str(entry.get("url", "")).strip()
-    access_date = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    access_date = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
     site = _source_label(url) if url else label
     year_match = re.search(r"(20\d{2}|19\d{2})", label)
-    year = year_match.group(1) if year_match else dt.datetime.utcnow().strftime("%Y")
+    year = year_match.group(1) if year_match else dt.datetime.now(dt.UTC).strftime("%Y")
     if style == "mla":
         return f'"{label}." {site}, {year}, {url}. Accessed {access_date}.'.strip()
     if style == "chicago":
@@ -2920,6 +3347,9 @@ def _collect_section_research_package(
     max_wait_seconds: int,
     heartbeat_seconds: int,
     max_sources: int,
+    research_kb_enabled: bool,
+    research_kb_id: str,
+    research_kb_top_k: int,
     cancel_check: Any | None = None,
 ) -> dict[str, Any]:
     section_title = str(section.get("title", f"Section {section_index}")).strip() or f"Section {section_index}"
@@ -2941,6 +3371,33 @@ def _collect_section_research_package(
         section_search_sources = _sources_from_search_results(section_search_results.get("results", []))
         section_search_text = _search_results_markdown(section_search_results.get("results", []))
 
+    section_kb_query = "\n".join(
+        [
+            section_title,
+            section_objective,
+            *[str(item).strip() for item in section_questions[:6] if str(item).strip()],
+        ]
+    ).strip()
+    section_kb_grounding: dict[str, Any] = {"requested": bool(research_kb_enabled)}
+    section_kb_warning = ""
+    if research_kb_enabled:
+        try:
+            section_kb_grounding = build_research_grounding(
+                section_kb_query or section_objective or objective,
+                kb_ref=research_kb_id,
+                top_k=research_kb_top_k,
+                use_active_if_empty=True,
+                require_indexed=True,
+            )
+            section_kb_grounding["requested"] = True
+            if int(section_kb_grounding.get("hit_count", 0) or 0) <= 0:
+                section_kb_warning = (
+                    f"Knowledge base '{section_kb_grounding.get('kb_name', 'unknown')}' returned no relevant results for section {section_index}."
+                )
+        except Exception as exc:
+            section_kb_warning = str(exc)
+            section_kb_grounding = {"requested": True, "hit_count": 0, "citations": [], "prompt_context": ""}
+
     local_section_notes = (
         _build_local_only_research_notes(
             objective=objective,
@@ -2958,13 +3415,24 @@ def _collect_section_research_package(
             "response_id": "evidence_bank" if web_search_enabled else f"local_only_section_{section_index}",
             "status": "evidence_bank" if web_search_enabled else "local_only",
             "elapsed_seconds": 0,
-            "output_text": local_section_notes or evidence_excerpt,
+            "output_text": "\n\n".join(
+                [
+                    item
+                    for item in (
+                        section_search_text,
+                        _kb_grounding_summary(section_kb_grounding),
+                        local_section_notes or evidence_excerpt,
+                    )
+                    if str(item).strip()
+                ]
+            ).strip(),
             "raw": {"evidence_bank_path": ""},
         }
-        research_output = local_section_notes or evidence_excerpt
-        if section_search_text:
-            research_output = f"{section_search_text}\n\n{research_output}"
-        section_sources = _merge_sources(list(evidence_sources), section_search_sources)
+        research_pass["research_kb"] = section_kb_grounding
+        research_pass["research_kb_warning"] = section_kb_warning
+        research_output = str(research_pass.get("output_text", "")).strip()
+        section_sources = _merge_sources(list(evidence_sources), _sources_from_kb_grounding(section_kb_grounding))
+        section_sources = _merge_sources(section_sources, section_search_sources)
     else:
         if web_search_enabled:
             if callable(cancel_check):
@@ -2999,10 +3467,22 @@ def _collect_section_research_package(
                 "response_id": f"local_only_section_{section_index}",
                 "status": "local_only",
                 "elapsed_seconds": 0,
-                "output_text": local_section_notes,
+                "output_text": "\n\n".join(
+                    item
+                    for item in (_kb_grounding_summary(section_kb_grounding), local_section_notes)
+                    if str(item).strip()
+                ).strip(),
                 "raw": {"reason": "web_search_disabled"},
             }
             research_output = local_section_notes
+        research_pass["research_kb"] = section_kb_grounding
+        research_pass["research_kb_warning"] = section_kb_warning
+        if section_kb_grounding.get("prompt_context"):
+            research_output = (
+                f"{_kb_grounding_summary(section_kb_grounding)}\n\n{research_output}".strip()
+                if research_output
+                else _kb_grounding_summary(section_kb_grounding)
+            )
         if section_search_text:
             research_output = f"{section_search_text}\n\n{research_output}".strip()
         if not research_output:
@@ -3012,6 +3492,7 @@ def _collect_section_research_package(
             )
 
         section_sources = _merge_sources(explicit_source_entries, _extract_source_entries(research_pass))
+        section_sources = _merge_sources(section_sources, _sources_from_kb_grounding(section_kb_grounding))
         section_sources = _merge_sources(section_sources, section_search_sources)
 
     if max_sources > 0:
@@ -3029,6 +3510,8 @@ def _collect_section_research_package(
         "source_ledger_md": source_ledger_md,
         "search_query": search_query,
         "section_search_results": section_search_results,
+        "research_kb": section_kb_grounding,
+        "research_kb_warning": section_kb_warning,
     }
 
 
@@ -3821,6 +4304,14 @@ def long_document_agent(state):
     source_family_display = requested_sources or (["web"] if web_search_enabled else ["local"])
     max_sources = _safe_int(state.get("research_max_sources"), 0, 0, 400)
     checkpoint_enabled = bool(state.get("research_checkpoint_enabled", False))
+    research_kb_enabled = bool(state.get("research_kb_enabled", False))
+    research_kb_id = str(state.get("research_kb_id", "") or "").strip()
+    research_kb_top_k = _safe_int(state.get("research_kb_top_k"), 8, 1, 50)
+    intent, source_strategy = _deep_research_strategy(
+        state,
+        objective=objective,
+        max_files=_safe_int(state.get("local_drive_max_files"), 200, 1, 1000),
+    )
 
     research_instructions = str(
         state.get(
@@ -3855,6 +4346,8 @@ def long_document_agent(state):
             "target_pages": target_pages,
             "section_count": section_count,
             "research_model": research_model,
+            "research_kb_enabled": research_kb_enabled,
+            "research_kb_id": research_kb_id,
         },
         subtask="Initialize deep research pipeline",
     )
@@ -3872,7 +4365,7 @@ def long_document_agent(state):
         state["research_max_sources"] = max_sources
     state["deep_research_source_urls"] = _normalize_research_urls(state.get("deep_research_source_urls", []))
 
-    collect_sources_first = bool(state.get("long_document_collect_sources_first", False))
+    collect_sources_first = bool(state.get("long_document_collect_sources_first", True if deep_research_mode else False))
     artifact_dir = f"deep_research_runs/deep_research_run_{call_number}"
     resume_reuse_enabled = bool(
         state.get("resume_source_run_id")
@@ -3893,6 +4386,29 @@ def long_document_agent(state):
                 f"Resume detected: reusing artifact directory {resumed_artifact_dir} instead of {artifact_dir}.",
             )
             artifact_dir = resumed_artifact_dir
+
+    intent_json_path = _artifact_file(artifact_dir, "deep_research_intent.json")
+    strategy_json_path = _artifact_file(artifact_dir, "deep_research_source_strategy.json")
+    write_text_file(intent_json_path, json.dumps(intent, indent=2, ensure_ascii=False))
+    write_text_file(strategy_json_path, json.dumps(source_strategy, indent=2, ensure_ascii=False))
+    _trace_research_event(
+        state,
+        title="Research intent discovered",
+        detail=str(intent.get("summary", "")).strip(),
+        status="completed",
+        kind="intent",
+        metadata={"phase": "intent", "intent": intent},
+        subtask="Discover research intent",
+    )
+    _trace_research_event(
+        state,
+        title="Source strategy planned",
+        detail=str(source_strategy.get("summary", "")).strip(),
+        status="completed",
+        kind="source_strategy",
+        metadata={"phase": "source_strategy", "strategy": source_strategy},
+        subtask="Plan source strategy",
+    )
 
     if bool(state.get("long_document_addendum_requested", False)):
         return _run_long_document_addendum(
@@ -3988,6 +4504,15 @@ def long_document_agent(state):
             "local_sources": len(_collect_local_drive_evidence(state)),
             "provided_urls": len(_normalize_research_urls(state.get("deep_research_source_urls", []))) if web_search_enabled else 0,
             "date_range": date_range,
+            "intent_summary": intent.get("summary", ""),
+            "strategy_summary": source_strategy.get("summary", ""),
+            "research_kind": intent.get("research_kind", ""),
+            "target_deliverable": intent.get("target_deliverable", ""),
+            "source_needs": intent.get("source_needs", []),
+            "risk_level": intent.get("risk_level", ""),
+            "strategy_mode": source_strategy.get("mode", ""),
+            "family_budgets": source_strategy.get("family_budgets", {}),
+            "selection_rationale": source_strategy.get("selection_rationale", []),
         }
         update_planning_file(
             state,
@@ -4102,6 +4627,15 @@ def long_document_agent(state):
             "section_count": len(outline.get("sections", [])),
             "formats": output_formats,
             "web_search_enabled": web_search_enabled,
+            "intent_summary": intent.get("summary", ""),
+            "strategy_summary": source_strategy.get("summary", ""),
+            "research_kind": intent.get("research_kind", ""),
+            "target_deliverable": intent.get("target_deliverable", ""),
+            "source_needs": intent.get("source_needs", []),
+            "risk_level": intent.get("risk_level", ""),
+            "strategy_mode": source_strategy.get("mode", ""),
+            "family_budgets": source_strategy.get("family_budgets", {}),
+            "selection_rationale": source_strategy.get("selection_rationale", []),
         }
 
         update_planning_file(
@@ -4136,12 +4670,52 @@ def long_document_agent(state):
     evidence_sources: list[dict] = []
     evidence_excerpt = ""
     local_entries: list[dict] = _collect_local_drive_evidence(state)
-    url_entries: list[dict] = _collect_user_url_evidence(objective, state) if web_search_enabled else []
+    url_entries: list[dict] = _collect_user_url_evidence(objective, state)
+    kb_grounding: dict[str, Any] = {"requested": research_kb_enabled}
+    kb_warning = ""
+    if research_kb_enabled:
+        try:
+            kb_grounding = build_research_grounding(
+                objective,
+                kb_ref=research_kb_id,
+                top_k=research_kb_top_k,
+                use_active_if_empty=True,
+                require_indexed=True,
+            )
+            kb_grounding["requested"] = True
+            if int(kb_grounding.get("hit_count", 0) or 0) <= 0:
+                kb_warning = (
+                    f"Knowledge base '{kb_grounding.get('kb_name', 'unknown')}' returned no relevant results for this report objective."
+                )
+        except Exception as exc:
+            kb_warning = str(exc)
+            has_other_report_evidence = bool(web_search_enabled or local_entries or url_entries)
+            if has_other_report_evidence:
+                log_task_update(
+                    DEEP_RESEARCH_LABEL,
+                    f"Knowledge base grounding unavailable; continuing with other report sources. {kb_warning}",
+                )
+            else:
+                raise ValueError(
+                    f"Knowledge base grounding failed and no other report evidence sources are available. {kb_warning}"
+                ) from exc
     explicit_source_entries = _merge_sources(
         _sources_from_local_entries(local_entries),
         _sources_from_url_entries(url_entries),
         max_sources=max_sources or 120,
     )
+    explicit_source_entries = _merge_sources(
+        explicit_source_entries,
+        _sources_from_kb_grounding(kb_grounding),
+        max_sources=max_sources or 120,
+    )
+    if research_kb_enabled and not web_search_enabled and not local_entries and not url_entries and not explicit_source_entries:
+        raise ValueError(
+            (
+                f"Knowledge base '{str(kb_grounding.get('kb_name', '') or research_kb_id or 'active KB')}' "
+                "returned no usable evidence and no other sources were provided for this deep research run."
+            ).strip()
+        )
     if collect_sources_first:
         cached_evidence = _load_cached_evidence_bank(
             artifact_dir=artifact_dir,
@@ -4222,6 +4796,7 @@ def long_document_agent(state):
                     f"Requested source families: {source_family_display}",
                     "Local drive rollup summary:",
                     _trim_text(state.get("local_drive_rollup_summary", ""), 2000),
+                    _kb_grounding_summary(kb_grounding),
                     "Task: Build a source-backed evidence bank with URLs, disagreements, numbers, and explicit citations.",
                 ]
                 evidence_pass = _run_research_pass(
@@ -4246,6 +4821,8 @@ def long_document_agent(state):
                     ),
                     cancel_check=lambda: _raise_if_cancelled(state, phase="evidence_bank"),
                 )
+                evidence_pass["research_kb"] = kb_grounding
+                evidence_pass["research_kb_warning"] = kb_warning
                 evidence_sources = _merge_sources(
                     explicit_source_entries,
                     _extract_source_entries(evidence_pass, max_sources=max_sources or 60),
@@ -4258,9 +4835,11 @@ def long_document_agent(state):
                     "response_id": "local_only",
                     "status": "local_only",
                     "elapsed_seconds": 0,
-                    "output_text": "",
+                    "output_text": _kb_grounding_summary(kb_grounding),
                     "raw": {"reason": "web_search_disabled"},
                 }
+                evidence_pass["research_kb"] = kb_grounding
+                evidence_pass["research_kb_warning"] = kb_warning
                 evidence_sources = list(explicit_source_entries)
                 evidence_notes_text = _build_local_only_research_notes(
                     objective=objective,
@@ -4272,15 +4851,19 @@ def long_document_agent(state):
                 objective=objective,
                 local_entries=local_entries,
                 url_entries=url_entries,
+                kb_grounding=kb_grounding,
+                kb_warning=kb_warning,
                 search_results=search_results,
                 research_notes_text=evidence_notes_text,
                 source_ledger=evidence_sources,
-                insufficiency_note="" if web_search_enabled else "Web search was disabled. Only local files were used to build this report.",
+                insufficiency_note="" if web_search_enabled else "Web search was disabled. This report used only local files, explicit links, and any selected knowledge-base evidence.",
             )
             evidence_payload = {
                 "objective": objective,
                 "local_drive_entries": local_entries,
                 "provided_url_entries": url_entries,
+                "research_kb": kb_grounding,
+                "research_kb_warning": kb_warning,
                 "search_results": search_results.get("results", []) if isinstance(search_results, dict) else [],
                 "web_research": evidence_pass,
                 "source_ledger": evidence_sources,
@@ -4470,6 +5053,9 @@ def long_document_agent(state):
                         max_wait_seconds=max_wait_seconds,
                         heartbeat_seconds=heartbeat_seconds,
                         max_sources=max_sources,
+                        research_kb_enabled=research_kb_enabled,
+                        research_kb_id=research_kb_id,
+                        research_kb_top_k=research_kb_top_k,
                         cancel_check=lambda idx=index: _raise_if_cancelled(state, phase=f"section_{idx}_research"),
                     )
                 )
@@ -4528,6 +5114,9 @@ def long_document_agent(state):
                         max_wait_seconds=max_wait_seconds,
                         heartbeat_seconds=heartbeat_seconds,
                         max_sources=max_sources,
+                        research_kb_enabled=research_kb_enabled,
+                        research_kb_id=research_kb_id,
+                        research_kb_top_k=research_kb_top_k,
                         cancel_check=lambda idx=index: _raise_if_cancelled(state, phase=f"section_{idx}_research"),
                     )
                     future_map[future] = index
@@ -5266,7 +5855,7 @@ Section continuity notes:
         plagiarism_report=plagiarism_report,
         source_entries=consolidated_references,
         research_log_lines=research_log_lines,
-        generated_at=dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        generated_at=dt.datetime.now(dt.UTC).strftime("%Y-%m-%d %H:%M UTC"),
         model_name=research_model,
         deep_research_tier=int(analysis.get("tier", 0) or 0),
         image_entries=all_section_images,
@@ -5331,6 +5920,101 @@ Section continuity notes:
             subtask="Compile and export final report",
         )
         export_errors = {"all": str(exc)}
+    local_manifest = state.get("local_drive_manifest", {}) if isinstance(state.get("local_drive_manifest"), dict) else {}
+    evidence_ledger = _build_evidence_ledger(
+        consolidated_references=consolidated_references,
+        section_outputs=section_outputs,
+        local_entries=local_entries,
+        url_entries=url_entries,
+    )
+    coverage_report = _build_coverage_report(
+        objective=objective,
+        intent=intent,
+        source_strategy=source_strategy,
+        local_manifest=local_manifest,
+        local_entries=local_entries,
+        url_entries=url_entries,
+        kb_grounding=kb_grounding,
+        kb_warning=kb_warning,
+        evidence_sources=evidence_sources,
+        consolidated_references=consolidated_references,
+    )
+    quality_report = _build_quality_report(
+        section_outputs=section_outputs,
+        evidence_ledger=evidence_ledger,
+        coverage_report=coverage_report,
+        consolidated_references=consolidated_references,
+    )
+    source_ledger_filename = _artifact_file(artifact_dir, "source_ledger.json")
+    coverage_report_filename = _artifact_file(artifact_dir, "coverage_report.json")
+    quality_report_filename = _artifact_file(artifact_dir, "quality_report.json")
+    write_text_file(source_ledger_filename, json.dumps(evidence_ledger, indent=2, ensure_ascii=False))
+    write_text_file(coverage_report_filename, json.dumps(coverage_report, indent=2, ensure_ascii=False))
+    write_text_file(quality_report_filename, json.dumps(quality_report, indent=2, ensure_ascii=False))
+    _trace_research_event(
+        state,
+        title="Coverage report updated",
+        detail=f"Coverage status: {coverage_report.get('status', 'unknown')} with {len(coverage_report.get('gaps', []) or [])} gap(s).",
+        status="completed",
+        kind="coverage",
+        metadata={"phase": "coverage", "coverage_report": coverage_report},
+        subtask="Update coverage report",
+    )
+    _trace_research_event(
+        state,
+        title="Research quality gate evaluated",
+        detail=str(quality_report.get("summary", "")).strip(),
+        status="completed" if quality_report.get("status") == "pass" else "failed" if quality_report.get("status") == "fail" else "pending",
+        kind="quality_gate",
+        metadata={"phase": "quality_gate", "quality_report": quality_report},
+        subtask="Run research quality gate",
+    )
+    for gap in coverage_report.get("gaps", []) or []:
+        _trace_research_event(
+            state,
+            title="Coverage gap detected",
+            detail=str(gap).strip(),
+            status="running",
+            kind="gap_detected",
+            metadata={"phase": "coverage_gap", "gap": gap},
+            subtask="Review research coverage gaps",
+        )
+    report_alias_md = f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'report.md')}"
+    report_alias_html = f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'report.html')}"
+    report_alias_pdf = f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'report.pdf')}"
+    report_alias_docx = f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'report.docx')}"
+    alias_results = {
+        "md": _copy_artifact_alias(f"{OUTPUT_DIR}/{compiled_filename}", report_alias_md),
+        "html": _copy_artifact_alias(export_paths.get("html", ""), report_alias_html),
+        "pdf": _copy_artifact_alias(export_paths.get("pdf", ""), report_alias_pdf),
+        "docx": _copy_artifact_alias(export_paths.get("docx", ""), report_alias_docx),
+    }
+    created_artifacts = [
+        {"name": "report.md", "path": alias_results.get("md", "") or f"{OUTPUT_DIR}/{compiled_filename}", "kind": "report"},
+        {"name": "source_ledger.json", "path": f"{OUTPUT_DIR}/{source_ledger_filename}", "kind": "evidence"},
+        {"name": "coverage_report.json", "path": f"{OUTPUT_DIR}/{coverage_report_filename}", "kind": "coverage"},
+        {"name": "quality_report.json", "path": f"{OUTPUT_DIR}/{quality_report_filename}", "kind": "quality"},
+        {"name": "evidence_bank.md", "path": state.get("long_document_evidence_bank_path", ""), "kind": "evidence"},
+        {"name": "evidence_bank.json", "path": state.get("long_document_evidence_bank_json_path", ""), "kind": "evidence"},
+    ]
+    if alias_results.get("pdf"):
+        created_artifacts.append({"name": "report.pdf", "path": alias_results["pdf"], "kind": "report"})
+    if alias_results.get("docx"):
+        created_artifacts.append({"name": "report.docx", "path": alias_results["docx"], "kind": "report"})
+    if alias_results.get("html"):
+        created_artifacts.append({"name": "report.html", "path": alias_results["html"], "kind": "report"})
+    for artifact in created_artifacts:
+        if not str(artifact.get("path", "")).strip():
+            continue
+        _trace_research_event(
+            state,
+            title=f"Artifact created: {artifact.get('name', '')}",
+            detail=str(artifact.get("path", "")).strip(),
+            status="completed",
+            kind="artifact_created",
+            metadata={"phase": "artifact", "artifact": artifact},
+            subtask="Write research artifact",
+        )
     total_images = len(all_section_images)
     manifest_filename = _artifact_file(artifact_dir, "deep_research_manifest.json")
     write_text_file(
@@ -5343,6 +6027,10 @@ Section continuity notes:
                 "target_pages": target_pages,
                 "section_count": len(section_outputs),
                 "compiled_markdown_file": f"{OUTPUT_DIR}/{compiled_filename}",
+                "report_markdown_file": alias_results.get("md", "") or f"{OUTPUT_DIR}/{compiled_filename}",
+                "report_html_file": alias_results.get("html", "") or export_paths.get("html", ""),
+                "report_docx_file": alias_results.get("docx", "") or export_paths.get("docx", ""),
+                "report_pdf_file": alias_results.get("pdf", "") or export_paths.get("pdf", ""),
                 "outline_file": f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'deep_research_outline.json')}",
                 "outline_markdown_file": f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'deep_research_outline.md')}",
                 "coherence_base_file": f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'deep_research_coherence_base.md')}",
@@ -5355,11 +6043,17 @@ Section continuity notes:
                 "visual_index_json_file": f"{OUTPUT_DIR}/{visual_index_json_filename}",
                 "plagiarism_report_json": f"{OUTPUT_DIR}/{plagiarism_json_filename}",
                 "plagiarism_report_markdown": f"{OUTPUT_DIR}/{plagiarism_md_filename}",
+                "source_ledger_file": f"{OUTPUT_DIR}/{source_ledger_filename}",
+                "coverage_report_file": f"{OUTPUT_DIR}/{coverage_report_filename}",
+                "quality_report_file": f"{OUTPUT_DIR}/{quality_report_filename}",
                 "compiled_html_file": export_paths.get("html", ""),
                 "compiled_docx_file": export_paths.get("docx", ""),
                 "compiled_pdf_file": export_paths.get("pdf", ""),
                 "evidence_bank_file": state.get("long_document_evidence_bank_path", ""),
                 "evidence_bank_json_file": state.get("long_document_evidence_bank_json_path", ""),
+                "intent_file": f"{OUTPUT_DIR}/{intent_json_path}",
+                "source_strategy_file": f"{OUTPUT_DIR}/{strategy_json_path}",
+                "created_artifacts": created_artifacts,
                 "image_gallery_count": total_images,
                 "image_gallery": [
                     {
@@ -5417,6 +6111,8 @@ Section continuity notes:
         f"- Web search: {'enabled' if web_search_enabled else 'disabled'}\n"
         f"- Local file sources: {len(local_entries)}\n"
         f"- Explicit URL sources: {len(url_entries)}\n"
+        f"- Knowledge base: {str(kb_grounding.get('kb_name', '') or 'disabled') if research_kb_enabled else 'disabled'}\n"
+        f"- Knowledge base hits: {int(kb_grounding.get('hit_count', 0) or 0)}\n"
         f"- Citations: {len(consolidated_references)}\n"
         f"- Plagiarism: {plagiarism_report.get('overall_score', 0)}% ({plagiarism_report.get('status', 'PASS')})\n"
         f"- Compiled markdown: {OUTPUT_DIR}/{compiled_filename}\n"
@@ -5427,6 +6123,9 @@ Section continuity notes:
         f"- Visual index: {OUTPUT_DIR}/{visual_index_md_filename}\n"
         f"- Plagiarism report: {OUTPUT_DIR}/{plagiarism_json_filename}\n"
         f"- Evidence bank: {state.get('long_document_evidence_bank_path', 'n/a')}\n"
+        f"- Source ledger: {OUTPUT_DIR}/{source_ledger_filename}\n"
+        f"- Coverage report: {OUTPUT_DIR}/{coverage_report_filename}\n"
+        f"- Quality report: {OUTPUT_DIR}/{quality_report_filename}\n"
         f"- Visual assets generated: {total_tables} tables, {total_flowcharts} flowcharts\n"
         f"- Web images collected: {total_images} (Appendix D)\n"
         f"- Manifest: {OUTPUT_DIR}/{manifest_filename}\n"
@@ -5473,7 +6172,23 @@ Section continuity notes:
     state["long_document_visual_index_path"] = f"{OUTPUT_DIR}/{visual_index_md_filename}"
     state["long_document_visual_index_json_path"] = f"{OUTPUT_DIR}/{visual_index_json_filename}"
     state["long_document_summary"] = executive_summary
+    state["long_document_evidence_sources"] = evidence_sources or explicit_source_entries
+    state["research_kb_used"] = bool(research_kb_enabled and int(kb_grounding.get("hit_count", 0) or 0) > 0)
+    state["research_kb_name"] = str(kb_grounding.get("kb_name", "") or "")
+    state["research_kb_hit_count"] = int(kb_grounding.get("hit_count", 0) or 0)
+    state["research_kb_citations"] = list(kb_grounding.get("citations", []) or [])
+    state["research_kb_warning"] = kb_warning
     state["deep_research_analysis"] = analysis
+    state["deep_research_intent"] = intent
+    state["deep_research_source_strategy"] = source_strategy
+    state["deep_research_evidence_ledger"] = evidence_ledger
+    state["deep_research_coverage_report"] = coverage_report
+    state["deep_research_quality_report"] = quality_report
+    state["deep_research_artifacts_manifest"] = {
+        "artifact_dir": f"{OUTPUT_DIR}/{artifact_dir}",
+        "manifest_path": f"{OUTPUT_DIR}/{manifest_filename}",
+        "created_artifacts": created_artifacts,
+    }
     state["deep_research_result_card"] = {
         "kind": "result",
         "title": title,
@@ -5489,14 +6204,43 @@ Section continuity notes:
         "web_search_enabled": web_search_enabled,
         "local_sources": len(local_entries),
         "provided_urls": len(url_entries),
+        "research_kb_used": bool(research_kb_enabled and int(kb_grounding.get("hit_count", 0) or 0) > 0),
+        "research_kb_name": str(kb_grounding.get("kb_name", "") or ""),
+        "research_kb_hit_count": int(kb_grounding.get("hit_count", 0) or 0),
+        "research_kb_citations": list(kb_grounding.get("citations", []) or []),
+        "research_kb_warning": kb_warning,
+        "intent_summary": intent.get("summary", ""),
+        "strategy_summary": source_strategy.get("summary", ""),
+        "research_kind": intent.get("research_kind", ""),
+        "target_deliverable": intent.get("target_deliverable", ""),
+        "source_needs": intent.get("source_needs", []),
+        "risk_level": intent.get("risk_level", ""),
+        "strategy_mode": source_strategy.get("mode", ""),
+        "family_budgets": source_strategy.get("family_budgets", {}),
+        "selection_rationale": source_strategy.get("selection_rationale", []),
+        "why_selected": dict(source_strategy.get("selection_notes", {}) or {}),
+        "why_skipped": dict(source_strategy.get("skip_notes", {}) or {}),
         "formats": output_formats,
         "report_path": f"{OUTPUT_DIR}/{compiled_filename}",
         "html_path": export_paths.get("html", ""),
         "docx_path": export_paths.get("docx", ""),
         "pdf_path": export_paths.get("pdf", ""),
+        "report_md_path": alias_results.get("md", "") or f"{OUTPUT_DIR}/{compiled_filename}",
+        "report_docx_path": alias_results.get("docx", "") or export_paths.get("docx", ""),
+        "report_pdf_path": alias_results.get("pdf", "") or export_paths.get("pdf", ""),
         "knowledge_graph_path": f"{OUTPUT_DIR}/{_artifact_file(artifact_dir, 'knowledge_graph.json')}",
         "plagiarism_report_path": f"{OUTPUT_DIR}/{plagiarism_json_filename}",
         "raw_json_path": f"{OUTPUT_DIR}/{manifest_filename}",
+        "source_ledger_path": f"{OUTPUT_DIR}/{source_ledger_filename}",
+        "coverage_report_path": f"{OUTPUT_DIR}/{coverage_report_filename}",
+        "quality_report_path": f"{OUTPUT_DIR}/{quality_report_filename}",
+        "coverage_status": coverage_report.get("status", ""),
+        "coverage_gaps": coverage_report.get("gaps", []),
+        "coverage_revisit_plan": coverage_report.get("revisit_plan", []),
+        "failed_extractions": coverage_report.get("failed_extractions", []),
+        "quality_status": quality_report.get("status", ""),
+        "quality_flags": quality_report.get("flags", []),
+        "created_artifacts": created_artifacts,
         "export_errors": export_errors,
         "image_count": total_images,
         "images": [
@@ -5520,6 +6264,9 @@ Section continuity notes:
             "section_count": len(section_outputs),
             "source_count": total_sources,
             "word_count": total_words,
+            "research_kb_used": bool(research_kb_enabled and int(kb_grounding.get("hit_count", 0) or 0) > 0),
+            "research_kb_name": str(kb_grounding.get("kb_name", "") or ""),
+            "research_kb_hit_count": int(kb_grounding.get("hit_count", 0) or 0),
         },
         subtask="Compile and export final report",
     )

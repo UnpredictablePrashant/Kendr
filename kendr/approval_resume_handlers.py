@@ -74,6 +74,8 @@ def restore_pending_user_input(
         return
     if _handle_generic_approval(initial_state, scope, response):
         return
+    if _handle_generic_cancellation(initial_state, previous_objective, scope, response):
+        return
     if _handle_generic_revision(initial_state, previous_objective, scope, response):
         return
 
@@ -116,6 +118,76 @@ def _clear_pending_user_input(initial_state: RuntimeState) -> None:
     initial_state["approval_request"] = {}
 
 
+def _looks_like_document_only_feedback(initial_state: RuntimeState, previous_objective: str, feedback: str) -> bool:
+    workflow_type = str(initial_state.get("workflow_type", "") or "").strip().lower()
+    if workflow_type in {"deep_research", "long_document", "research_pipeline"}:
+        return True
+    if bool(initial_state.get("deep_research_mode", False)) or bool(initial_state.get("long_document_mode", False)):
+        return True
+    formats = {str(item or "").strip().lower() for item in (initial_state.get("research_output_formats") or [])}
+    if formats & {"pdf", "docx", "html", "md", "markdown"}:
+        return True
+    combined = f"{previous_objective}\n{feedback}".lower()
+    build_reject_markers = (
+        "dont create",
+        "don't create",
+        "do not create",
+        "dont build",
+        "don't build",
+        "do not build",
+        "dont implement",
+        "don't implement",
+        "do not implement",
+        "no existing files need to be changed",
+        "only in the logs",
+    )
+    document_markers = (
+        "deep research",
+        "research report",
+        "report",
+        "document",
+        "docx",
+        "doc",
+        "pdf",
+        "markdown",
+        "md",
+        "citations",
+        "output as files",
+    )
+    return any(marker in combined for marker in build_reject_markers) and any(marker in combined for marker in document_markers)
+
+
+def _recover_blueprint_into_deep_research(
+    initial_state: RuntimeState,
+    previous_objective: str,
+    feedback: str,
+    *,
+    cancelled: bool,
+) -> None:
+    _clear_pending_user_input(initial_state)
+    initial_state["project_build_mode"] = False
+    initial_state["blueprint_waiting_for_approval"] = False
+    initial_state["blueprint_status"] = "cancelled" if cancelled else "revision_requested"
+    initial_state["blueprint_json"] = {}
+    initial_state["blueprint_summary"] = ""
+    initial_state["plan_ready"] = False
+    initial_state["user_cancelled"] = False
+    initial_state["final_output"] = ""
+    initial_state["deep_research_confirmed"] = True
+    initial_state["deep_research_mode"] = True
+    initial_state["long_document_mode"] = False
+    initial_state["long_document_job_started"] = False
+    initial_state["workflow_type"] = "deep_research"
+    if previous_objective and feedback:
+        initial_state["current_objective"] = (
+            f"{previous_objective}\n\nDocument-only research instructions from the user:\n{feedback}"
+        )
+    elif previous_objective:
+        initial_state["current_objective"] = previous_objective
+    elif feedback:
+        initial_state["current_objective"] = feedback
+
+
 def _handle_drive_data_sufficiency(initial_state: RuntimeState, scope: str, response: Mapping[str, str]) -> bool:
     if scope != "drive_data_sufficiency":
         return False
@@ -125,7 +197,7 @@ def _handle_drive_data_sufficiency(initial_state: RuntimeState, scope: str, resp
         initial_state["local_drive_insufficient_approved"] = True
         initial_state["local_drive_insufficient_response"] = response.get("feedback", "")
         return True
-    if action == "revise":
+    if action in {"revise", "cancel"}:
         _clear_pending_user_input(initial_state)
         initial_state["user_cancelled"] = True
         initial_state["final_output"] = (
@@ -150,7 +222,7 @@ def _handle_integration_approval(
         _clear_pending_user_input(initial_state)
         initial_state[state_key] = True
         return True
-    if action == "revise":
+    if action in {"revise", "cancel"}:
         _clear_pending_user_input(initial_state)
         initial_state["user_cancelled"] = True
         initial_state["final_output"] = cancel_message
@@ -182,7 +254,7 @@ def _handle_shell_approval(
         ).strip()
         initial_state["privileged_approval_mode"] = approval_mode
         return True
-    if action == "revise":
+    if action in {"revise", "cancel"}:
         _clear_pending_user_input(initial_state)
         initial_state["user_cancelled"] = True
         initial_state["final_output"] = "Shell execution cancelled by user."
@@ -217,6 +289,11 @@ def _handle_deep_research_confirmation(
         initial_state["research_pipeline_enabled"] = True
         initial_state["research_pipeline_completed"] = False
         initial_state["research_query"] = previous_objective or user_query
+        return True
+    if action == "cancel":
+        _clear_pending_user_input(initial_state)
+        initial_state["user_cancelled"] = True
+        initial_state["final_output"] = "Deep research run cancelled by user."
         return True
     if action == "revise":
         _clear_pending_user_input(initial_state)
@@ -255,6 +332,35 @@ def _approve_long_document_subplan(initial_state: RuntimeState) -> None:
     initial_state["plan_ready"] = bool(initial_state.get("plan_steps")) and initial_state.get("plan_approval_status") == "approved"
 
 
+def _handle_generic_cancellation(
+    initial_state: RuntimeState,
+    previous_objective: str,
+    scope: str,
+    response: Mapping[str, str],
+) -> bool:
+    if response.get("action") != "cancel":
+        return False
+    feedback = response.get("feedback", "")
+    if scope == "project_blueprint" and _looks_like_document_only_feedback(initial_state, previous_objective, feedback):
+        _recover_blueprint_into_deep_research(initial_state, previous_objective, feedback, cancelled=True)
+        return True
+    _clear_pending_user_input(initial_state)
+    if scope == "project_blueprint":
+        initial_state["blueprint_waiting_for_approval"] = False
+        initial_state["blueprint_status"] = "cancelled"
+        initial_state["blueprint_json"] = {}
+    elif scope == "root_plan":
+        initial_state["plan_waiting_for_approval"] = False
+        initial_state["plan_approval_status"] = "cancelled"
+        initial_state["plan_ready"] = False
+    elif scope == "long_document_plan":
+        initial_state["long_document_plan_waiting_for_approval"] = False
+        initial_state["long_document_plan_status"] = "cancelled"
+    initial_state["user_cancelled"] = True
+    initial_state["final_output"] = "Run cancelled by user."
+    return True
+
+
 def _handle_generic_revision(
     initial_state: RuntimeState,
     previous_objective: str,
@@ -265,6 +371,14 @@ def _handle_generic_revision(
         return False
     _clear_pending_user_input(initial_state)
     if scope == "project_blueprint":
+        if _looks_like_document_only_feedback(initial_state, previous_objective, response.get("feedback", "")):
+            _recover_blueprint_into_deep_research(
+                initial_state,
+                previous_objective,
+                response.get("feedback", ""),
+                cancelled=False,
+            )
+            return True
         initial_state["blueprint_waiting_for_approval"] = False
         initial_state["blueprint_status"] = "revision_requested"
         initial_state["blueprint_json"] = {}

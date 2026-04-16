@@ -3,6 +3,7 @@ import math
 import os
 from pathlib import Path
 
+from kendr.domain.deep_research import build_source_strategy, discover_research_intent
 from kendr.domain.local_drive import (
     extension_handler_registry as _extension_handler_registry,
     maybe_search_memory as _maybe_search_memory,
@@ -67,6 +68,23 @@ AGENT_METADATA = {
         "requirements": [],
     }
 }
+
+
+def _ensure_deep_research_strategy(state: dict, *, objective: str, max_files: int, local_paths_present: bool) -> tuple[dict, dict]:
+    intent = state.get("deep_research_intent", {}) if isinstance(state.get("deep_research_intent"), dict) else {}
+    if not intent:
+        intent = discover_research_intent(objective, state)
+        state["deep_research_intent"] = intent
+    strategy = state.get("deep_research_source_strategy", {}) if isinstance(state.get("deep_research_source_strategy"), dict) else {}
+    if not strategy:
+        strategy = build_source_strategy(
+            intent,
+            max_files=max_files,
+            allow_web_search=bool(state.get("research_web_search_enabled", True)),
+            local_paths_present=local_paths_present,
+        )
+        state["deep_research_source_strategy"] = strategy
+    return intent, strategy
 
 
 def _is_duplicate_filename_objective(text: str) -> bool:
@@ -324,12 +342,20 @@ def document_ingestion_agent(state):
         )
         roots = _resolve_paths(raw_roots, state.get("local_drive_working_directory") or state.get("working_directory"))
         if roots:
+            _, strategy = _ensure_deep_research_strategy(
+                state,
+                objective=state.get("current_objective") or state.get("user_query", ""),
+                max_files=max(1, min(int(state.get("local_drive_max_files", 200)), 1000)),
+                local_paths_present=bool(roots),
+            )
             scan = _scan_local_drive_tree(
                 roots,
                 recursive=bool(state.get("local_drive_recursive", True)),
                 include_hidden=bool(state.get("local_drive_include_hidden", False)),
                 max_files=max(1, min(int(state.get("local_drive_max_files", 200)), 1000)),
                 allowed_extensions=_normalize_extension_set(state.get("local_drive_extensions")),
+                objective=state.get("current_objective") or state.get("user_query", ""),
+                source_strategy=strategy,
             )
             selected_files = list(scan.get("selected_files") or [])
             if selected_files:
@@ -552,6 +578,12 @@ def local_drive_agent(state):
     image_ocr_enabled = bool(state.get("local_drive_enable_image_ocr", True))
     ocr_instruction = state.get("local_drive_ocr_instruction")
     objective = state.get("current_objective") or state.get("user_query", "")
+    intent, source_strategy = _ensure_deep_research_strategy(
+        state,
+        objective=objective,
+        max_files=max_files,
+        local_paths_present=bool(roots),
+    )
 
     manifest = _scan_local_drive_tree(
         roots,
@@ -559,6 +591,8 @@ def local_drive_agent(state):
         include_hidden=include_hidden,
         max_files=max_files,
         allowed_extensions=allowed_extensions,
+        objective=objective,
+        source_strategy=source_strategy,
     )
     files = list(manifest.get("selected_files") or [])
     if not files:
@@ -667,6 +701,67 @@ def local_drive_agent(state):
         ),
         "\n".join(files[:20]),
     )
+    selected_type_counts = manifest.get("selected_type_counts", {}) if isinstance(manifest.get("selected_type_counts"), dict) else {}
+    excluded_reason_counts = manifest.get("excluded_reason_counts", {}) if isinstance(manifest.get("excluded_reason_counts"), dict) else {}
+    selected_mix = ", ".join(
+        f"{ext or 'unknown'}={count}"
+        for ext, count in sorted(selected_type_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))
+    ) or "n/a"
+    excluded_mix = ", ".join(
+        f"{reason}={count}"
+        for reason, count in sorted(excluded_reason_counts.items(), key=lambda item: (-int(item[1]), str(item[0])))
+    ) or "n/a"
+    log_task_update(
+        "Local Drive",
+        "Selection strategy prioritized files by objective relevance and file type.",
+        "\n".join(
+            [
+                f"objective: {objective or 'n/a'}",
+                f"intent: {intent.get('research_kind', 'n/a')} / {intent.get('target_deliverable', 'n/a')}",
+                f"strategy: {source_strategy.get('summary', 'n/a')}",
+                f"selected_mix: {selected_mix}",
+                f"excluded_mix: {excluded_mix}",
+            ]
+        ),
+    )
+    state["deep_research_coverage_report"] = {
+        "status": "in_progress",
+        "discovered_files": int(manifest.get("file_count", 0) or 0),
+        "selected_files": int(manifest.get("selected_file_count", 0) or 0),
+        "remaining_work": max(0, int(manifest.get("selected_file_count", 0) or 0) - len(files)),
+        "selected_family_counts": dict(manifest.get("selected_family_counts", {}) or {}),
+        "excluded_reason_counts": dict(excluded_reason_counts),
+        "why_selected": dict(source_strategy.get("selection_notes", {}) or {}),
+        "why_skipped": dict(source_strategy.get("skip_notes", {}) or {}),
+    }
+    selected_preview = [
+        item
+        for item in (manifest.get("files") or [])
+        if isinstance(item, dict) and bool(item.get("selected_for_processing"))
+    ][:5]
+    skipped_preview = [
+        item
+        for item in (manifest.get("files") or [])
+        if isinstance(item, dict) and not bool(item.get("selected_for_processing")) and str(item.get("exclusion_reason", "")).strip()
+    ][:5]
+    if selected_preview:
+        log_task_update(
+            "Local Drive",
+            "Why these files were selected first.",
+            "\n".join(
+                f"- {Path(str(item.get('path', '') or '')).name}: {item.get('selection_reason') or 'High ranked evidence for this run.'}"
+                for item in selected_preview
+            ),
+        )
+    if skipped_preview:
+        log_task_update(
+            "Local Drive",
+            "Why some files were skipped or deprioritized.",
+            "\n".join(
+                f"- {Path(str(item.get('path', '') or '')).name}: {item.get('skip_reason_detail') or item.get('exclusion_reason') or 'Skipped by ranking.'}"
+                for item in skipped_preview
+            ),
+        )
 
     if _is_duplicate_filename_objective(objective):
         file_entries = manifest.get("files") if isinstance(manifest.get("files"), list) else []
@@ -752,9 +847,11 @@ def local_drive_agent(state):
     documents = []
     document_summaries = []
     for index, file_path in enumerate(files, start=1):
+        remaining = max(0, len(files) - index)
+        current_suffix = Path(file_path).suffix.lower().lstrip(".") or "unknown"
         log_task_update(
             "Local Drive",
-            f"[{index}/{len(files)}] Scanning file.",
+            f"[{index}/{len(files)} | remaining={remaining}] Scanning {Path(file_path).name} ({current_suffix}).",
             file_path,
         )
         parsed = parse_documents(
@@ -771,13 +868,13 @@ def local_drive_agent(state):
         if extraction_error:
             log_task_update(
                 "Local Drive",
-                f"[{index}/{len(files)}] Skipped unreadable file.",
+                f"[{index}/{len(files)} | remaining={remaining}] Skipped unreadable file.",
                 f"{file_path}\nreason: {extraction_error}",
             )
         else:
             log_task_update(
                 "Local Drive",
-                f"[{index}/{len(files)}] Parsed file successfully.",
+                f"[{index}/{len(files)} | remaining={remaining}] Parsed file successfully.",
                 f"{file_path}\ncharacters: {len(parsed_text)}",
             )
         document_type = str(metadata.get("type", Path(file_path).suffix.lstrip(".").lower() or "unknown"))
@@ -815,6 +912,10 @@ Write a concise summary with:
             "summary": summary,
             "char_count": len(parsed_text),
             "error": metadata.get("error", ""),
+            "error_kind": metadata.get("error_kind", ""),
+            "recoverable": bool(metadata.get("recoverable", False)),
+            "reader": metadata.get("reader", ""),
+            "metadata": dict(metadata),
         }
         document_summaries.append(summary_item)
 
@@ -831,6 +932,11 @@ Write a concise summary with:
             ]
         )
         write_text_file(artifact_name, artifact_body)
+        log_task_update(
+            "Local Drive",
+            f"[{index}/{len(files)} | remaining={remaining}] Wrote summary artifact.",
+            artifact_name,
+        )
 
     rollup_input = {
         "objective": objective,
@@ -876,6 +982,8 @@ Input:
         f"- Files discovered: {manifest.get('file_count', 0)}",
         f"- Files selected for processing: {manifest.get('selected_file_count', 0)}",
         f"- Files excluded from processing: {manifest.get('excluded_file_count', 0)}",
+        f"- Selected type mix: {selected_mix}",
+        f"- Excluded reasons: {excluded_mix}",
         f"- Documents summarized: {len(document_summaries)}",
         f"- Extraction issues: {len(extraction_issues)}",
         "",

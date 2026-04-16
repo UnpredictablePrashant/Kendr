@@ -4,10 +4,18 @@ from kendr.orchestration.state import state_awaiting_user_input
 
 
 class OrchestrationStateTests(unittest.TestCase):
-    def test_state_awaiting_user_input_detects_approval_scope_without_pending_kind(self):
+    def test_state_awaiting_user_input_ignores_scope_without_question(self):
         state = {
             "approval_pending_scope": "deep_research_confirmation",
             "pending_user_input_kind": "",
+        }
+        self.assertFalse(state_awaiting_user_input(state))
+
+    def test_state_awaiting_user_input_detects_pending_user_question(self):
+        state = {
+            "approval_pending_scope": "deep_research_confirmation",
+            "pending_user_input_kind": "approval",
+            "pending_user_question": "Reply approve to continue.",
         }
         self.assertTrue(state_awaiting_user_input(state))
 
@@ -32,6 +40,14 @@ class OrchestrationStateTests(unittest.TestCase):
             },
             "pending_user_input_kind": "",
             "approval_pending_scope": "",
+        }
+        self.assertFalse(state_awaiting_user_input(state))
+
+    def test_state_awaiting_user_input_ignores_kind_and_scope_without_prompt(self):
+        state = {
+            "approval_pending_scope": "deep_research_confirmation",
+            "pending_user_input_kind": "approval",
+            "approval_request": {"scope": "deep_research_confirmation"},
         }
         self.assertFalse(state_awaiting_user_input(state))
 

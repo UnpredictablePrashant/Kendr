@@ -5,6 +5,7 @@ from typing import Any
 from kendr.llm_router import provider_status
 from kendr.orchestration import annotate_plan_steps, plan_is_read_only
 from kendr.persistence import insert_orchestration_event, replace_plan_tasks, upsert_execution_plan
+from kendr.workflow_contract import is_deep_research_workflow_type
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.file_memory import update_planning_file
 from tasks.security_policy import is_security_assessment_query
@@ -12,6 +13,22 @@ from tasks.utils import OUTPUT_DIR, llm, log_task_update, logger, model_selectio
 
 
 NON_EXECUTABLE_PLAN_AGENTS = {"planner_agent"}
+DEEP_RESEARCH_DISALLOWED_PLAN_AGENTS = {
+    "project_blueprint_agent",
+    "dev_pipeline_agent",
+    "project_scaffold_agent",
+    "database_architect_agent",
+    "auth_security_agent",
+    "backend_builder_agent",
+    "frontend_builder_agent",
+    "dependency_manager_agent",
+    "test_agent",
+    "devops_agent",
+    "project_verifier_agent",
+    "post_setup_agent",
+    "coding_agent",
+    "master_coding_agent",
+}
 _SECURITY_PLAN_AGENT_PREFERENCE = [
     "security_scope_guard_agent",
     "recon_agent",
@@ -23,6 +40,52 @@ _SECURITY_PLAN_AGENT_PREFERENCE = [
 
 def _planner_db_path(state: dict[str, Any]) -> str:
     return str(state.get("db_path", "") or "").strip()
+
+
+def _is_deep_research_planning_mode(state: dict[str, Any]) -> bool:
+    workflow_type = str(state.get("workflow_type", "") or "").strip().lower()
+    return bool(
+        is_deep_research_workflow_type(workflow_type)
+        or bool(state.get("deep_research_mode", False))
+        or bool(state.get("long_document_mode", False))
+    )
+
+
+def _plan_contains_disallowed_deep_research_agent(plan_data: dict[str, Any]) -> bool:
+    execution_steps = plan_data.get("execution_steps", plan_data.get("steps", [])) or []
+    for step in execution_steps:
+        if not isinstance(step, dict):
+            continue
+        agent = str(step.get("agent", "") or "").strip()
+        if agent in DEEP_RESEARCH_DISALLOWED_PLAN_AGENTS:
+            return True
+    return False
+
+
+def _sanitize_deep_research_plan(plan_data: dict[str, Any], objective: str) -> dict[str, Any]:
+    if not _plan_contains_disallowed_deep_research_agent(plan_data):
+        return plan_data
+    safe_plan = {
+        "needs_clarification": False,
+        "clarification_questions": [],
+        "summary": (
+            "Deep research mode is restricted to evidence collection, analysis, and document generation. "
+            "Project build steps were removed and replaced with a document-only research step."
+        ),
+        "steps": [
+            {
+                "id": "step-1",
+                "title": "Produce research report",
+                "agent": "long_document_agent",
+                "task": objective,
+                "depends_on": [],
+                "parallel_group": "",
+                "success_criteria": "A research report is generated and exported as document artifacts.",
+                "status": "pending",
+            }
+        ],
+    }
+    return normalize_plan_data(safe_plan, objective)
 
 
 def _persist_plan_snapshot(
@@ -472,6 +535,8 @@ def _planning_context(state: dict, objective: str) -> str:
     context = {
         "objective": objective,
         "current_objective": state.get("current_objective", ""),
+        "workflow_type": state.get("workflow_type", ""),
+        "deep_research_mode": bool(state.get("deep_research_mode", False)),
         "available_agents": state.get("available_agents", []),
         "agent_routing_hints": state.get("plan_agent_hints", []),
         "local_drive_paths": state.get("local_drive_paths", []),
@@ -542,6 +607,15 @@ AGENT ROUTING — the planning context has "agent_routing_hints" pre-computed by
 - devops_agent: Dockerfile, docker-compose, CI/CD, GitHub Actions
 - long_document_agent: complete document, full report, handbook, guide, whitepaper (research + long-form writing pipeline)
 - document_formatter_agent: ALWAYS the FINAL step in any plan producing a document, report, or guide. Exports Markdown + PDF + DOCX.
+
+DEEP RESEARCH MODE:
+If the planning context contains "workflow_type": "deep_research" or "long_document", or "deep_research_mode": true:
+- This workflow is STRICTLY for research, evidence collection, analysis, and document export.
+- NEVER include project_blueprint_agent, dev_pipeline_agent, project_* build agents, coding_agent, or master_coding_agent.
+- Never ask to create a project, scaffold code, run builds, or request blueprint approval.
+- Use long_document_agent for the main execution step.
+- Optional supporting steps may only collect or analyze sources, such as local_drive_agent, research_pipeline_agent, deep_research_agent, ocr_agent, or excel_agent.
+- The final deliverable must be research documents, not source code or project scaffolding.
 
 PROJECT BUILD MODE:
 If the planning context contains "project_build_mode": true and a non-empty "blueprint_json",
@@ -617,6 +691,14 @@ Return ONLY valid JSON in this exact schema (no extra fields, no markdown, no ex
         }
     else:
         plan_data = normalize_plan_data(parsed_plan, user_query)
+        if _is_deep_research_planning_mode(state):
+            sanitized_plan = _sanitize_deep_research_plan(plan_data, user_query)
+            if sanitized_plan is not plan_data:
+                plan_data = sanitized_plan
+                log_task_update(
+                    "Planner",
+                    "Removed project-build agents from a deep research plan and forced document-only execution.",
+                )
 
     plan_md = plan_as_markdown(plan_data)
     questions = plan_data.get("clarification_questions", [])

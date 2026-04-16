@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -15,10 +16,27 @@ def estimate_token_count(text: str) -> int:
 
 def summary_storage_root() -> Path:
     raw = str(os.getenv("KENDR_HOME", "")).strip()
-    root = Path(raw).expanduser() if raw else (Path.home() / ".kendr")
-    path = root / "chat_context"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    candidates: list[Path] = []
+    if raw:
+        candidates.append(Path(raw).expanduser())
+    candidates.append(Path.home() / ".kendr")
+    candidates.append(Path(tempfile.gettempdir()) / "kendr")
+    seen: set[str] = set()
+    for root in candidates:
+        key = str(root)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        path = root / "chat_context"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return path
+        except OSError:
+            continue
+    raise OSError("No writable chat context storage root available")
 
 
 def summary_file_path(session_key: str) -> Path:

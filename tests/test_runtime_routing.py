@@ -361,6 +361,24 @@ class RuntimeRoutingTests(unittest.TestCase):
         self.assertEqual(task["recipient"], "long_document_agent")
         self.assertEqual(routed_state["workflow_type"], "deep_research")
 
+    def test_build_initial_state_primes_deep_research_intent_and_strategy(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state(
+                "Do deep research on AWS resilience patterns with code and architecture context.",
+                deep_research_mode=True,
+                research_web_search_enabled=False,
+                local_drive_paths=["/tmp/research"],
+            )
+
+        self.assertEqual(state["workflow_type"], "deep_research")
+        self.assertEqual(state["deep_research_intent"]["research_kind"], "mixed")
+        self.assertFalse(state["deep_research_source_strategy"]["allow_web_search"])
+        self.assertTrue(state["deep_research_execution_plan"]["phases"])
+        trace_titles = [item.get("title", "") for item in state.get("execution_trace", []) if isinstance(item, dict)]
+        self.assertIn("Research intent discovered", trace_titles)
+        self.assertIn("Source strategy planned", trace_titles)
+
     def test_project_audit_request_routes_to_master_coding_agent(self):
         with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
             runtime = AgentRuntime(build_registry())
@@ -476,6 +494,35 @@ class RuntimeRoutingTests(unittest.TestCase):
         self.assertEqual(task["recipient"], "long_document_agent")
         self.assertEqual(task["intent"], "long-document-dispatch")
         self.assertEqual(routed_state["workflow_type"], "deep_research")
+
+    def test_deep_research_blocks_coding_and_blueprint_agents(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Do deep research on cloud outage patterns and export a report.")
+            state["workflow_type"] = "deep_research"
+            state["deep_research_mode"] = True
+            state["long_document_mode"] = True
+
+        self.assertFalse(runtime._is_agent_available(state, "coding_agent"))
+        self.assertFalse(runtime._is_agent_available(state, "master_coding_agent"))
+        self.assertFalse(runtime._is_agent_available(state, "project_blueprint_agent"))
+
+    def test_deep_research_unavailable_build_agent_redirects_back_to_long_document(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Do deep research on telecom privacy policy trends.")
+            state["workflow_type"] = "deep_research"
+            state["deep_research_mode"] = True
+            state["long_document_mode"] = True
+
+        choice, reason = runtime._handle_unavailable_agent_choice(
+            state,
+            "master_coding_agent",
+            "Planner requested a blocked build agent.",
+        )
+
+        self.assertEqual(choice, "long_document_agent")
+        self.assertIn("output-only", reason.lower())
 
     def test_document_generation_request_routes_to_long_document_via_registry(self):
         with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
@@ -1286,6 +1333,65 @@ class RuntimeRoutingTests(unittest.TestCase):
         self.assertEqual(state["long_document_plan_status"], "revision_requested")
         self.assertTrue(state["long_document_replan_requested"])
         self.assertIn("market sizing first", state["long_document_plan_feedback"].lower())
+
+    def test_interpret_user_input_response_recognizes_cancel(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+
+        response = runtime._interpret_user_input_response("cancel")
+
+        self.assertEqual(response["action"], "cancel")
+
+    def test_build_initial_state_revision_to_document_output_recovers_from_blueprint_loop(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            prior_state = {
+                "last_objective": "Can you tell me how to implement chaos engineering failure simulation in AWS?",
+                "awaiting_user_input": True,
+                "pending_user_input_kind": "blueprint_approval",
+                "approval_pending_scope": "project_blueprint",
+                "pending_user_question": "Reply approve to continue.",
+                "blueprint_waiting_for_approval": True,
+                "blueprint_status": "pending",
+                "blueprint_json": {"project_name": "chaos-engineering-failure-simulation-aws"},
+                "research_output_formats": ["PDF", "DOCX", "MD"],
+            }
+            state = runtime.build_initial_state(
+                "You dont have to create the project but give output in doc or md or pdf.",
+                channel_session={"state": prior_state},
+            )
+
+        self.assertFalse(state["blueprint_waiting_for_approval"])
+        self.assertEqual(state["blueprint_status"], "revision_requested")
+        self.assertEqual(state["blueprint_json"], {})
+        self.assertTrue(state["deep_research_mode"])
+        self.assertEqual(state["workflow_type"], "deep_research")
+        self.assertIn("document-only research instructions", state["current_objective"].lower())
+
+    def test_build_initial_state_cancel_blueprint_in_deep_research_restores_research_flow(self):
+        with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):
+            runtime = AgentRuntime(build_registry())
+            prior_state = {
+                "last_objective": "Can you tell me how to implement chaos engineering failure simulation in AWS?",
+                "awaiting_user_input": True,
+                "pending_user_input_kind": "blueprint_approval",
+                "approval_pending_scope": "project_blueprint",
+                "pending_user_question": "Reply approve to continue.",
+                "blueprint_waiting_for_approval": True,
+                "blueprint_status": "pending",
+                "blueprint_json": {"project_name": "chaos-engineering-failure-simulation-aws"},
+                "deep_research_mode": True,
+                "workflow_type": "deep_research",
+            }
+            state = runtime.build_initial_state("cancel", channel_session={"state": prior_state})
+
+        self.assertFalse(state["blueprint_waiting_for_approval"])
+        self.assertEqual(state["blueprint_status"], "cancelled")
+        self.assertEqual(state["blueprint_json"], {})
+        self.assertTrue(state["deep_research_mode"])
+        self.assertEqual(state["workflow_type"], "deep_research")
+        self.assertFalse(state["user_cancelled"])
+        self.assertEqual(state["pending_user_input_kind"], "")
 
     def test_build_initial_state_preserves_session_id_for_pending_skill_approval(self):
         with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):

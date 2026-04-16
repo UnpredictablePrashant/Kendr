@@ -644,17 +644,46 @@ class CliSmokeTests(unittest.TestCase):
         self.assertFalse(payload.get("research_web_search_enabled"))
         self.assertEqual(payload.get("research_sources"), ["local"])
 
-    def test_run_rejects_local_only_mode_with_explicit_links(self):
+    def test_run_allows_local_only_mode_with_links_and_kb(self):
+        captured = {"payload": {}}
+
+        class _FakeResponse:
+            def __init__(self, body: str):
+                self._body = body.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self._body
+
+        def _fake_urlopen(request, timeout=0):  # noqa: ARG001
+            body = request.data.decode("utf-8") if getattr(request, "data", None) else "{}"
+            captured["payload"] = json.loads(body)
+            return _FakeResponse(json.dumps({"run_id": "run_kb_local", "final_output": "ok", "last_agent": "long_document_agent"}))
+
         with tempfile.TemporaryDirectory() as tmpdir:
             source_root = Path(tmpdir) / "research_inputs"
             source_root.mkdir()
+            (source_root / "brief.txt").write_text("Local source material", encoding="utf-8")
 
             with (
+                patch("kendr.cli._gateway_ready", return_value=True),
                 patch("kendr.cli._configured_working_dir", return_value="/tmp/work"),
                 patch("kendr.cli._resolve_working_dir", return_value="/tmp/work"),
+                patch("kendr.cli._http_json_get", return_value=[]),
+                patch(
+                    "kendr.cli._workflow_setup_snapshot",
+                    return_value={"available_agents": ["deep_research_agent", "long_document_agent", "coding_agent"], "agents": {}},
+                ),
+                patch("kendr.cli.urllib.request.urlopen", side_effect=_fake_urlopen),
             ):
-                with self.assertRaises(SystemExit) as exc:
-                    main(
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    exit_code = main(
                         [
                             "run",
                             "--json",
@@ -663,11 +692,69 @@ class CliSmokeTests(unittest.TestCase):
                             "--no-web-search",
                             "--deep-research-link",
                             "https://example.com/report",
-                            "Create a local-only deep research report",
+                            "--research-use-active-kb",
+                            "--research-kb-top-k",
+                            "12",
+                            "Investigate this material in a local-only deep research report",
                         ]
                     )
 
-        self.assertIn("cannot be combined", str(exc.exception))
+        self.assertEqual(exit_code, 0)
+        payload = captured["payload"]
+        self.assertFalse(payload.get("research_web_search_enabled"))
+        self.assertTrue(payload.get("research_kb_enabled"))
+        self.assertEqual(payload.get("research_kb_id"), "")
+        self.assertEqual(payload.get("research_kb_top_k"), 12)
+        self.assertEqual(payload.get("deep_research_source_urls"), ["https://example.com/report"])
+
+    def test_research_command_forwards_kb_controls(self):
+        captured = {"payload": {}}
+
+        class _FakeResponse:
+            def __init__(self, body: str):
+                self._body = body.encode("utf-8")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return self._body
+
+        def _fake_urlopen(request, timeout=0):  # noqa: ARG001
+            body = request.data.decode("utf-8") if getattr(request, "data", None) else "{}"
+            captured["payload"] = json.loads(body)
+            return _FakeResponse(json.dumps({"run_id": "run_research_kb", "final_output": "ok", "last_agent": "long_document_agent"}))
+
+        with (
+            patch("kendr.cli._gateway_ready", return_value=True),
+            patch("kendr.cli._configured_working_dir", return_value="/tmp/work"),
+            patch("kendr.cli._resolve_working_dir", return_value="/tmp/work"),
+            patch("kendr.cli._http_json_get", return_value=[]),
+            patch("kendr.cli.urllib.request.urlopen", side_effect=_fake_urlopen),
+        ):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                exit_code = main(
+                    [
+                        "research",
+                        "--json",
+                        "--quiet",
+                        "--research-kb",
+                        "finance-kb",
+                        "--research-kb-top-k",
+                        "9",
+                        "Map the market structure",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        payload = captured["payload"]
+        self.assertTrue(payload.get("research_kb_enabled"))
+        self.assertEqual(payload.get("research_kb_id"), "finance-kb")
+        self.assertEqual(payload.get("research_kb_top_k"), 9)
 
     def test_run_interactive_follow_up_resubmits_paused_session(self):
         captured_payloads = []

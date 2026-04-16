@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from kendr.workflow_contract import is_deep_research_workflow_type
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.privileged_control import (
     append_privileged_audit_event,
@@ -68,6 +69,20 @@ AGENT_METADATA = {
         "requirements": ["openai_or_codex_cli"],
     },
 }
+
+
+def _deep_research_output_only_violation(state: dict, agent_name: str) -> str:
+    workflow_type = str(state.get("workflow_type", "") or "").strip().lower()
+    if not (
+        is_deep_research_workflow_type(workflow_type)
+        or bool(state.get("deep_research_mode", False))
+        or bool(state.get("long_document_mode", False))
+    ):
+        return ""
+    return (
+        f"{agent_name} cannot run in deep research mode. "
+        "Deep research is output-only and may create report artifacts, but must not build projects or write source code."
+    )
 
 
 def _read_context_files(file_paths: list[str], working_directory: Path) -> tuple[str, list[str]]:
@@ -414,6 +429,17 @@ def coding_agent(state):
     active_task, task_content, _ = begin_agent_session(state, "coding_agent")
     state["coding_agent_calls"] = state.get("coding_agent_calls", 0) + 1
     call_number = state["coding_agent_calls"]
+    violation = _deep_research_output_only_violation(state, "coding_agent")
+    if violation:
+        state["draft_response"] = violation
+        log_task_update("Coding Agent", violation)
+        return publish_agent_output(
+            state,
+            "coding_agent",
+            violation,
+            f"coding_result_{call_number}",
+            recipients=["orchestrator_agent"],
+        )
 
     task = state.get("coding_task") or task_content or state.get("current_objective") or state.get("user_query", "").strip()
     if not task:
@@ -565,6 +591,17 @@ def master_coding_agent(state):
     active_task, task_content, _ = begin_agent_session(state, "master_coding_agent")
     state["master_coding_agent_calls"] = state.get("master_coding_agent_calls", 0) + 1
     call_number = state["master_coding_agent_calls"]
+    violation = _deep_research_output_only_violation(state, "master_coding_agent")
+    if violation:
+        state["draft_response"] = violation
+        log_task_update("Master Coding Agent", violation)
+        return publish_agent_output(
+            state,
+            "master_coding_agent",
+            violation,
+            f"master_coding_result_{call_number}",
+            recipients=["orchestrator_agent"],
+        )
 
     objective = (
         state.get("master_coding_request")

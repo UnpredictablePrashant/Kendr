@@ -39,9 +39,10 @@ python scripts/bootstrap_local_state.py
 Bootstrap creates local runtime folders and a usable `.env` with:
 
 - `KENDR_WORKING_DIR=output/workspace`
-- `QDRANT_URL=http://127.0.0.1:6333`
+- `KENDR_HOME=output/.kendr`
+- `KENDR_CHROMA_PATH=output/.kendr/rag/chroma`
 
-Container services still override `QDRANT_URL` to `http://qdrant:6333` inside Docker Compose.
+Qdrant remains optional for shared/server-backed deployments. Container services still override `QDRANT_URL` to `http://qdrant:6333` inside Docker Compose.
 
 ## Verification Buckets
 
@@ -63,7 +64,7 @@ High-signal surface checks for the shipped developer experience:
 - registry discovery
 - setup-aware routing
 - gateway HTTP surface
-- basic `superRAG` flow with stubbed ingestion
+- basic `superRAG` flow with mocked ingestion/indexing boundaries
 - import safety
 
 Run:
@@ -129,7 +130,7 @@ Verified by default:
 - registry discovery and agent-card requirements
 - setup-aware routing and dependency gating
 - gateway health and registry surfaces
-- basic `superRAG` build flow with stubbed vector indexing
+- basic `superRAG` build flow with mocked vector indexing boundaries
 - local docs-link integrity
 - Docker Compose config validity and Docker image build
 

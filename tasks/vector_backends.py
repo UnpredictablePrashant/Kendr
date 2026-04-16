@@ -5,11 +5,26 @@ import sys
 import urllib.request
 import urllib.error
 from abc import ABC, abstractmethod
+from pathlib import Path
 
 DEFAULT_VECTOR_COLLECTION = os.getenv("QDRANT_COLLECTION", "research_memory")
 DEFAULT_QDRANT_URL = os.getenv("QDRANT_URL", "http://localhost:6333")
 
 _BACKEND_CACHE: "VectorBackend | None" = None
+
+
+def _default_chroma_path() -> str:
+    explicit = str(os.getenv("KENDR_CHROMA_PATH", "") or "").strip()
+    if explicit:
+        return str(Path(explicit).expanduser().resolve())
+
+    kendr_home = str(os.getenv("KENDR_HOME", "") or "").strip()
+    if kendr_home:
+        root = Path(kendr_home).expanduser().resolve()
+    else:
+        working_dir = str(os.getenv("KENDR_WORKING_DIR", "") or "").strip()
+        root = (Path(working_dir).expanduser().resolve() / ".kendr") if working_dir else (Path.cwd() / ".kendr").resolve()
+    return str((root / "rag" / "chroma").resolve())
 
 
 class VectorBackend(ABC):
@@ -30,8 +45,8 @@ class ChromaBackend(VectorBackend):
     def __init__(self) -> None:
         import chromadb
 
-        working_dir = os.getenv("KENDR_WORKING_DIR") or "."
-        persist_path = os.path.join(working_dir, ".chroma")
+        persist_path = _default_chroma_path()
+        os.makedirs(persist_path, exist_ok=True)
         self._client = chromadb.PersistentClient(path=persist_path)
         self._collections: dict[str, object] = {}
 

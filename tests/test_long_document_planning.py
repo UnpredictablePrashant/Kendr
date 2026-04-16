@@ -11,8 +11,11 @@ os.environ.setdefault("OPENAI_API_KEY", "test-openai-key")
 from kendr.discovery import build_registry
 from kendr.runtime import AgentRuntime
 from tasks.long_document_tasks import (
+    _build_coverage_report,
+    _build_evidence_ledger,
     _build_compiled_markdown,
     _build_deep_research_analysis_request,
+    _collect_section_research_package,
     _default_subtopics,
     long_document_agent,
 )
@@ -20,6 +23,78 @@ from tasks.utils import set_active_output_dir
 
 
 class LongDocumentPlanningTests(unittest.TestCase):
+    def test_build_evidence_ledger_carries_metadata_and_section_links(self):
+        ledger = _build_evidence_ledger(
+            consolidated_references=[{"id": "S1", "url": "https://example.com/report", "label": "Market Report"}],
+            section_outputs=[
+                {
+                    "index": 1,
+                    "title": "Findings",
+                    "references": [{"id": "S1", "url": "https://example.com/report", "label": "Market Report"}],
+                }
+            ],
+            local_entries=[
+                {
+                    "path": "/tmp/data.xlsx",
+                    "file_name": "data.xlsx",
+                    "type": "xlsx",
+                    "char_count": 520,
+                    "reader": "openpyxl",
+                    "summary": "Revenue table.",
+                    "error": "",
+                    "error_kind": "",
+                }
+            ],
+            url_entries=[],
+        )
+
+        self.assertEqual(len(ledger), 2)
+        web_entry = next(item for item in ledger if item["source_id"] == "S1")
+        local_entry = next(item for item in ledger if item["source_id"].startswith("L"))
+        self.assertIn("section-01", web_entry["used_in_sections"])
+        self.assertIn("section-01", web_entry["claim_links"])
+        self.assertEqual(local_entry["reader"], "openpyxl")
+        self.assertEqual(local_entry["char_count"], 520)
+        self.assertEqual(local_entry["extract_quality"], "high")
+
+    def test_build_coverage_report_adds_revisit_plan_for_missing_and_failed_sources(self):
+        coverage = _build_coverage_report(
+            objective="Analyze spreadsheet evidence and diagrams.",
+            intent={"source_needs": ["tables", "images"]},
+            source_strategy={"summary": "docs first", "web_search_needed": False, "selection_notes": {}, "skip_notes": {}},
+            local_manifest={
+                "file_count": 6,
+                "selected_file_count": 2,
+                "selected_family_counts": {"document": 2},
+                "excluded_reason_counts": {"family_budget_exhausted": 4},
+                "files": [
+                    {"name": "notes.txt", "exclusion_reason": ""},
+                    {"name": "financials.xlsx", "exclusion_reason": "family_budget_exhausted"},
+                    {"name": "deck.pptx", "exclusion_reason": "family_budget_exhausted"},
+                ],
+            },
+            local_entries=[
+                {"path": "/tmp/notes.txt", "file_name": "notes.txt", "error": "", "error_kind": ""},
+                {"path": "/tmp/financials.xlsx", "file_name": "financials.xlsx", "error": "bad zip", "error_kind": "corrupt"},
+            ],
+            url_entries=[],
+            kb_grounding={"requested": True, "kb_name": "finance-kb", "kb_status": "indexed", "hit_count": 0, "citations": []},
+            kb_warning="Knowledge base returned no relevant results.",
+            evidence_sources=[],
+            consolidated_references=[],
+        )
+
+        self.assertEqual(coverage["failed_selected_files"], 1)
+        self.assertIn("spreadsheet", coverage["missing_families"])
+        self.assertTrue(coverage["revisit_plan"])
+        self.assertEqual(coverage["failed_extractions"][0]["reason"], "corrupt")
+        self.assertEqual(coverage["failed_extractions"][0]["message"], "bad zip")
+        self.assertIn("financials.xlsx", json.dumps(coverage["revisit_plan"]))
+        self.assertIn("deck.pptx", coverage["skipped_examples"]["family_budget_exhausted"])
+        self.assertTrue(coverage["kb_enabled"])
+        self.assertEqual(coverage["kb_hit_count"], 0)
+        self.assertEqual(coverage["kb_warning"], "Knowledge base returned no relevant results.")
+
     def test_build_compiled_markdown_escapes_quoted_title(self):
         markdown = _build_compiled_markdown(
             title='Market "Structure" Report',
@@ -44,6 +119,65 @@ class LongDocumentPlanningTests(unittest.TestCase):
         )
 
         self.assertIn('title: "Market \\"Structure\\" Report"', markdown)
+
+    def test_collect_section_research_package_merges_kb_sources(self):
+        with patch(
+            "tasks.long_document_tasks.build_research_grounding",
+            return_value={
+                "kb_id": "kb-1",
+                "kb_name": "finance-kb",
+                "kb_status": "indexed",
+                "hit_count": 1,
+                "prompt_context": "Knowledge Base Grounding:\n- KB: finance-kb",
+                "citations": [
+                    {
+                        "source_id": "file:///tmp/report.md",
+                        "url": "file:///tmp/report.md",
+                        "path": "/tmp/report.md",
+                        "label": "report.md",
+                        "source_type": "local_file",
+                        "kb_provenance": {"kb_id": "kb-1", "kb_name": "finance-kb"},
+                        "chunk_index": 0,
+                        "score": 0.9,
+                    }
+                ],
+            },
+        ):
+            package = _collect_section_research_package(
+                api_key="test-openai-key",
+                objective="Analyze the market",
+                section={"title": "Industry Baseline", "objective": "Summarize the baseline", "key_questions": []},
+                section_index=1,
+                total_sections=1,
+                section_pages=5,
+                use_section_search=False,
+                section_search_results_count=3,
+                collect_sources_first=False,
+                evidence_excerpt="",
+                evidence_sources=[],
+                explicit_source_entries=[],
+                local_entries=[],
+                url_entries=[],
+                continuity_notes=[],
+                coherence_context_md="",
+                web_search_enabled=False,
+                research_model="o4-mini-deep-research",
+                research_instructions="Be careful.",
+                max_tool_calls=4,
+                max_output_tokens_int=None,
+                poll_interval_seconds=1,
+                max_wait_seconds=60,
+                heartbeat_seconds=30,
+                max_sources=20,
+                research_kb_enabled=True,
+                research_kb_id="finance-kb",
+                research_kb_top_k=8,
+            )
+
+        self.assertEqual(package["research_kb"]["kb_name"], "finance-kb")
+        self.assertIn("Knowledge Base Grounding", package["research_text"])
+        self.assertTrue(package["sources"])
+        self.assertEqual(package["sources"][0]["url"], "file:///tmp/report.md")
 
     def test_long_document_agent_requires_subplan_approval_before_execution(self):
         fake_setup_snapshot = {
@@ -292,12 +426,28 @@ class LongDocumentPlanningTests(unittest.TestCase):
         mock_google_search.assert_not_called()
         self.assertFalse(result["deep_research_result_card"]["web_search_enabled"])
         self.assertEqual(result["deep_research_result_card"]["local_sources"], 1)
+        self.assertIn("deep_research_intent", result)
+        self.assertIn("deep_research_source_strategy", result)
+        self.assertIn("deep_research_evidence_ledger", result)
+        self.assertIn("deep_research_coverage_report", result)
+        self.assertIn("deep_research_quality_report", result)
+        self.assertIn("deep_research_artifacts_manifest", result)
+        self.assertIn("source_ledger_path", result["deep_research_result_card"])
+        self.assertIn("coverage_status", result["deep_research_result_card"])
+        self.assertIn("quality_status", result["deep_research_result_card"])
+        self.assertIn("intent_summary", result["deep_research_result_card"])
+        self.assertIn("strategy_summary", result["deep_research_result_card"])
+        self.assertIn("family_budgets", result["deep_research_result_card"])
+        self.assertIn("source_needs", result["deep_research_result_card"])
+        self.assertTrue(result["deep_research_artifacts_manifest"]["created_artifacts"])
         self.assertTrue(result["long_document_evidence_sources"])
         self.assertTrue(result["long_document_evidence_sources"][0]["url"].startswith("file:"))
         self.assertIn("Web search: disabled", result["draft_response"])
         trace_titles = [event.get("title", "") for event in result.get("execution_trace", [])]
         self.assertIn("Deep research run started", trace_titles)
-        self.assertIn("Collecting evidence bank", trace_titles)
+        self.assertIn("Research intent discovered", trace_titles)
+        self.assertIn("Source strategy planned", trace_titles)
+        self.assertIn("Coverage report updated", trace_titles)
         self.assertIn("Researching section 1/1", trace_titles)
         self.assertIn("Drafting section 1/1", trace_titles)
         self.assertIn("Compiling final report", trace_titles)
@@ -621,6 +771,133 @@ class LongDocumentPlanningTests(unittest.TestCase):
 
         section_packages = mock_correlation.call_args.args[1]
         self.assertEqual([item["index"] for item in section_packages], [1, 2])
+
+    def test_long_document_agent_kb_only_pipeline_writes_kb_backed_report_artifacts(self):
+        objective = "Create a private-knowledge market report."
+        state = {
+            "current_objective": objective,
+            "user_query": objective,
+            "memory_soul_file": __file__,
+            "deep_research_mode": True,
+            "deep_research_confirmed": True,
+            "long_document_mode": True,
+            "long_document_pages": 12,
+            "long_document_plan_status": "approved",
+            "research_web_search_enabled": False,
+            "research_kb_enabled": True,
+            "research_kb_id": "finance-kb",
+            "research_kb_top_k": 6,
+            "deep_research_analysis": {
+                "tier": 3,
+                "requires_deep_research": True,
+                "estimated_pages": 12,
+                "estimated_sources": 6,
+                "estimated_duration_minutes": 10,
+                "subtopics": ["Industry Baseline"],
+            },
+            "long_document_outline": {
+                "title": "KB-Only Market Report",
+                "sections": [
+                    {
+                        "id": 1,
+                        "title": "Industry Baseline",
+                        "objective": "Summarize the baseline using private knowledge.",
+                        "key_questions": ["What did private documents say about 2024 market changes?"],
+                        "target_pages": 3,
+                    }
+                ],
+            },
+        }
+
+        def _fake_grounding(query: str, **_kwargs):
+            citations = [
+                {
+                    "source_id": "file:///tmp/private-market-report.md",
+                    "url": "file:///tmp/private-market-report.md",
+                    "path": "/tmp/private-market-report.md",
+                    "label": "private-market-report.md",
+                    "source_type": "local_file",
+                    "kb_provenance": {"kb_id": "kb-1", "kb_name": "finance-kb"},
+                    "chunk_index": 0 if "Industry Baseline" not in str(query) else 1,
+                    "score": 0.91,
+                }
+            ]
+            return {
+                "requested": True,
+                "used": True,
+                "kb_id": "kb-1",
+                "kb_name": "finance-kb",
+                "kb_status": "indexed",
+                "hit_count": len(citations),
+                "raw_hits": [{"score": 0.91, "text": "Private market report evidence."}],
+                "citations": citations,
+                "deduped_source_ids": ["file:///tmp/private-market-report.md"],
+                "prompt_context": "Knowledge Base Grounding:\n- KB: finance-kb\n- Source: private-market-report.md",
+            }
+
+        def _fake_llm_text(prompt: str) -> str:
+            prompt = str(prompt)
+            if "Create a concise executive summary" in prompt:
+                return "KB-backed executive summary."
+            if "without open web search" in prompt:
+                return "KB-only evidence memo anchored in private-market-report.md."
+            return "## Industry Baseline\n\nPrivate knowledge shows margin expansion and stronger retention."
+
+        correlation = {
+            "briefing": "Correlation briefing",
+            "knowledge_graph": {"nodes": [], "edges": []},
+            "cross_cutting_themes": [],
+            "contradictions": [],
+            "section_order": ["Industry Baseline"],
+        }
+
+        with tempfile.TemporaryDirectory() as tmp_output:
+            set_active_output_dir(tmp_output)
+            try:
+                with (
+                    patch("tasks.long_document_tasks.OpenAI", return_value=Mock()),
+                    patch("tasks.long_document_tasks.build_research_grounding", side_effect=_fake_grounding),
+                    patch("tasks.long_document_tasks.llm_text", side_effect=_fake_llm_text),
+                    patch("tasks.long_document_tasks._build_correlation_package", return_value=correlation),
+                    patch("tasks.long_document_tasks._build_plagiarism_report", return_value={"overall_score": 0.0, "ai_content_score": 0.0, "status": "PASS", "sections": []}),
+                    patch("tasks.long_document_tasks._generate_visual_assets", return_value={"tables": [], "flowcharts": [], "notes": ""}),
+                    patch("tasks.long_document_tasks._export_long_document_formats", return_value={}),
+                    patch("tasks.long_document_tasks.update_planning_file"),
+                    patch("tasks.long_document_tasks.log_task_update"),
+                    patch("tasks.long_document_tasks.publish_agent_output", side_effect=lambda current_state, *args, **kwargs: current_state),
+                ):
+                    result = long_document_agent(state)
+            finally:
+                set_active_output_dir("output")
+
+            artifact_dir = Path(tmp_output) / "deep_research_runs" / "deep_research_run_1"
+            report_path = artifact_dir / "deep_research_report.md"
+            evidence_path = artifact_dir / "evidence_bank.json"
+            coverage_path = artifact_dir / "coverage_report.json"
+
+            self.assertTrue(report_path.exists())
+            self.assertTrue(evidence_path.exists())
+            self.assertTrue(coverage_path.exists())
+
+            coverage = json.loads(coverage_path.read_text(encoding="utf-8"))
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            report_text = report_path.read_text(encoding="utf-8")
+
+        self.assertTrue(result["research_kb_used"])
+        self.assertEqual(result["research_kb_name"], "finance-kb")
+        self.assertEqual(result["research_kb_hit_count"], 1)
+        self.assertTrue(result["deep_research_result_card"]["research_kb_used"])
+        self.assertEqual(result["deep_research_result_card"]["research_kb_name"], "finance-kb")
+        self.assertEqual(result["deep_research_result_card"]["provided_urls"], 0)
+        self.assertFalse(result["deep_research_result_card"]["web_search_enabled"])
+        self.assertTrue(coverage["kb_enabled"])
+        self.assertEqual(coverage["kb_name"], "finance-kb")
+        self.assertEqual(coverage["kb_hit_count"], 1)
+        self.assertGreaterEqual(coverage["kb_source_count"], 1)
+        self.assertEqual(evidence["research_kb"]["kb_name"], "finance-kb")
+        self.assertEqual(evidence["source_ledger"][0]["url"], "file:///tmp/private-market-report.md")
+        self.assertIn("private-market-report.md", report_text)
+        self.assertIn("file:///tmp/private-market-report.md", json.dumps(result["long_document_references"]))
 
 
 if __name__ == "__main__":

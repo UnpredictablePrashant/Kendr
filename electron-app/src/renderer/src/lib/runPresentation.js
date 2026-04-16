@@ -20,6 +20,27 @@ function pushUniqueItem(list, item, limit = 4) {
   list.push({ label, path })
 }
 
+function normalizeArtifactItem(artifact) {
+  if (!artifact) return null
+  if (typeof artifact === 'string') {
+    const raw = artifact.trim()
+    if (!raw) return null
+    return {
+      label: basename(raw),
+      path: raw,
+    }
+  }
+  if (typeof artifact !== 'object') return null
+  const path = String(artifact.path || artifact.file_path || '').trim()
+  const name = String(artifact.name || artifact.label || '').trim()
+  const label = name || basename(path)
+  if (!label) return null
+  return {
+    label,
+    path,
+  }
+}
+
 function extractFileRefs(text) {
   const raw = String(text || '')
   if (!raw) return []
@@ -166,6 +187,7 @@ export function summarizeRunArtifacts(progress = [], artifacts = []) {
     search: 0,
     read: 0,
     edit: 0,
+    artifact: 0,
     command: 0,
     review: 0,
   }
@@ -173,6 +195,7 @@ export function summarizeRunArtifacts(progress = [], artifacts = []) {
     search: [],
     read: [],
     edit: [],
+    artifact: [],
     command: [],
     review: [],
   }
@@ -193,10 +216,10 @@ export function summarizeRunArtifacts(progress = [], artifacts = []) {
   }
 
   for (const artifact of Array.isArray(artifacts) ? artifacts : []) {
-    pushUniqueItem(samples.edit, { label: basename(artifact), path: String(artifact || '').trim() })
-  }
-  if (Array.isArray(artifacts) && artifacts.length) {
-    counts.edit = Math.max(counts.edit, artifacts.length)
+    const normalized = normalizeArtifactItem(artifact)
+    if (!normalized) continue
+    counts.artifact += 1
+    pushUniqueItem(samples.artifact, normalized, 6)
   }
 
   const makeCard = (kind, title) => ({
@@ -209,6 +232,7 @@ export function summarizeRunArtifacts(progress = [], artifacts = []) {
   if (counts.search > 0) cards.push(makeCard('search', `Searched ${counts.search} source${counts.search === 1 ? '' : 's'}`))
   if (counts.read > 0) cards.push(makeCard('read', `Read ${counts.read} file${counts.read === 1 ? '' : 's'}`))
   if (counts.edit > 0) cards.push(makeCard('edit', `Changed ${counts.edit} file${counts.edit === 1 ? '' : 's'}`))
+  if (counts.artifact > 0) cards.push(makeCard('artifact', `Created ${counts.artifact} artifact${counts.artifact === 1 ? '' : 's'}`))
   if (counts.command > 0) cards.push(makeCard('command', `Ran ${counts.command} command${counts.command === 1 ? '' : 's'}`))
   if (counts.review > 0) cards.push(makeCard('review', `Checked ${counts.review} task${counts.review === 1 ? '' : 's'}`))
   return cards.slice(0, 4)

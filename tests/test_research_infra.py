@@ -1,8 +1,11 @@
 import os
 import sys
+import threading
+import time
 import unittest
 from tempfile import TemporaryDirectory
 from pathlib import Path
+import zipfile
 from unittest.mock import patch, MagicMock
 
 from tasks.research_infra import fetch_search_results, llm_text, parse_document, parse_documents
@@ -105,6 +108,35 @@ class ResearchInfraTests(unittest.TestCase):
         self.assertEqual(result["providers_tried"], ["serpapi"])
         self.assertFalse(mock_browser_use.called)
 
+    def test_fetch_search_results_preserves_viewed_page_order_under_parallel_fetch(self):
+        def _fetch_page(url: str, timeout: int = 20) -> dict:
+            if url.endswith("/a"):
+                time.sleep(0.08)
+            else:
+                time.sleep(0.01)
+            return {"url": url, "content_type": "text/html", "text": f"evidence for {url}", "raw_text": ""}
+
+        with (
+            patch.dict(os.environ, {"SERP_API_KEY": "", "KENDR_BROWSER_USE_SEARCH_ENABLED": "0"}, clear=False),
+            patch("tasks.research_infra._browser_use_server_enabled", return_value=False),
+            patch(
+                "tasks.research_infra.duckduckgo_html_search",
+                return_value={
+                    "results": [
+                        {"title": "A", "url": "https://example.com/a", "snippet": "snippet a", "source": "DuckDuckGo", "date": ""},
+                        {"title": "B", "url": "https://example.com/b", "snippet": "snippet b", "source": "DuckDuckGo", "date": ""},
+                    ]
+                },
+            ),
+            patch("tasks.research_infra.fetch_url_content", side_effect=_fetch_page),
+        ):
+            result = fetch_search_results("ordered query", num=2, fetch_pages=2)
+
+        self.assertEqual(
+            [item["url"] for item in result["viewed_pages"]],
+            ["https://example.com/a", "https://example.com/b"],
+        )
+
     def test_parse_document_uses_excel_pdf_fallback_when_primary_read_fails(self):
         with TemporaryDirectory() as tmp:
             excel_path = Path(tmp) / "model.xlsx"
@@ -179,6 +211,114 @@ class ResearchInfraTests(unittest.TestCase):
         mock_extract.assert_called_once()
         self.assertEqual(result["metadata"]["type"], "xlsx")
         self.assertIn("col1", result["text"])
+
+    def test_parse_document_docx_falls_back_to_zipxml_when_primary_reader_fails(self):
+        with TemporaryDirectory() as tmp:
+            docx_path = Path(tmp) / "notes.docx"
+            with zipfile.ZipFile(docx_path, "w") as archive:
+                archive.writestr(
+                    "word/document.xml",
+                    (
+                        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                        "<w:body><w:p><w:r><w:t>AWS failure simulation plan</w:t></w:r></w:p></w:body>"
+                        "</w:document>"
+                    ),
+                )
+
+            result = parse_document(str(docx_path))
+
+        self.assertEqual(result["metadata"]["type"], "docx")
+        self.assertIn("AWS failure simulation plan", result["text"])
+        self.assertIn(result["metadata"]["reader"], {"zipxml", "python-docx"})
+
+    def test_parse_document_reads_code_file_extensions_as_text(self):
+        with TemporaryDirectory() as tmp:
+            py_path = Path(tmp) / "service.py"
+            py_path.write_text("def handler(event, context):\n    return {'ok': True}\n", encoding="utf-8")
+
+            result = parse_document(str(py_path))
+
+        self.assertEqual(result["metadata"]["type"], "py")
+        self.assertIn("def handler", result["text"])
+        self.assertEqual(result["metadata"]["reader"], "text")
+        self.assertGreaterEqual(result["metadata"]["line_count"], 1)
+
+    def test_parse_document_csv_includes_shape_metadata(self):
+        with TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "financials.csv"
+            csv_path.write_text("year,revenue,margin\n2024,100,0.5\n2025,120,0.55\n", encoding="utf-8")
+
+            result = parse_document(str(csv_path))
+
+        self.assertEqual(result["metadata"]["type"], "csv")
+        self.assertEqual(result["metadata"]["reader"], "csv")
+        self.assertEqual(result["metadata"]["rows"], 3)
+        self.assertEqual(result["metadata"]["columns"], 3)
+
+    def test_parse_document_pptx_zipxml_extracts_slide_notes(self):
+        with TemporaryDirectory() as tmp:
+            pptx_path = Path(tmp) / "deck.pptx"
+            with zipfile.ZipFile(pptx_path, "w") as archive:
+                archive.writestr(
+                    "ppt/slides/slide1.xml",
+                    (
+                        '<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+                        'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+                        "<p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Main finding</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>"
+                        "</p:sld>"
+                    ),
+                )
+                archive.writestr(
+                    "ppt/notesSlides/notesSlide1.xml",
+                    (
+                        '<p:notes xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" '
+                        'xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">'
+                        "<p:cSld><p:spTree><p:sp><p:txBody><a:p><a:r><a:t>Speaker note detail</a:t></a:r></a:p></p:txBody></p:sp></p:spTree></p:cSld>"
+                        "</p:notes>"
+                    ),
+                )
+
+            result = parse_document(str(pptx_path))
+
+        self.assertEqual(result["metadata"]["type"], "pptx")
+        self.assertIn("Speaker note detail", result["text"])
+        self.assertGreaterEqual(result["metadata"].get("notes_count", 0), 1)
+
+    def test_parse_documents_continue_on_error_adds_error_kind(self):
+        with TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "scan.png"
+            image_path.write_bytes(b"placeholder")
+
+            results = parse_documents([str(image_path)], continue_on_error=True, ocr_images=False)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["metadata"]["error_kind"], "ocr_required")
+        self.assertTrue(results[0]["metadata"]["recoverable"])
+
+    def test_parse_documents_runs_multiple_files_concurrently_and_preserves_order(self):
+        active = {"count": 0, "max": 0}
+        lock = threading.Lock()
+
+        def _fake_parse(path: str, *, ocr_images: bool = False, ocr_instruction: str | None = None) -> dict:
+            with lock:
+                active["count"] += 1
+                active["max"] = max(active["max"], active["count"])
+            try:
+                if path.endswith("slow.txt"):
+                    time.sleep(0.08)
+                else:
+                    time.sleep(0.02)
+                return {"path": path, "text": path, "metadata": {"type": "txt"}}
+            finally:
+                with lock:
+                    active["count"] -= 1
+
+        paths = ["slow.txt", "fast-a.txt", "fast-b.txt"]
+        with patch("tasks.research_infra.parse_document", side_effect=_fake_parse):
+            results = parse_documents(paths, continue_on_error=False)
+
+        self.assertEqual([item["path"] for item in results], paths)
+        self.assertGreaterEqual(active["max"], 2)
 
 
 class VectorBackendSelectionTests(unittest.TestCase):

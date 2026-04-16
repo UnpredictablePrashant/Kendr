@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from kendr.workflow_contract import is_deep_research_workflow_type
 
 @dataclass(slots=True)
 class WorkflowDispatchPlan:
@@ -142,6 +143,7 @@ def _current_objective(state: dict[str, Any]) -> str:
 
 
 def _match_project_build_blueprint(runtime: Any, state: dict[str, Any]) -> bool:
+    workflow_type = str(state.get("workflow_type", "") or "").strip().lower()
     return bool(
         not state.get("plan_steps")
         and state.get("last_agent") != "project_blueprint_agent"
@@ -149,6 +151,9 @@ def _match_project_build_blueprint(runtime: Any, state: dict[str, Any]) -> bool:
         and runtime._is_agent_available(state, "project_blueprint_agent")
         and runtime._is_project_build_request(state)
         and not bool(state.get("dev_pipeline_mode", False))
+        and not is_deep_research_workflow_type(workflow_type)
+        and not bool(state.get("deep_research_mode", False))
+        and not bool(state.get("long_document_mode", False))
     )
 
 

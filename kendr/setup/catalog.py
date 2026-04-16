@@ -691,7 +691,7 @@ def _legacy_requirements() -> dict[str, list[str]]:
     assign(["openai", "whatsapp"], "whatsapp_agent")
     assign(["openai", "outbound_channel"], "notification_dispatch_agent")
     assign(["openai", "playwright"], "interactive_browser_agent")
-    assign(["openai", "qdrant"], "memory_index_agent", "superrag_agent")
+    assign(["openai"], "memory_index_agent", "superrag_agent")
     assign(["openai", "google_workspace"], "gmail_agent", "drive_agent")
     assign(["openai", "telegram"], "telegram_agent")
     assign(["openai", "slack"], "slack_agent")

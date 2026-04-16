@@ -42,7 +42,7 @@ class RegistryDiscoveryTests(unittest.TestCase):
     def test_agent_cards_include_declared_requirements(self):
         registry = build_registry()
         cards = {card["agent_name"]: card for card in registry.agent_cards()}
-        self.assertEqual(cards["superrag_agent"]["requirements"], ["openai", "qdrant"])
+        self.assertEqual(cards["superrag_agent"]["requirements"], ["openai"])
 
 
 if __name__ == "__main__":

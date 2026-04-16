@@ -6,6 +6,8 @@ try:
 except ImportError:
     from typing_extensions import NotRequired
 
+from kendr.workflow_contract import approval_request_to_text, normalize_approval_request
+
 
 class PlanStep(TypedDict, total=False):
     id: str
@@ -238,28 +240,13 @@ class ResumeStateOverrides(TypedDict, total=False):
     execution_mode: str
 
 
+def _state_has_meaningful_approval_request(state: Mapping[str, Any]) -> bool:
+    approval_request = normalize_approval_request(state.get("approval_request", {}))
+    return bool(approval_request_to_text(approval_request))
+
+
 def state_awaiting_user_input(state: Mapping[str, Any]) -> bool:
-    approval_request = state.get("approval_request", {})
-    has_approval_request = False
-    if isinstance(approval_request, Mapping):
-        scope = str(approval_request.get("scope", "") or "").strip()
-        summary = str(approval_request.get("summary", "") or "").strip()
-        help_text = str(approval_request.get("help_text", "") or "").strip()
-        sections = approval_request.get("sections", [])
-        artifact_paths = approval_request.get("artifact_paths", [])
-        has_approval_request = bool(
-            scope
-            or summary
-            or help_text
-            or (isinstance(sections, list) and len(sections) > 0)
-            or (isinstance(artifact_paths, list) and len(artifact_paths) > 0)
-        )
     return bool(
-        state.get("plan_needs_clarification", False)
-        or state.get("plan_waiting_for_approval", False)
-        or state.get("long_document_plan_waiting_for_approval", False)
-        or state.get("blueprint_waiting_for_approval", False)
-        or str(state.get("approval_pending_scope", "")).strip()
-        or has_approval_request
-        or str(state.get("pending_user_input_kind", "")).strip()
+        str(state.get("pending_user_question", "") or "").strip()
+        or _state_has_meaningful_approval_request(state)
     )

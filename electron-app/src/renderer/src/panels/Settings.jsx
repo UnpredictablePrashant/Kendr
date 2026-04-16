@@ -227,7 +227,7 @@ export default function Settings() {
         {tab === 'rag' && (
           <>
             <div className="st-info-banner">
-              Configure retrieval-augmented generation (RAG) sources. These are used by research and document agents.
+              Configure RAG infrastructure defaults here. Deep Research can optionally consume an indexed KB at run time, but KB creation and indexing live in Super-RAG.
             </div>
 
             <Section title="Vector Store">
@@ -289,11 +289,11 @@ export default function Settings() {
                 <input type="checkbox" className="st-check" checked={!!s.ragAutoIndex} onChange={e => update('ragAutoIndex', e.target.checked)} />
               </Row>
               <div className="st-actions">
-                <button className="st-btn-accent" onClick={async () => {
+                <button className="st-btn-accent" onClick={() => {
                   try {
-                    await fetch(`${apiBase}/api/rag/index`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paths: s.ragLocalPaths?.split(',').map(p => p.trim()).filter(Boolean) }) })
-                  } catch {}
-                }}>Index Documents Now</button>
+                    window.open(`${apiBase}/rag`, '_blank', 'noopener,noreferrer')
+                  } catch (_) {}
+                }}>Open Super-RAG</button>
               </div>
             </Section>
 

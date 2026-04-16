@@ -125,6 +125,22 @@ class WorkflowRegistryTests(unittest.TestCase):
         self.assertTrue(plan.state_mutations["long_document_job_started"])
         self.assertTrue(plan.state_updates["long_document_collect_sources_first"])
 
+    def test_match_explicit_workflow_blocks_project_blueprint_when_deep_research_mode_is_active(self):
+        with (
+            patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
+            patch("tasks.a2a_protocol.upsert_agent_card"),
+            patch("tasks.a2a_protocol.insert_message"),
+            patch("tasks.a2a_protocol.upsert_task"),
+            patch("tasks.a2a_protocol.insert_artifact"),
+        ):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Build a project for chaos engineering failure simulation on AWS.")
+            state["workflow_type"] = "deep_research"
+            state["deep_research_mode"] = True
+            plan = match_explicit_workflow(runtime, state, stage="early")
+
+        self.assertIsNone(plan)
+
     def test_match_explicit_workflow_returns_deep_research_resume_plan(self):
         with (
             patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),

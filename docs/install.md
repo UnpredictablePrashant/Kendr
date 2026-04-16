@@ -33,10 +33,11 @@ Recommended:
 - `OPENAI_MODEL_CODING`
 - `OPENAI_VISION_MODEL`
 - `OPENAI_EMBEDDING_MODEL`
+- `KENDR_HOME`
+- `KENDR_CHROMA_PATH`
 - `QDRANT_URL`
 - `QDRANT_COLLECTION`
 - `RESEARCH_USER_AGENT`
-- `KENDR_HOME`
 - `KENDR_PLUGIN_PATHS`
 
 Workflow-specific or optional:
@@ -67,6 +68,7 @@ This script:
 - creates `.venv` if needed
 - installs the package in editable mode
 - bootstraps local runtime state
+- prepares a local ChromaDB-backed RAG store under `KENDR_HOME` for zero-config usage
 - adds `.venv/bin` to your shell path
 
 ### Windows PowerShell
@@ -190,6 +192,16 @@ Compose currently includes:
 - `cve-mcp`
 
 Docker is optional for local CLI use, but useful when you want the fuller Qdrant and MCP service stack.
+
+## Local RAG Default
+
+Kendr now defaults to a local ChromaDB vector store for RAG. On a fresh scripted install, bootstrap prepares:
+
+- `KENDR_HOME`
+- `KENDR_CHROMA_PATH`
+- local folders for the vector store and uploaded RAG content
+
+You do not need Qdrant for the default beginner workflow. Set `QDRANT_URL` only when you want a shared or server-backed vector database.
 
 ## Verification Commands
 

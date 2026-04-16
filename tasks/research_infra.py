@@ -8,8 +8,11 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 from pathlib import Path
 from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -37,12 +40,53 @@ BROWSER_USE_SEARCH_ENGINES = {
     "duckduckgo": "https://duckduckgo.com/html/",
 }
 IMAGE_FILE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff"}
-LOCAL_DRIVE_SUPPORTED_EXTENSIONS = {
+TEXT_LIKE_SOURCE_EXTENSIONS = {
     ".txt",
     ".md",
     ".json",
     ".html",
     ".htm",
+    ".xml",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".env",
+    ".properties",
+    ".sql",
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".java",
+    ".go",
+    ".rs",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".cs",
+    ".rb",
+    ".php",
+    ".swift",
+    ".kt",
+    ".kts",
+    ".scala",
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ps1",
+    ".bat",
+    ".tf",
+    ".tfvars",
+    ".gradle",
+}
+LOCAL_DRIVE_SUPPORTED_EXTENSIONS = {
+    *TEXT_LIKE_SOURCE_EXTENSIONS,
     ".csv",
     ".pdf",
     ".doc",
@@ -190,6 +234,68 @@ def fetch_url_content(url: str, timeout: int = 20) -> dict:
     }
 
 
+def fetch_urls_content(
+    urls: list[str],
+    *,
+    timeout: int = 20,
+    max_workers: int | None = None,
+    per_domain_limit: int | None = None,
+) -> list[dict]:
+    ordered_urls = [str(url or "").strip() for url in urls if str(url or "").strip()]
+    if not ordered_urls:
+        return []
+
+    if len(ordered_urls) == 1:
+        url = ordered_urls[0]
+        try:
+            payload = dict(fetch_url_content(url, timeout=timeout) or {})
+            payload["url"] = str(payload.get("url", "") or url).strip()
+            payload["content_type"] = str(payload.get("content_type", "") or "").strip()
+            payload["text"] = str(payload.get("text", "") or "")
+            payload["raw_text"] = str(payload.get("raw_text", payload["text"]) or "")
+            return [payload]
+        except Exception as exc:
+            return [{"url": url, "content_type": "", "text": "", "raw_text": "", "error": str(exc)}]
+
+    worker_count = max_workers if max_workers is not None else _link_worker_count(len(ordered_urls))
+    worker_count = max(1, min(len(ordered_urls), int(worker_count)))
+    domain_limit = max(1, min(worker_count, per_domain_limit if per_domain_limit is not None else _per_domain_link_limit()))
+    results: list[dict | None] = [None] * len(ordered_urls)
+    domain_semaphores: dict[str, threading.BoundedSemaphore] = {}
+    domain_lock = threading.Lock()
+
+    def _domain_semaphore(url: str) -> threading.BoundedSemaphore:
+        domain = urlparse(url).netloc.lower() or "__default__"
+        with domain_lock:
+            semaphore = domain_semaphores.get(domain)
+            if semaphore is None:
+                semaphore = threading.BoundedSemaphore(domain_limit)
+                domain_semaphores[domain] = semaphore
+            return semaphore
+
+    def _fetch_one(index: int, url: str) -> tuple[int, dict]:
+        semaphore = _domain_semaphore(url)
+        with semaphore:
+            try:
+                payload = fetch_url_content(url, timeout=timeout)
+                normalized = dict(payload or {})
+                normalized["url"] = str(normalized.get("url", "") or url).strip()
+                normalized["content_type"] = str(normalized.get("content_type", "") or "").strip()
+                normalized["text"] = str(normalized.get("text", "") or "")
+                normalized["raw_text"] = str(normalized.get("raw_text", normalized["text"]) or "")
+                return index, normalized
+            except Exception as exc:
+                return index, {"url": url, "content_type": "", "text": "", "raw_text": "", "error": str(exc)}
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(_fetch_one, index, url) for index, url in enumerate(ordered_urls)]
+        for future in as_completed(futures):
+            index, payload = future.result()
+            results[index] = payload
+
+    return [item for item in results if isinstance(item, dict)]
+
+
 def _env_flag(name: str, default: bool = True) -> bool:
     raw = str(os.getenv(name, "1" if default else "0") or "").strip().lower()
     if raw in {"", "1", "true", "yes", "on"}:
@@ -197,6 +303,45 @@ def _env_flag(name: str, default: bool = True) -> bool:
     if raw in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None = None) -> int:
+    raw = str(os.getenv(name, str(default)) or "").strip()
+    try:
+        value = int(raw)
+    except Exception:
+        value = default
+    value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+def _bounded_worker_count(total_items: int, default: int, *, env_name: str, maximum: int = 16) -> int:
+    if total_items <= 0:
+        return 1
+    configured = _env_int(env_name, default, minimum=1, maximum=maximum)
+    return max(1, min(total_items, configured))
+
+
+def _link_worker_count(total_items: int) -> int:
+    return _bounded_worker_count(total_items, 4, env_name="KENDR_RESEARCH_LINK_MAX_WORKERS", maximum=16)
+
+
+def _per_domain_link_limit() -> int:
+    return _env_int("KENDR_RESEARCH_PER_DOMAIN_MAX_WORKERS", 2, minimum=1, maximum=8)
+
+
+def _document_worker_count(total_items: int) -> int:
+    return _bounded_worker_count(total_items, 4, env_name="KENDR_RESEARCH_DOCUMENT_MAX_WORKERS", maximum=12)
+
+
+def _heavy_document_worker_count() -> int:
+    return _env_int("KENDR_RESEARCH_HEAVY_DOCUMENT_MAX_WORKERS", 2, minimum=1, maximum=6)
+
+
+def _ocr_document_worker_count() -> int:
+    return _env_int("KENDR_RESEARCH_OCR_MAX_WORKERS", 1, minimum=1, maximum=4)
 
 
 def _browser_use_search_enabled() -> bool:
@@ -334,27 +479,44 @@ def extract_links(base_url: str, html: str, limit: int = 20, same_domain: bool =
 
 
 def crawl_urls(urls: list[str], max_pages: int = 5, same_domain: bool = True) -> list[dict]:
-    queue = list(urls)
-    visited = []
-    pages = []
-    while queue and len(pages) < max_pages:
-        url = queue.pop(0)
-        if url in visited:
+    pending = deque(str(url or "").strip() for url in urls if str(url or "").strip())
+    enqueued = set(pending)
+    visited: set[str] = set()
+    pages: list[dict] = []
+    worker_count = _link_worker_count(max_pages)
+
+    while pending and len(pages) < max_pages:
+        batch: list[str] = []
+        remaining = max_pages - len(pages)
+        while pending and len(batch) < min(worker_count, remaining):
+            url = pending.popleft()
+            enqueued.discard(url)
+            if url in visited:
+                continue
+            visited.add(url)
+            batch.append(url)
+        if not batch:
             continue
-        visited.append(url)
-        try:
-            page = fetch_url_content(url)
+        fetched_pages = fetch_urls_content(batch, timeout=20, max_workers=min(worker_count, len(batch)))
+        for page in fetched_pages:
+            page_url = str(page.get("url", "")).strip()
+            content_type = str(page.get("content_type", "")).strip()
             pages.append(
                 {
-                    "url": page["url"],
-                    "content_type": page["content_type"],
-                    "text": page["text"][:12000],
+                    "url": page_url,
+                    "content_type": content_type,
+                    "text": str(page.get("text", "") or "")[:12000],
+                    **({"error": str(page.get("error", "")).strip()} if page.get("error") else {}),
                 }
             )
-            if "html" in page["content_type"]:
-                queue.extend(link for link in extract_links(url, page["raw_text"], same_domain=same_domain) if link not in visited)
-        except Exception as exc:
-            pages.append({"url": url, "error": str(exc), "content_type": "", "text": ""})
+            if len(pages) >= max_pages:
+                break
+            raw_text = str(page.get("raw_text", "") or "")
+            if "html" in content_type and raw_text:
+                for link in extract_links(page_url, raw_text, same_domain=same_domain):
+                    if link not in visited and link not in enqueued:
+                        pending.append(link)
+                        enqueued.add(link)
     return pages
 
 
@@ -614,29 +776,21 @@ def fetch_search_results(
 
     viewed_pages: list[dict] = []
     if search_results:
-        for item in search_results[: max(0, int(fetch_pages or 0))]:
-            url = _clean_search_result_url(item.get("url", ""))
-            if not url:
-                continue
-            try:
-                page = fetch_url_content(url, timeout=20)
-                excerpt = re.sub(r"\s+", " ", str(page.get("text", "")).strip())[:1200]
-                viewed_pages.append(
-                    {
-                        "url": url,
-                        "content_type": str(page.get("content_type", "")).strip(),
-                        "excerpt": excerpt,
-                    }
-                )
-            except Exception as exc:
-                viewed_pages.append(
-                    {
-                        "url": url,
-                        "content_type": "",
-                        "excerpt": "",
-                        "error": str(exc),
-                    }
-                )
+        view_urls = [
+            _clean_search_result_url(item.get("url", ""))
+            for item in search_results[: max(0, int(fetch_pages or 0))]
+        ]
+        view_urls = [url for url in view_urls if url]
+        for page in fetch_urls_content(view_urls, timeout=20, max_workers=min(_link_worker_count(len(view_urls)), len(view_urls) or 1)):
+            excerpt = re.sub(r"\s+", " ", str(page.get("text", "")).strip())[:1200]
+            viewed_pages.append(
+                {
+                    "url": str(page.get("url", "")).strip(),
+                    "content_type": str(page.get("content_type", "")).strip(),
+                    "excerpt": excerpt,
+                    **({"error": str(page.get("error", "")).strip()} if page.get("error") else {}),
+                }
+            )
 
     return {
         "provider": provider,
@@ -812,6 +966,39 @@ def _clean_whitespace(value: str) -> str:
     return re.sub(r"[ \t]+", " ", (value or "")).strip()
 
 
+def _text_structure_metadata(text: str) -> dict:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    heading_count = sum(
+        1
+        for line in lines
+        if line.startswith("#")
+        or (len(line) <= 120 and line == line.upper() and re.search(r"[A-Z]", line))
+        or line.endswith(":")
+    )
+    return {
+        "line_count": len(lines),
+        "heading_count": heading_count,
+        "character_count": len(str(text or "")),
+    }
+
+
+def _classify_extract_error(exc: Exception) -> tuple[str, bool]:
+    message = str(exc or "").lower()
+    if "encrypted" in message or "password" in message:
+        return "encrypted", False
+    if "ocr mode" in message or "ocr" in message:
+        return "ocr_required", True
+    if "not found" in message:
+        return "missing", False
+    if "unsupported" in message:
+        return "unsupported", False
+    if "badzipfile" in message or "file is not a zip file" in message or "cannot parse" in message:
+        return "corrupt", False
+    if "pdf" in message and "stream" in message:
+        return "corrupt", False
+    return "extract_failed", False
+
+
 def _extract_printable_chunks(data: bytes, *, min_length: int = 6, max_chunks: int = 3000) -> str:
     decoded = data.decode("latin-1", errors="ignore").replace("\x00", " ")
     pattern = rf"[^\x00-\x1F]{{{max(1, min_length)},}}"
@@ -850,6 +1037,82 @@ def _extract_doc_text(path: Path) -> tuple[str, dict]:
     raise ValueError(f"Unable to read legacy DOC file: {path}")
 
 
+def _extract_docx_xml_text(path: Path) -> tuple[str, dict]:
+    with zipfile.ZipFile(path) as archive:
+        word_parts = [
+            "word/document.xml",
+            *sorted(
+                item
+                for item in archive.namelist()
+                if item.startswith("word/header") and item.endswith(".xml")
+            ),
+            *sorted(
+                item
+                for item in archive.namelist()
+                if item.startswith("word/footer") and item.endswith(".xml")
+            ),
+            "word/footnotes.xml",
+            "word/endnotes.xml",
+        ]
+        seen: set[str] = set()
+        lines: list[str] = []
+        table_count = 0
+        for part in word_parts:
+            if part in seen or part not in archive.namelist():
+                continue
+            seen.add(part)
+            root = ET.fromstring(archive.read(part))
+            table_count += len(root.findall(".//{*}tbl"))
+            paragraphs = root.findall(".//{*}p") or [root]
+            for paragraph in paragraphs:
+                pieces = [
+                    node.text.strip()
+                    for node in paragraph.findall(".//{*}t")
+                    if node.text and node.text.strip()
+                ]
+                if pieces:
+                    lines.append(" ".join(pieces))
+        text = "\n".join(lines).strip()
+        return text, {"type": "docx", "reader": "zipxml", "paragraphs": len(lines), "table_count": table_count}
+
+
+def _extract_docx_text(path: Path) -> tuple[str, dict]:
+    errors: list[str] = []
+    try:
+        from docx import Document
+
+        doc = Document(str(path))
+        text = "\n".join(paragraph.text for paragraph in doc.paragraphs if paragraph.text)
+        if text.strip():
+            return text, {
+                "type": "docx",
+                "reader": "python-docx",
+                "paragraphs": len(doc.paragraphs),
+                "table_count": len(getattr(doc, "tables", []) or []),
+            }
+        errors.append("python-docx returned no text")
+    except Exception as exc:
+        errors.append(str(exc))
+
+    try:
+        text, metadata = _extract_docx_xml_text(path)
+        if text.strip():
+            if errors:
+                metadata = {**metadata, "primary_extract_error": errors[0]}
+            return text, metadata
+        errors.append("zipxml returned no text")
+    except Exception as exc:
+        errors.append(str(exc))
+
+    fallback = _extract_printable_chunks(path.read_bytes())
+    if fallback:
+        metadata = {"type": "docx", "reader": "binary_strings"}
+        if errors:
+            metadata["primary_extract_error"] = errors[0]
+        return fallback, metadata
+    raise ValueError(f"Unable to read DOCX file: {path}. attempts={' | '.join(errors) if errors else 'none'}")
+
+
 def _extract_xlsx_xml_text(path: Path) -> tuple[str, dict]:
     with zipfile.ZipFile(path) as archive:
         shared_strings = []
@@ -864,8 +1127,12 @@ def _extract_xlsx_xml_text(path: Path) -> tuple[str, dict]:
         )
 
         lines = []
+        sheet_names: list[str] = []
+        non_empty_rows = 0
         for sheet_index, sheet_path in enumerate(sheet_paths, start=1):
-            lines.append(f"[Sheet {sheet_index}] {Path(sheet_path).name}")
+            sheet_name = Path(sheet_path).name
+            sheet_names.append(sheet_name)
+            lines.append(f"[Sheet {sheet_index}] {sheet_name}")
             root = ET.fromstring(archive.read(sheet_path))
             for row in root.findall(".//{*}row")[:600]:
                 row_values = []
@@ -893,9 +1160,10 @@ def _extract_xlsx_xml_text(path: Path) -> tuple[str, dict]:
                     if cleaned:
                         row_values.append(cleaned)
                 if row_values:
+                    non_empty_rows += 1
                     lines.append(", ".join(row_values))
         text = "\n".join(lines).strip()
-        return text, {"type": "xlsx", "reader": "zipxml", "sheets": len(sheet_paths)}
+        return text, {"type": "xlsx", "reader": "zipxml", "sheets": len(sheet_paths), "sheet_names": sheet_names, "non_empty_rows": non_empty_rows}
 
 
 def _extract_xlsx_text(path: Path) -> tuple[str, dict]:
@@ -904,18 +1172,28 @@ def _extract_xlsx_text(path: Path) -> tuple[str, dict]:
 
         workbook = load_workbook(str(path), data_only=True, read_only=True)
         lines = []
+        sheet_names: list[str] = []
+        non_empty_rows = 0
         for sheet in workbook.worksheets:
+            sheet_names.append(sheet.title)
             lines.append(f"[Sheet] {sheet.title}")
             for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
                 if row_index > 600:
                     break
                 values = [_clean_whitespace(str(value)) for value in row if value is not None and _clean_whitespace(str(value))]
                 if values:
+                    non_empty_rows += 1
                     lines.append(", ".join(values))
         text = "\n".join(lines).strip()
-        return text, {"type": "xlsx", "reader": "openpyxl", "sheets": len(workbook.worksheets)}
-    except Exception:
-        return _extract_xlsx_xml_text(path)
+        return text, {"type": "xlsx", "reader": "openpyxl", "sheets": len(workbook.worksheets), "sheet_names": sheet_names, "non_empty_rows": non_empty_rows}
+    except Exception as exc:
+        try:
+            text, metadata = _extract_xlsx_xml_text(path)
+            if text.strip():
+                return text, metadata
+        except Exception:
+            pass
+        raise exc
 
 
 def _extract_xls_text(path: Path) -> tuple[str, dict]:
@@ -954,14 +1232,23 @@ def _extract_pptx_xml_text(path: Path) -> tuple[str, dict]:
             if item.startswith("ppt/slides/slide") and item.endswith(".xml")
         )
         lines = []
+        notes_count = 0
         for index, slide_path in enumerate(slide_paths, start=1):
             root = ET.fromstring(archive.read(slide_path))
             parts = [node.text.strip() for node in root.findall(".//{*}t") if node.text and node.text.strip()]
             lines.append(f"[Slide {index}]")
             if parts:
                 lines.append(" ".join(parts))
+            notes_path = f"ppt/notesSlides/notesSlide{index}.xml"
+            if notes_path in archive.namelist():
+                notes_root = ET.fromstring(archive.read(notes_path))
+                notes_parts = [node.text.strip() for node in notes_root.findall(".//{*}t") if node.text and node.text.strip()]
+                if notes_parts:
+                    notes_count += 1
+                    lines.append(f"[Slide {index} Notes]")
+                    lines.append(" ".join(notes_parts))
         text = "\n".join(lines).strip()
-        return text, {"type": "pptx", "reader": "zipxml", "slides": len(slide_paths)}
+        return text, {"type": "pptx", "reader": "zipxml", "slides": len(slide_paths), "notes_count": notes_count}
 
 
 def _extract_pptx_text(path: Path) -> tuple[str, dict]:
@@ -970,9 +1257,13 @@ def _extract_pptx_text(path: Path) -> tuple[str, dict]:
 
         presentation = Presentation(str(path))
         lines = []
+        notes_count = 0
+        table_count = 0
         for slide_index, slide in enumerate(presentation.slides, start=1):
             parts = []
             for shape in slide.shapes:
+                if getattr(shape, "has_table", False):
+                    table_count += 1
                 if getattr(shape, "has_text_frame", False) and shape.text:
                     cleaned = _clean_whitespace(shape.text)
                     if cleaned:
@@ -980,10 +1271,31 @@ def _extract_pptx_text(path: Path) -> tuple[str, dict]:
             lines.append(f"[Slide {slide_index}]")
             if parts:
                 lines.append(" ".join(parts))
+            try:
+                notes_frame = slide.notes_slide.notes_text_frame
+                notes_text = _clean_whitespace(notes_frame.text if notes_frame is not None else "")
+                if notes_text:
+                    notes_count += 1
+                    lines.append(f"[Slide {slide_index} Notes]")
+                    lines.append(notes_text)
+            except Exception:
+                pass
         text = "\n".join(lines).strip()
-        return text, {"type": "pptx", "reader": "python-pptx", "slides": len(presentation.slides)}
-    except Exception:
-        return _extract_pptx_xml_text(path)
+        return text, {"type": "pptx", "reader": "python-pptx", "slides": len(presentation.slides), "notes_count": notes_count, "table_count": table_count}
+    except Exception as exc:
+        errors = [str(exc)]
+        try:
+            text, metadata = _extract_pptx_xml_text(path)
+            if text.strip():
+                metadata = {**metadata, "primary_extract_error": errors[0]}
+                return text, metadata
+            errors.append("zipxml returned no text")
+        except Exception as xml_exc:
+            errors.append(str(xml_exc))
+        fallback = _extract_printable_chunks(path.read_bytes())
+        if fallback:
+            return fallback, {"type": "pptx", "reader": "binary_strings", "primary_extract_error": errors[0]}
+        raise ValueError(f"Unable to read PPTX file: {path}. attempts={' | '.join(errors)}")
 
 
 def _extract_ppt_text(path: Path) -> tuple[str, dict]:
@@ -1000,6 +1312,13 @@ def _extract_pdf_text(path: Path) -> tuple[str, dict]:
     from pypdf import PdfReader
 
     reader = PdfReader(str(path))
+    if getattr(reader, "is_encrypted", False):
+        try:
+            decrypt_status = reader.decrypt("")
+        except Exception as exc:
+            raise ValueError(f"Encrypted PDF requires password: {path}") from exc
+        if not decrypt_status:
+            raise ValueError(f"Encrypted PDF requires password: {path}")
     text = "\n".join((page.extract_text() or "") for page in reader.pages)
     return text, {"type": "pdf", "reader": "pypdf", "pages": len(reader.pages)}
 
@@ -1086,26 +1405,27 @@ def parse_document(path_str: str, *, ocr_images: bool = False, ocr_instruction: 
         raise ValueError(f"File not found for ingestion: {path}")
 
     suffix = path.suffix.lower()
-    if suffix in {".txt", ".md", ".json", ".html", ".htm"}:
+    if suffix in TEXT_LIKE_SOURCE_EXTENSIONS:
         text = path.read_text(encoding="utf-8", errors="ignore")
         if suffix in {".html", ".htm"}:
             text = html_to_text(text)
-        return {"path": str(path), "text": text, "metadata": {"type": suffix.lstrip(".")}}
+        metadata = {"type": suffix.lstrip("."), "reader": "text"}
+        metadata.update(_text_structure_metadata(text))
+        return {"path": str(path), "text": text, "metadata": metadata}
     if suffix == ".csv":
         with open(path, "r", encoding="utf-8", errors="ignore", newline="") as handle:
             reader = csv.reader(handle)
             rows = list(reader)
         text = "\n".join(", ".join(row) for row in rows[:200])
-        return {"path": str(path), "text": text, "metadata": {"type": "csv", "rows": len(rows)}}
+        metadata = {"type": "csv", "reader": "csv", "rows": len(rows), "columns": max((len(row) for row in rows), default=0)}
+        metadata.update(_text_structure_metadata(text))
+        return {"path": str(path), "text": text, "metadata": metadata}
     if suffix == ".pdf":
         text, metadata = _extract_pdf_text(path)
         return {"path": str(path), "text": text, "metadata": metadata}
     if suffix == ".docx":
-        from docx import Document
-
-        doc = Document(str(path))
-        text = "\n".join(paragraph.text for paragraph in doc.paragraphs)
-        return {"path": str(path), "text": text, "metadata": {"type": "docx", "paragraphs": len(doc.paragraphs)}}
+        text, metadata = _extract_docx_text(path)
+        return {"path": str(path), "text": text, "metadata": metadata}
     if suffix == ".doc":
         text, metadata = _extract_doc_text(path)
         return {"path": str(path), "text": text, "metadata": metadata}
@@ -1134,9 +1454,38 @@ def parse_document(path_str: str, *, ocr_images: bool = False, ocr_instruction: 
         return {
             "path": str(path),
             "text": result.get("text", ""),
-            "metadata": {"type": "image", "reader": "openai_ocr", "ocr_characters": len(result.get("text", "") or "")},
+            "metadata": {
+                "type": "image",
+                "reader": "openai_ocr",
+                "ocr_characters": len(result.get("text", "") or ""),
+                **_text_structure_metadata(result.get("text", "") or ""),
+            },
         }
     raise ValueError(f"Unsupported document type for ingestion: {path}")
+
+
+def _document_parse_bucket(path_str: str, *, ocr_images: bool) -> str:
+    suffix = Path(path_str).suffix.lower()
+    if suffix in IMAGE_FILE_EXTENSIONS and ocr_images:
+        return "ocr"
+    if suffix in {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".xlsm", ".ppt", ".pptx", ".pptm"}:
+        return "heavy"
+    return "light"
+
+
+def _document_parse_error(path_str: str, exc: Exception) -> dict:
+    resolved_path = Path(path_str)
+    error_kind, recoverable = _classify_extract_error(exc)
+    return {
+        "path": str(resolved_path),
+        "text": "",
+        "metadata": {
+            "type": resolved_path.suffix.lstrip(".") or "unknown",
+            "error": str(exc),
+            "error_kind": error_kind,
+            "recoverable": recoverable,
+        },
+    }
 
 
 def parse_documents(
@@ -1146,22 +1495,56 @@ def parse_documents(
     ocr_images: bool = False,
     ocr_instruction: str | None = None,
 ) -> list[dict]:
-    documents = []
-    for path in paths:
+    ordered_paths = [str(path or "").strip() for path in paths if str(path or "").strip()]
+    if not ordered_paths:
+        return []
+
+    if len(ordered_paths) == 1:
+        path = ordered_paths[0]
         try:
-            documents.append(parse_document(path, ocr_images=ocr_images, ocr_instruction=ocr_instruction))
+            return [parse_document(path, ocr_images=ocr_images, ocr_instruction=ocr_instruction)]
         except Exception as exc:
             if not continue_on_error:
                 raise
-            resolved_path = Path(path)
-            documents.append(
-                {
-                    "path": str(resolved_path),
-                    "text": "",
-                    "metadata": {"type": resolved_path.suffix.lstrip(".") or "unknown", "error": str(exc)},
-                }
-            )
-    return documents
+            return [_document_parse_error(path, exc)]
+
+    bucket_limits = {
+        "light": _document_worker_count(len(ordered_paths)),
+        "heavy": _heavy_document_worker_count(),
+        "ocr": _ocr_document_worker_count(),
+    }
+    semaphore_by_bucket = {
+        bucket: threading.BoundedSemaphore(limit)
+        for bucket, limit in bucket_limits.items()
+    }
+    results: list[dict | None] = [None] * len(ordered_paths)
+    max_workers = min(len(ordered_paths), sum(bucket_limits.values()))
+
+    def _parse_one(index: int, path: str) -> tuple[int, dict]:
+        bucket = _document_parse_bucket(path, ocr_images=ocr_images)
+        with semaphore_by_bucket[bucket]:
+            try:
+                return index, parse_document(path, ocr_images=ocr_images, ocr_instruction=ocr_instruction)
+            except Exception as exc:
+                if not continue_on_error:
+                    raise
+                return index, _document_parse_error(path, exc)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(_parse_one, index, path): index
+            for index, path in enumerate(ordered_paths)
+        }
+        try:
+            for future in as_completed(futures):
+                index, payload = future.result()
+                results[index] = payload
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
+
+    return [item for item in results if isinstance(item, dict)]
 
 
 def openai_ocr_image(path_str: str, instruction: str | None = None) -> dict:
