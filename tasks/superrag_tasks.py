@@ -21,6 +21,7 @@ from kendr.persistence import (
 from kendr.providers import get_microsoft_graph_access_token
 
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
+from tasks.research_output import render_phase0_report
 from tasks.research_infra import (
     LOCAL_DRIVE_SUPPORTED_EXTENSIONS,
     chunk_text,
@@ -778,6 +779,102 @@ def _ensure_sources_section(answer: str, citations: list[dict]) -> str:
     return f"{answer_text}\n\n{sources_block}"
 
 
+def _build_summary_next_steps(session_id: str) -> list[str]:
+    return [
+        f"Reuse superrag_mode=chat with superrag_session_id={session_id} to ask focused questions against this indexed corpus.",
+        "Validate the highest-impact answers against the cited source files or URLs before sharing them externally.",
+        "Rebuild the session after adding new documents so retrieval stays aligned with the latest evidence.",
+    ]
+
+
+def _hit_metadata(hit: dict) -> dict:
+    if isinstance(hit.get("metadata"), dict):
+        return hit["metadata"]
+    if isinstance(hit.get("payload"), dict):
+        return hit["payload"]
+    return {}
+
+
+def _hit_source(hit: dict, fallback_rank: int = 0) -> str:
+    meta = _hit_metadata(hit)
+    source = str(hit.get("source") or meta.get("source") or "").strip()
+    if source:
+        return source
+    return f"unknown://superrag-hit/{fallback_rank or 0}"
+
+
+def _hit_score(hit: dict) -> float | None:
+    try:
+        value = hit.get("score")
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _hit_dedup_key(hit: dict, fallback_rank: int = 0) -> tuple[str, str]:
+    meta = _hit_metadata(hit)
+    source = _hit_source(hit, fallback_rank=fallback_rank)
+    chunk_index = str(meta.get("chunk_index", "") or "").strip()
+    if chunk_index:
+        return source, chunk_index
+    normalized_text = " ".join(str(hit.get("text", "") or "").split())[:240]
+    return source, normalized_text
+
+
+def _select_chat_hits(raw_hits: list[dict], *, top_k: int, per_source_limit: int) -> tuple[list[dict], dict]:
+    enumerated_hits = list(enumerate(raw_hits, start=1))
+    ranked_hits = sorted(
+        enumerated_hits,
+        key=lambda item: (
+            _hit_score(item[1]) is None,
+            -(_hit_score(item[1]) or 0.0),
+            item[0],
+        ),
+    )
+
+    deduped_hits: list[dict] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for original_rank, hit in ranked_hits:
+        dedup_key = _hit_dedup_key(hit, fallback_rank=original_rank)
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        deduped_hits.append(hit)
+
+    selected_hits: list[dict] = []
+    deferred_hits: list[dict] = []
+    source_counts: dict[str, int] = {}
+    for hit in deduped_hits:
+        source = _hit_source(hit)
+        if source_counts.get(source, 0) == 0 and len(selected_hits) < top_k:
+            selected_hits.append(hit)
+            source_counts[source] = 1
+        else:
+            deferred_hits.append(hit)
+
+    for hit in deferred_hits:
+        if len(selected_hits) >= top_k:
+            break
+        source = _hit_source(hit)
+        if source_counts.get(source, 0) >= per_source_limit:
+            continue
+        selected_hits.append(hit)
+        source_counts[source] = source_counts.get(source, 0) + 1
+
+    retrieval_summary = {
+        "strategy": "score_desc_source_diversity",
+        "raw_hit_count": len(raw_hits),
+        "deduped_hit_count": len(deduped_hits),
+        "selected_hit_count": len(selected_hits),
+        "distinct_source_count": len(source_counts),
+        "per_source_limit": per_source_limit,
+        "selected_sources": list(source_counts.keys()),
+    }
+    return selected_hits, retrieval_summary
+
+
 def _build_mode(state: dict, task_content: str, call_number: int) -> tuple[str, dict]:
     requested_session = str(state.get("superrag_session_id") or _extract_session_from_text(task_content) or "").strip()
     if bool(state.get("superrag_new_session", False)):
@@ -970,21 +1067,32 @@ def _build_mode(state: dict, task_content: str, call_number: int) -> tuple[str, 
 
     resolved_session = get_superrag_session(session_id) or updated
     source_mix_summary = _source_mix_summary_lines(source_summary)
-    summary = (
-        "superRAG build completed.\n"
-        f"Session: {session_id}\n"
-        f"Collection: {collection_name}\n"
-        f"Documents: {stats['documents']}\n"
-        f"Chunks indexed: {stats['indexed']}\n"
-        "Source mix:\n"
-        f"{chr(10).join(source_mix_summary)}\n"
-        "You can now chat with this session by setting superrag_mode=chat and reusing the same superrag_session_id."
+    coverage_summary = [
+        f"Session: {session_id}",
+        f"Collection: {collection_name}",
+        f"Documents indexed: {stats['documents']}",
+        f"Chunks indexed: {stats['indexed']}",
+        *source_mix_summary,
+    ]
+    recommended_next_steps = _build_summary_next_steps(session_id)
+    summary = render_phase0_report(
+        title="superRAG Build Summary",
+        objective=str(state.get("user_query") or task_content or f"Build superRAG session {session_id}"),
+        findings=(
+            f"superRAG build completed and session '{session_id}' is ready for retrieval-backed chat. "
+            f"The vector collection contains {stats['indexed']} indexed chunk(s) across {stats['documents']} document(s)."
+        ),
+        coverage_lines=coverage_summary,
+        next_steps=recommended_next_steps,
+        sources_lines=[item.get("source", "") for item in all_docs[:15]],
     )
     payload = {
         "mode": "build",
         "session": resolved_session,
         "source_summary": source_summary,
         "source_mix_summary": source_mix_summary,
+        "coverage_summary": coverage_summary,
+        "recommended_next_steps": recommended_next_steps,
         "index_result": index_result,
         "stats": stats,
         "sample_sources": [item.get("source", "") for item in all_docs[:15]],
@@ -1128,15 +1236,17 @@ def _chat_mode(state: dict, task_content: str, call_number: int) -> tuple[str, d
         raise ValueError("chat mode requires a non-empty question.")
 
     top_k = max(1, min(int(state.get("superrag_top_k", 8) or 8), 40))
+    per_source_limit = max(1, min(int(state.get("superrag_max_hits_per_source", 2) or 2), 5))
     try:
-        hits = search_memory(query, top_k=top_k, collection_name=collection)
+        raw_hits = search_memory(query, top_k=max(top_k * 3, top_k), collection_name=collection)
     except Exception as exc:  # noqa: BLE001
         raise _superrag_dependency_error("chat retrieval", exc) from exc
+    hits, retrieval_summary = _select_chat_hits(raw_hits, top_k=top_k, per_source_limit=per_source_limit)
     context_blocks = []
     citations = []
     for index, hit in enumerate(hits, start=1):
-        meta = hit.get("metadata") if isinstance(hit.get("metadata"), dict) else {}
-        source = hit.get("source") or meta.get("source") or "unknown"
+        meta = _hit_metadata(hit)
+        source = _hit_source(hit, fallback_rank=index)
         text = str(hit.get("text", "") or "")
         score = hit.get("score")
         citations.append(
@@ -1224,11 +1334,13 @@ Rules:
         "collection": collection,
         "query": query,
         "hits": hits,
+        "raw_hit_count": len(raw_hits),
         "hit_count": len(hits),
         "citations": citations,
         "answer": answer,
         "source_summary": session.get("source_summary", {}),
         "source_mix_summary": _source_mix_summary_lines(session.get("source_summary", {})),
+        "retrieval_summary": retrieval_summary,
     }
     state["superrag_active_session_id"] = session_id
     state["superrag_session_id"] = session_id

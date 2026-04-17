@@ -4948,6 +4948,7 @@ def _cmd_research(args: argparse.Namespace) -> int:
         base_ingest_payload["deep_research_source_urls"] = deep_research_links
     if bool(args.auto_approve):
         base_ingest_payload["auto_approve"] = True
+        base_ingest_payload["auto_approve_plan"] = True
 
     drive_paths = _normalize_drive_paths(args.drive)
     if bool(getattr(args, "no_web_search", False)) and not drive_paths:
@@ -5483,6 +5484,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         base_ingest_payload["target_os"] = str(args.target_os).strip().lower()
     if bool(args.auto_approve):
         base_ingest_payload["auto_approve"] = True
+        base_ingest_payload["auto_approve_plan"] = True
     if bool(args.skip_reviews):
         base_ingest_payload["skip_reviews"] = True
     if int(args.max_step_revisions or 0) > 0:

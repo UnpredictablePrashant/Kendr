@@ -242,25 +242,47 @@ def get_context_window(model: str) -> int:
     return 128000
 
 
-def get_model_capabilities(model: str) -> dict[str, bool]:
+def supports_native_web_search(model: str, provider: str = "") -> bool:
+    normalized_provider = str(provider or "").strip().lower()
+    if normalized_provider != PROVIDER_OPENAI:
+        return False
+    name = str(model or "").strip().lower()
+    if not name:
+        return False
+    if "gpt-4.1-nano" in name:
+        return False
+    if "deep-research" in name:
+        return True
+    return any(token in name for token in ("gpt-5", "gpt-4o", "gpt-4.1", "o3", "o4-"))
+
+
+def get_model_capabilities(model: str, provider: str = "") -> dict[str, bool]:
     name = str(model or "").strip().lower()
     default = {
         "tool_calling": False,
         "vision": False,
         "structured_output": False,
         "reasoning": False,
+        "native_web_search": False,
     }
     for needle, capabilities in _MODEL_CAPABILITY_RULES:
         if needle in name:
-            return {**default, **capabilities}
-    return default
+            return {
+                **default,
+                **capabilities,
+                "native_web_search": supports_native_web_search(model, provider),
+            }
+    return {
+        **default,
+        "native_web_search": supports_native_web_search(model, provider),
+    }
 
 
 def is_agent_capable_model(model: str, provider: str = "") -> bool:
     normalized_provider = str(provider or "").strip().lower()
     if normalized_provider == PROVIDER_OLLAMA:
         return False
-    capabilities = get_model_capabilities(model)
+    capabilities = get_model_capabilities(model, provider)
     return bool(capabilities.get("tool_calling"))
 
 
@@ -547,7 +569,7 @@ def provider_status(provider: str) -> dict:
                     "name": name,
                     "family": infer_model_family(name, provider),
                     "context_window": get_context_window(name),
-                    "capabilities": get_model_capabilities(name),
+                    "capabilities": get_model_capabilities(name, provider),
                     "agent_capable": False,
                 }
                 for name in selectable
@@ -578,7 +600,7 @@ def provider_status(provider: str) -> dict:
                     "name": item,
                     "family": infer_model_family(item, provider),
                     "context_window": get_context_window(item),
-                    "capabilities": get_model_capabilities(item),
+                    "capabilities": get_model_capabilities(item, provider),
                     "agent_capable": is_agent_capable_model(item, infer_model_family(item, provider)),
                 }
                 for item in selectable
@@ -603,7 +625,7 @@ def provider_status(provider: str) -> dict:
         "model": model,
         "model_family": infer_model_family(model, provider),
         "configured_models": configured,
-        "model_capabilities": get_model_capabilities(model),
+        "model_capabilities": get_model_capabilities(model, provider),
         "agent_capable": is_agent_capable_model(model, provider),
         "selectable_models": selectable,
         "selectable_model_details": [
@@ -611,7 +633,7 @@ def provider_status(provider: str) -> dict:
                 "name": item,
                 "family": infer_model_family(item, provider),
                 "context_window": get_context_window(item),
-                "capabilities": get_model_capabilities(item),
+                "capabilities": get_model_capabilities(item, provider),
                 "agent_capable": is_agent_capable_model(item, infer_model_family(item, provider)),
             }
             for item in selectable

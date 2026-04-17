@@ -102,48 +102,51 @@ def _persist_plan_snapshot(
     if not run_id:
         return
     db_path = _planner_db_path(state)
-    upsert_execution_plan(
-        plan_id,
-        run_id=run_id,
-        intent_id=str(state.get("selected_intent_id", "")).strip(),
-        version=plan_version,
-        status=planning_status,
-        approval_status=str(state.get("plan_approval_status", "")).strip() or "not_started",
-        needs_clarification=bool(state.get("plan_needs_clarification", False)),
-        objective=str(state.get("current_objective", state.get("user_query", ""))).strip(),
-        summary=str(plan_data.get("summary", "")).strip(),
-        plan_markdown=plan_md,
-        plan_data=plan_data,
-        metadata={
-            "execution_note": execution_note,
-            "clarification_questions": list(plan_data.get("clarification_questions", []) or []),
-        },
-        db_path=db_path,
-    )
-    replace_plan_tasks(
-        plan_id,
-        run_id,
-        list(plan_data.get("execution_steps", plan_data.get("steps", [])) or []),
-        db_path=db_path,
-    )
-    insert_orchestration_event(
-        {
-            "run_id": run_id,
-            "plan_id": plan_id,
-            "subject_type": "plan",
-            "subject_id": plan_id,
-            "event_type": "plan.generated",
-            "status": planning_status,
-            "source": "planner_agent",
-            "payload": {
-                "plan_version": plan_version,
-                "step_count": len(plan_data.get("execution_steps", plan_data.get("steps", [])) or []),
-                "approval_status": state.get("plan_approval_status", ""),
-                "needs_clarification": bool(state.get("plan_needs_clarification", False)),
+    try:
+        upsert_execution_plan(
+            plan_id,
+            run_id=run_id,
+            intent_id=str(state.get("selected_intent_id", "")).strip(),
+            version=plan_version,
+            status=planning_status,
+            approval_status=str(state.get("plan_approval_status", "")).strip() or "not_started",
+            needs_clarification=bool(state.get("plan_needs_clarification", False)),
+            objective=str(state.get("current_objective", state.get("user_query", ""))).strip(),
+            summary=str(plan_data.get("summary", "")).strip(),
+            plan_markdown=plan_md,
+            plan_data=plan_data,
+            metadata={
+                "execution_note": execution_note,
+                "clarification_questions": list(plan_data.get("clarification_questions", []) or []),
             },
-        },
-        db_path=db_path,
-    )
+            db_path=db_path,
+        )
+        replace_plan_tasks(
+            plan_id,
+            run_id,
+            list(plan_data.get("execution_steps", plan_data.get("steps", [])) or []),
+            db_path=db_path,
+        )
+        insert_orchestration_event(
+            {
+                "run_id": run_id,
+                "plan_id": plan_id,
+                "subject_type": "plan",
+                "subject_id": plan_id,
+                "event_type": "plan.generated",
+                "status": planning_status,
+                "source": "planner_agent",
+                "payload": {
+                    "plan_version": plan_version,
+                    "step_count": len(plan_data.get("execution_steps", plan_data.get("steps", [])) or []),
+                    "approval_status": state.get("plan_approval_status", ""),
+                    "needs_clarification": bool(state.get("plan_needs_clarification", False)),
+                },
+            },
+            db_path=db_path,
+        )
+    except Exception as exc:
+        logger.warning("Planner persistence skipped: %s", exc)
 
 
 def _planner_provider_snapshot() -> dict[str, str]:

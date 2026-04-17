@@ -66,6 +66,184 @@ function formatRelTime(dateStr) {
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
+function logTimestampMs(value = '') {
+  const raw = String(value || '').trim()
+  if (!raw) return Number.NaN
+  const direct = Date.parse(raw)
+  if (Number.isFinite(direct)) return direct
+  const normalized = raw.replace(' ', 'T').replace(',', '.')
+  const parsed = Date.parse(normalized)
+  return Number.isFinite(parsed) ? parsed : Number.NaN
+}
+
+function providerDisplayLabel(provider = '') {
+  const normalized = String(provider || '').trim().toLowerCase()
+  if (!normalized) return 'Model'
+  if (normalized === 'ollama') return 'Local'
+  if (normalized === 'xai') return 'xAI'
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1)
+}
+
+function hasNativeWebSearchCapability(provider = '', model = '', capabilities = null) {
+  if (capabilities && Object.prototype.hasOwnProperty.call(capabilities, 'native_web_search')) {
+    return !!capabilities.native_web_search
+  }
+  const normalizedProvider = String(provider || '').trim().toLowerCase()
+  if (normalizedProvider !== 'openai') return false
+  const name = String(model || '').trim().toLowerCase()
+  if (!name || name.includes('gpt-4.1-nano')) return false
+  if (name.includes('deep-research')) return true
+  return ['gpt-5', 'gpt-4o', 'gpt-4.1', 'o3', 'o4-'].some((needle) => name.includes(needle))
+}
+
+function synthesizeDeepResearchOption(rawValue, modelInventory) {
+  const resolved = resolveSelectedModel(rawValue)
+  if (!resolved.provider || !resolved.model) return null
+  const capabilities = {
+    native_web_search: hasNativeWebSearchCapability(resolved.provider, resolved.model),
+  }
+  return {
+    value: `${resolved.provider}/${resolved.model}`,
+    provider: resolved.provider,
+    model: resolved.model,
+    label: resolved.label,
+    shortLabel: `${providerDisplayLabel(resolved.provider)} · ${resolved.model}`,
+    isLocal: resolved.isLocal,
+    ready: true,
+    contextWindow: resolveContextWindow(rawValue, modelInventory),
+    capabilities,
+    note: '',
+  }
+}
+
+function buildDeepResearchModelOptions(modelInventory, inheritedModel = '') {
+  const providers = Array.isArray(modelInventory?.providers) ? modelInventory.providers : []
+  const options = []
+  const seen = new Set()
+  for (const providerEntry of providers) {
+    const provider = String(providerEntry?.provider || '').trim().toLowerCase()
+    if (!provider) continue
+    const ready = provider === 'ollama' ? !!providerEntry?.ready : providerEntry?.ready !== false
+    const details = Array.isArray(providerEntry?.selectable_model_details) && providerEntry.selectable_model_details.length
+      ? providerEntry.selectable_model_details
+      : (String(providerEntry?.model || '').trim()
+        ? [{
+            name: String(providerEntry.model).trim(),
+            context_window: Number(providerEntry?.context_window || 0),
+            capabilities: providerEntry?.model_capabilities || {},
+          }]
+        : [])
+    for (const detail of details) {
+      const model = String(detail?.name || '').trim()
+      if (!model) continue
+      const value = `${provider}/${model}`
+      if (seen.has(value)) continue
+      seen.add(value)
+      const detailCapabilities = (detail?.capabilities && typeof detail.capabilities === 'object')
+        ? detail.capabilities
+        : {}
+      options.push({
+        value,
+        provider,
+        model,
+        label: `${providerDisplayLabel(provider)} · ${model}`,
+        shortLabel: `${providerDisplayLabel(provider)} · ${model}`,
+        isLocal: provider === 'ollama',
+        ready,
+        contextWindow: Number(detail?.context_window || providerEntry?.context_window || 0),
+        capabilities: {
+          ...detailCapabilities,
+          native_web_search: hasNativeWebSearchCapability(provider, model, detailCapabilities),
+        },
+        note: String(providerEntry?.note || '').trim(),
+      })
+    }
+  }
+  const inheritedOption = synthesizeDeepResearchOption(inheritedModel, modelInventory)
+  if (inheritedOption && !seen.has(inheritedOption.value)) options.unshift(inheritedOption)
+  return options
+}
+
+function deepResearchModelDisabledReason(option, webSearchEnabled) {
+  if (!option) return 'Choose a model.'
+  if (!option.ready) {
+    if (option.provider === 'ollama') return 'Local model runtime is not ready.'
+    return option.note || `${providerDisplayLabel(option.provider)} is not configured.`
+  }
+  const modelName = String(option.model || '').trim().toLowerCase()
+  if (modelName.includes('image-')) return 'Image-only models are not supported for report writing.'
+  if (Number(option.contextWindow || 0) > 0 && Number(option.contextWindow || 0) < 32000) {
+    return 'Context window is too small for long-form deep research.'
+  }
+  return ''
+}
+
+function scoreDeepResearchOption(option, { webSearchEnabled = true, preferredValue = '' } = {}) {
+  if (!option) return Number.NEGATIVE_INFINITY
+  let score = 0
+  if (option.value === preferredValue) score += 1000
+  if (!webSearchEnabled && option.isLocal) score += 240
+  if (webSearchEnabled && option.provider === 'openai') score += 240
+  if (webSearchEnabled && hasNativeWebSearchCapability(option.provider, option.model, option.capabilities)) score += 120
+  const name = String(option.model || '').trim().toLowerCase()
+  if (name.includes('gpt-5')) score += 160
+  else if (name.includes('o3')) score += 145
+  else if (name.includes('gpt-4.1')) score += 135
+  else if (name.includes('gpt-4o')) score += 125
+  else if (name.includes('claude')) score += 110
+  else if (name.includes('gemini')) score += 100
+  else if (name.includes('grok')) score += 95
+  else if (name.includes('llama') || name.includes('qwen') || name.includes('mistral')) score += 80
+  score += Math.min(Number(option.contextWindow || 0), 2_000_000) / 20_000
+  return score
+}
+
+function resolveDeepResearchModelSelection({ requestedValue = '', inheritedValue = '', modelInventory = null, webSearchEnabled = true }) {
+  const options = buildDeepResearchModelOptions(modelInventory, inheritedValue)
+  const optionByValue = new Map(options.map((option) => [option.value, option]))
+  const requestedOption = requestedValue
+    ? (optionByValue.get(requestedValue) || synthesizeDeepResearchOption(requestedValue, modelInventory))
+    : null
+  const inheritedOption = inheritedValue
+    ? (optionByValue.get(inheritedValue) || synthesizeDeepResearchOption(inheritedValue, modelInventory))
+    : null
+  const optionsWithState = options.map((option) => ({
+    ...option,
+    disabledReason: deepResearchModelDisabledReason(option, webSearchEnabled),
+  }))
+  const enabledOptions = optionsWithState.filter((option) => !option.disabledReason)
+  const requestedReason = deepResearchModelDisabledReason(requestedOption, webSearchEnabled)
+  const inheritedReason = deepResearchModelDisabledReason(inheritedOption, webSearchEnabled)
+  const recommendedOption = enabledOptions.length
+    ? [...enabledOptions].sort((left, right) => (
+      scoreDeepResearchOption(right, { webSearchEnabled, preferredValue: inheritedValue })
+      - scoreDeepResearchOption(left, { webSearchEnabled, preferredValue: inheritedValue })
+    ))[0]
+    : null
+  const effectiveOption = requestedOption && !requestedReason
+    ? requestedOption
+    : inheritedOption && !inheritedReason
+      ? inheritedOption
+      : recommendedOption
+  const effectiveSource = requestedOption && !requestedReason
+    ? 'explicit'
+    : inheritedOption && !inheritedReason
+      ? 'header'
+      : recommendedOption
+        ? 'recommended'
+        : 'none'
+  return {
+    options: optionsWithState,
+    requestedOption,
+    requestedReason,
+    inheritedOption,
+    inheritedReason,
+    recommendedOption,
+    effectiveOption,
+    effectiveSource,
+  }
+}
+
 // ─── Chat-local state ────────────────────────────────────────────────────────
 const initChat = {
   messages: [],          // [{id,role,content,steps,status,runId,artifacts,progress,ts}]
@@ -150,9 +328,17 @@ function chatReducer(s, a) {
         }
         if (!item.text) return m
         const prev = Array.isArray(m.logs) ? m.logs : []
-        const last = prev[0]
-        if (last && last.text === item.text && last.ts === item.ts) return m
-        return { ...m, logs: [item, ...prev].slice(0, 40) }
+        if (prev.some((entry) => entry && entry.text === item.text && entry.ts === item.ts)) return m
+        const next = [...prev, item]
+          .sort((left, right) => {
+            const leftMs = logTimestampMs(left?.ts || left?.timestamp || '')
+            const rightMs = logTimestampMs(right?.ts || right?.timestamp || '')
+            if (Number.isFinite(leftMs) && Number.isFinite(rightMs) && leftMs !== rightMs) return leftMs - rightMs
+            if (Number.isFinite(leftMs) !== Number.isFinite(rightMs)) return Number.isFinite(leftMs) ? -1 : 1
+            return String(left?.ts || left?.timestamp || '').localeCompare(String(right?.ts || right?.timestamp || ''))
+          })
+          .slice(-40)
+        return { ...m, logs: next }
       })
       return { ...s, messages: msgs }
     }
@@ -365,7 +551,7 @@ function formatDuration(totalSeconds) {
 function summarizeLogFeed(logs = []) {
   const items = Array.isArray(logs) ? logs : []
   if (!items.length) return 'Waiting for execution log output...'
-  const latest = String(items[0]?.text || '').trim()
+  const latest = String(items[items.length - 1]?.text || '').trim()
   if (!latest) return `${items.length} log update${items.length === 1 ? '' : 's'} captured`
   const clipped = latest.length > 120 ? `${latest.slice(0, 117)}...` : latest
   return `${items.length} log update${items.length === 1 ? '' : 's'} captured. Latest: ${clipped}`
@@ -430,6 +616,10 @@ function liveProgressLabel(item = null) {
 
 function isPendingRunStatus(status) {
   return ['thinking', 'streaming', 'awaiting'].includes(String(status || '').trim().toLowerCase())
+}
+
+function isStreamingRunStatus(status) {
+  return ['thinking', 'streaming'].includes(String(status || '').trim().toLowerCase())
 }
 
 function failureMessageForRecoveredRun(runId, status = '') {
@@ -1101,6 +1291,7 @@ function attachmentPreviewSrc(item) {
 // ─── Deep Research default settings ─────────────────────────────────────────
 const DR_DEFAULTS = {
   pages: 25,
+  researchModel: '',
   citationStyle: 'apa',
   dateRange: 'all_time',
   maxSources: 0,
@@ -1150,8 +1341,19 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   const selectedModelMeta = resolveSelectedModel(appState.selectedModel)
   const isSimpleStudioChat = studioMode && chat.mode === 'chat'
   const modelInventory = appState.modelInventory
+  const deepResearchModelState = useMemo(() => resolveDeepResearchModelSelection({
+    requestedValue: dr.researchModel,
+    inheritedValue: appState.selectedModel || '',
+    modelInventory,
+    webSearchEnabled: !!dr.webSearchEnabled,
+  }), [dr.researchModel, dr.webSearchEnabled, appState.selectedModel, modelInventory])
+  const effectiveDeepResearchModel = deepResearchModelState.effectiveOption
+  const composerModelRaw = chat.mode === 'research'
+    ? (effectiveDeepResearchModel?.value || appState.selectedModel || '')
+    : (appState.selectedModel || '')
+  const composerModelMeta = resolveSelectedModel(composerModelRaw)
   const selectedModelAgentCapable = resolveAgentCapability(appState.selectedModel, modelInventory)
-  const contextLimit = resolveContextWindow(appState.selectedModel, modelInventory)
+  const contextLimit = resolveContextWindow(composerModelRaw, modelInventory)
   const payloadPreview = useMemo(() => {
     const draftText = String(input || '').trim()
     const body = buildPayload(
@@ -1166,19 +1368,36 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       mcpEnabled,
     )
     body.history = buildSimpleHistory(chat.messages, 14)
-    if (appState.selectedModel) {
-      const selected = resolveSelectedModel(appState.selectedModel)
+    const activePayloadModel = chat.mode === 'research'
+      ? effectiveDeepResearchModel
+      : (appState.selectedModel ? resolveSelectedModel(appState.selectedModel) : null)
+    if (activePayloadModel) {
+      const selected = activePayloadModel
       if (selected.provider) body.provider = selected.provider
       if (selected.model) body.model = selected.model
+    }
+    if (chat.mode === 'research' && effectiveDeepResearchModel?.model) {
+      body.research_model = effectiveDeepResearchModel.model
     }
     body.context_limit = contextLimit
     if (isSimpleStudioChat) body.stream = true
     return body
-  }, [input, chatId, appState.projectRoot, chat.mode, dr, attachments, studioMode, mcpEnabled, chat.messages, appState.selectedModel, isSimpleStudioChat, contextLimit])
+  }, [input, chatId, appState.projectRoot, chat.mode, dr, attachments, studioMode, mcpEnabled, chat.messages, appState.selectedModel, isSimpleStudioChat, contextLimit, effectiveDeepResearchModel])
   const estimatedContextTokens = estimateObjectTokens(payloadPreview)
   const contextPct = Math.min(100, Math.round((estimatedContextTokens / Math.max(contextLimit, 1)) * 100))
   const stickyChecklistMsg = useMemo(() => latestChecklistMessage(chat.messages), [chat.messages])
   const stickyChecklist = Array.isArray(stickyChecklistMsg?.checklist) ? stickyChecklistMsg.checklist : []
+  const latestStreamingRunMsg = useMemo(() => (
+    [...(chat.messages || [])].reverse().find((msg) => (
+      msg?.role === 'assistant'
+      && String(msg?.runId || '').trim()
+      && isStreamingRunStatus(msg?.status)
+    )) || null
+  ), [chat.messages])
+  const activeRunId = String(chat.activeRunId || appState.activeRunId || latestStreamingRunMsg?.runId || '').trim()
+  const awaitingRunId = String(chat.awaitingContext?.runId || '').trim()
+  const stopTargetRunId = activeRunId || awaitingRunId
+  const composerRunActive = !chat.awaitingContext && !!activeRunId
   const inlineAwaiting = shouldInlineAwaitingContext(chat.awaitingContext)
   const displayableAwaitingContext = hasDisplayableAwaitingContext(chat.awaitingContext)
   const hasMessages = chat.messages.length > 0
@@ -1198,6 +1417,16 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     if (dr.kbId) return indexedResearchKbs.find(kb => kb.id === dr.kbId) || null
     return activeResearchKb
   }, [dr.kbEnabled, dr.kbId, indexedResearchKbs, activeResearchKb])
+
+  useEffect(() => {
+    if (!dr.researchModel) return
+    if (!deepResearchModelState.requestedReason) return
+    setDr((current) => (
+      current.researchModel === dr.researchModel
+        ? { ...current, researchModel: '' }
+        : current
+    ))
+  }, [dr.researchModel, deepResearchModelState.requestedReason])
 
   const loadResearchKbs = useCallback(async () => {
     try {
@@ -1227,19 +1456,56 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     return () => { cancelled = true }
   }, [apiBase])
   const planKeywordsDetected = /\b(plan|roadmap|outline|steps|milestones|strategy)\b/i.test(input)
-  const showPlanSuggestion = minimalStudio && selectedModelAgentCapable && !chat.streaming && chat.mode === 'chat' && planKeywordsDetected
+  const showPlanSuggestion = minimalStudio && selectedModelAgentCapable && !composerRunActive && chat.mode === 'chat' && planKeywordsDetected
   const showActiveWorkflowChip = minimalStudio && chat.mode !== 'chat'
+  const resolveArtifactActionUrl = useCallback((item, runId, action = 'download') => {
+    const direct = String(
+      action === 'view'
+        ? (item?.viewUrl || item?.view_url || '')
+        : (item?.downloadUrl || item?.download_url || ''),
+    ).trim()
+    if (direct) {
+      try {
+        return new URL(direct, apiBase || window.location.origin).toString()
+      } catch (_) {
+        return direct
+      }
+    }
+    const resolvedRunId = String(runId || '').trim()
+    const artifactName = String(item?.name || item?.label || basename(item?.path || '')).trim()
+    if (!resolvedRunId || !artifactName) return ''
+    const base = String(apiBase || '').replace(/\/$/, '')
+    return `${base}/api/artifacts/${action}?run_id=${encodeURIComponent(resolvedRunId)}&name=${encodeURIComponent(artifactName)}`
+  }, [apiBase])
   const openArtifact = useCallback(async (item) => {
     const filePath = String(item?.path || '').trim()
     if (!filePath) return
     appDispatch({ type: 'SET_VIEW', view: 'developer' })
     await openFile(filePath)
   }, [appDispatch, openFile])
+  const downloadArtifact = useCallback((item, runId) => {
+    const url = resolveArtifactActionUrl(item, runId, 'download')
+    if (!url) return
+    const link = document.createElement('a')
+    link.href = url
+    const artifactName = String(item?.name || item?.label || '').trim()
+    if (artifactName) link.setAttribute('download', artifactName)
+    link.rel = 'noopener'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+  }, [resolveArtifactActionUrl])
   const reviewArtifact = useCallback((item) => {
     const filePath = String(item?.path || '').trim()
     if (!filePath) return
     setDiffPreviewPath(filePath)
   }, [])
+  const clearActiveRunState = useCallback(() => {
+    dispatch({ type: 'SET_STREAMING', val: false })
+    dispatch({ type: 'SET_RUN', id: null })
+    appDispatch({ type: 'SET_STREAMING', streaming: false })
+    appDispatch({ type: 'SET_ACTIVE_RUN', runId: null })
+  }, [appDispatch])
 
   // Close the SSE stream when the panel unmounts (e.g. explicit new-chat remount)
   useEffect(() => {
@@ -1319,6 +1585,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
               content: pendingMsg.lastError || failureMessageForRecoveredRun(runId),
             },
           })
+          clearActiveRunState()
           return
         }
 
@@ -1377,6 +1644,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             : buildFailedMessagePatch(data, runId, status, pendingMsg),
         })
         dispatch({ type: 'CLEAR_AWAITING' })
+        clearActiveRunState()
       } catch (_) {
         if (cancelled) return
         dispatch({
@@ -1389,11 +1657,12 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           },
         })
         dispatch({ type: 'CLEAR_AWAITING' })
+        clearActiveRunState()
       }
     })()
 
     return () => { cancelled = true }
-  }, [chat.messages, chat.streaming, appState.activeRunId, apiBase, appDispatch])
+  }, [chat.messages, chat.streaming, appState.activeRunId, apiBase, appDispatch, clearActiveRunState])
 
   useEffect(() => {
     if ((chat.mode === 'agent' || chat.mode === 'plan') && !selectedModelAgentCapable) {
@@ -1415,8 +1684,8 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   }, [composerMenuOpen])
 
   useEffect(() => {
-    if (chat.streaming) setComposerMenuOpen(false)
-  }, [chat.streaming])
+    if (composerRunActive) setComposerMenuOpen(false)
+  }, [composerRunActive])
 
   useEffect(() => {
     const entries = chat.messages
@@ -1482,7 +1751,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   }, [saveCurrentSession])
 
   const compactContext = useCallback(async () => {
-    if (!chat.messages.length || chat.streaming) return
+    if (!chat.messages.length || composerRunActive) return
     saveCurrentSession()
     try {
       const resp = await fetch(`${apiBase}/api/chat/compact`, {
@@ -1523,7 +1792,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       dispatch({ type: 'ADD_MSG', msg: note })
       saveHistory([...chat.messages, note])
     }
-  }, [apiBase, chat.messages, chat.streaming, chatId, contextLimit, saveCurrentSession])
+  }, [apiBase, chat.messages, composerRunActive, chatId, contextLimit, saveCurrentSession])
 
   const loadSession = useCallback((session) => {
     esRef.current?.close()
@@ -1638,7 +1907,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
   // ── Send message ────────────────────────────────────────────────────────────
   const send = useCallback(async (text, isResume = false) => {
     const msg = (typeof text === 'string' ? text.trim() : '') || input.trim()
-    if (!msg || chat.streaming) return
+    if (!msg || composerRunActive) return
     if (!isResume && chat.mode === 'research' && dr.kbEnabled) {
       if (!researchKbs.length) {
         window.alert('No knowledge bases found. Create and index one in Super-RAG or `kendr rag` first.')
@@ -1765,10 +2034,18 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             channel:     'webchat',
           }
         : buildPayload(msg, chatId, runId, appState.projectRoot, chat.mode, dr, sentAttachments, studioMode, mcpEnabled)
-      if (!isResume && appState.selectedModel) {
-        const selected = resolveSelectedModel(appState.selectedModel)
+      const activePayloadModel = !isResume
+        ? (chat.mode === 'research'
+          ? effectiveDeepResearchModel
+          : (appState.selectedModel ? resolveSelectedModel(appState.selectedModel) : null))
+        : null
+      if (!isResume && activePayloadModel) {
+        const selected = activePayloadModel
         if (selected.provider) body.provider = selected.provider
         if (selected.model) body.model = selected.model
+      }
+      if (!isResume && chat.mode === 'research' && effectiveDeepResearchModel?.model) {
+        body.research_model = effectiveDeepResearchModel.model
       }
       if (!isResume) {
         body.history = buildSimpleHistory(chat.messages, 14)
@@ -1786,8 +2063,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         if (!resp.ok) {
           refreshModelInventory(true)
           dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: data.error || data.detail || resp.statusText, status: 'error', runId: null } })
-          dispatch({ type: 'SET_STREAMING', val: false })
-          appDispatch({ type: 'SET_STREAMING', streaming: false })
+          clearActiveRunState()
           return
         }
 
@@ -1800,8 +2076,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           return
         } else {
           dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: data.answer || '', status: 'done', runId: null, artifacts: [] } })
-          dispatch({ type: 'SET_STREAMING', val: false })
-          appDispatch({ type: 'SET_STREAMING', streaming: false })
+          clearActiveRunState()
           return
         }
       }
@@ -1816,8 +2091,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         const err = await resp.json().catch(() => ({}))
         refreshModelInventory(true)
         dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: err.error || err.detail || resp.statusText, status: 'error' } })
-        dispatch({ type: 'SET_STREAMING', val: false })
-        appDispatch({ type: 'SET_STREAMING', streaming: false })
+        clearActiveRunState()
         return
       }
 
@@ -1832,10 +2106,9 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     } catch (err) {
       refreshModelInventory(true)
       dispatch({ type: 'UPD_MSG', id: asstMsgId, patch: { content: `Cannot reach backend: ${err.message}`, status: 'error' } })
-      dispatch({ type: 'SET_STREAMING', val: false })
-      appDispatch({ type: 'SET_STREAMING', streaming: false })
+      clearActiveRunState()
     }
-  }, [input, chat.streaming, chat.awaitingContext, chat.mode, apiBase, appState.projectRoot, appState.selectedModel, chatId, dr, attachments, studioMode, isSimpleStudioChat, mcpEnabled, appDispatch, refreshModelInventory, contextLimit, researchKbs, activeResearchKb])
+  }, [input, composerRunActive, chat.awaitingContext, chat.mode, apiBase, appState.projectRoot, appState.selectedModel, chatId, dr, attachments, studioMode, isSimpleStudioChat, mcpEnabled, appDispatch, refreshModelInventory, contextLimit, researchKbs, activeResearchKb, clearActiveRunState])
 
   // ── SSE stream ──────────────────────────────────────────────────────────────
   const openStream = useCallback((runId, asstMsgId) => {
@@ -1873,9 +2146,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
 
     const finishStream = () => {
       closeClean()
-      dispatch({ type: 'SET_STREAMING', val: false })
-      appDispatch({ type: 'SET_STREAMING', streaming: false })
-      appDispatch({ type: 'SET_ACTIVE_RUN', runId: null })
+      clearActiveRunState()
     }
 
     const pushLogEntry = (item) => {
@@ -2009,7 +2280,17 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       try {
         const resp = await fetch(`${apiBase}/api/runs/${encodeURIComponent(runId)}`)
         const data = await resp.json().catch(() => ({}))
-        if (!resp.ok || closed) return
+        if (closed) return
+        if (!resp.ok) {
+          dispatch({
+            type: 'UPD_MSG',
+            id: asstMsgId,
+            patch: buildFailedMessagePatch(data, runId, 'failed', existingMsg || {}),
+          })
+          dispatch({ type: 'CLEAR_AWAITING' })
+          finishStream()
+          return
+        }
         dispatch({
           type: 'UPD_MSG',
           id: asstMsgId,
@@ -2294,7 +2575,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       })
       refreshRunSnapshot()
     }
-  }, [apiBase, appDispatch, refreshModelInventory, chat.messages])
+  }, [apiBase, appDispatch, refreshModelInventory, chat.messages, clearActiveRunState])
 
   // Re-attach to an active background run when returning to chat view.
   useEffect(() => {
@@ -2306,13 +2587,24 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     let cancelled = false
     ;(async () => {
       try {
+        const existing = (chat.messages || []).find(m => String(m.runId || '') === activeRunId)
         const resp = await fetch(`${apiBase}/api/runs/${encodeURIComponent(activeRunId)}`)
         const data = await resp.json().catch(() => ({}))
         if (cancelled) return
-        if (!resp.ok) return
+        if (!resp.ok) {
+          if (existing?.id) {
+            dispatch({
+              type: 'UPD_MSG',
+              id: existing.id,
+              patch: buildFailedMessagePatch(data, activeRunId, 'failed', existing),
+            })
+          }
+          dispatch({ type: 'CLEAR_AWAITING' })
+          clearActiveRunState()
+          return
+        }
         const status = runSnapshotStatus(data)
         if (TERMINAL_RUN_STATUSES.has(status)) {
-          const existing = (chat.messages || []).find(m => String(m.runId || '') === activeRunId)
           if (existing?.id) {
             dispatch({
               type: 'UPD_MSG',
@@ -2323,13 +2615,11 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             })
           }
           dispatch({ type: 'CLEAR_AWAITING' })
-          appDispatch({ type: 'SET_STREAMING', streaming: false })
-          appDispatch({ type: 'SET_ACTIVE_RUN', runId: null })
+          clearActiveRunState()
           return
         }
 
         let asstMsgId = ''
-        const existing = (chat.messages || []).find(m => String(m.runId || '') === activeRunId)
         if (status === 'awaiting_user_input' && !buildAwaitingState(data, existing || {})) {
           if (existing?.id) {
             dispatch({
@@ -2339,8 +2629,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             })
           }
           dispatch({ type: 'CLEAR_AWAITING' })
-          appDispatch({ type: 'SET_STREAMING', streaming: false })
-          appDispatch({ type: 'SET_ACTIVE_RUN', runId: null })
+          clearActiveRunState()
           return
         }
         if (existing?.id) {
@@ -2413,27 +2702,29 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     })()
 
     return () => { cancelled = true }
-  }, [appState.activeRunId, apiBase, openStream, chat.messages, chat.mode, appDispatch])
+  }, [appState.activeRunId, apiBase, openStream, chat.messages, chat.mode, appDispatch, clearActiveRunState])
 
   // ── Stop run ────────────────────────────────────────────────────────────────
   const stopRun = useCallback(async () => {
+    const runId = String(stopTargetRunId || '').trim()
+    if (!runId) return
     esRef.current?.close()
-    // Mark the in-progress bubble as done so it doesn't stay stuck in "Running"
-    const activeMsg = chat.messages.find(m => m.status === 'streaming' || m.status === 'thinking')
+    // Mark the matching in-progress bubble as done so it doesn't stay stuck in "Running"
+    const activeMsg = [...(chat.messages || [])].reverse().find((msg) => (
+      String(msg?.runId || '').trim() === runId && isPendingRunStatus(msg?.status)
+    ))
     if (activeMsg) {
       dispatch({ type: 'UPD_MSG', id: activeMsg.id, patch: { status: 'done' } })
     }
     dispatch({ type: 'CLEAR_AWAITING' })
-    if (chat.activeRunId) {
+    if (runId) {
       await fetch(`${apiBase}/api/runs/stop`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ run_id: chat.activeRunId })
+        body: JSON.stringify({ run_id: runId })
       }).catch(() => {})
     }
-    dispatch({ type: 'SET_STREAMING', val: false })
-    appDispatch({ type: 'SET_STREAMING', streaming: false })
-    appDispatch({ type: 'SET_ACTIVE_RUN', runId: null })
-  }, [chat.activeRunId, chat.messages, apiBase, appDispatch])
+    clearActiveRunState()
+  }, [stopTargetRunId, chat.messages, apiBase, clearActiveRunState])
 
   const submitSkillApproval = useCallback(async (scope, note = '') => {
     const ctx = chat.awaitingContext || {}
@@ -2471,6 +2762,9 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
 
   const isOnline = appState.backendStatus === 'running'
   const studioModelLabel = (() => {
+    if (chat.mode === 'research' && effectiveDeepResearchModel?.model) {
+      return `Research · ${effectiveDeepResearchModel.shortLabel || composerModelMeta.label}`
+    }
     if (selectedModelMeta.model) return `Selected · ${selectedModelMeta.label}`
     const provider = String(modelInventory?.configured_provider || '').trim()
     const model = String(modelInventory?.configured_model || '').trim()
@@ -2545,7 +2839,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
     { id: 'research', label: '🔬 Deep Research' },
   ]
   const showLandingLayout = minimalStudio && !hasMessages
-  const composerBanner = chat.streaming
+  const composerBanner = composerRunActive
     ? 'Run active. Live execution log updates are streaming in the current run bubble. Stop the run before sending another message.'
     : displayableAwaitingContext
       ? 'Run paused for your input. Reply here to continue the same workflow.'
@@ -2557,7 +2851,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       {!hideHeader && <div className="kc-header">
         <div className="kc-logo">K<span>endr</span></div>
         <div className="kc-header-model" title={studioModelLabel}>
-          <span className={`kc-header-model-dot ${selectedModelMeta.isLocal || String(modelInventory?.configured_provider || '').toLowerCase() === 'ollama' ? 'local' : ''}`} />
+          <span className={`kc-header-model-dot ${composerModelMeta.isLocal || String(modelInventory?.configured_provider || '').toLowerCase() === 'ollama' ? 'local' : ''}`} />
           <span>{studioModelLabel}</span>
           {!studioMode && appState.projectRoot && <span className="kc-header-model-project">{basename(appState.projectRoot)}</span>}
         </div>
@@ -2615,7 +2909,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           {chat.messages.map(msg =>
             msg.role === 'user'
               ? <UserMessage key={msg.id} msg={msg} />
-              : <AssistantMessage key={msg.id} msg={msg} onQuickReply={(reply) => send(reply, true)} onSendSuggestion={(reply) => send(reply, true)} onOpenArtifact={openArtifact} onReviewArtifact={reviewArtifact} />
+              : <AssistantMessage key={msg.id} msg={msg} onQuickReply={(reply) => send(reply, true)} onSendSuggestion={(reply) => send(reply, true)} onOpenArtifact={openArtifact} onDownloadArtifact={downloadArtifact} onReviewArtifact={reviewArtifact} />
           )}
           <div ref={messagesEndRef} />
         </div>
@@ -2625,6 +2919,11 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             dr={dr}
             updateDr={updateDr}
             collapsed={dr.collapsed}
+            modelOptions={deepResearchModelState.options}
+            inheritedModel={deepResearchModelState.inheritedOption}
+            inheritedReason={deepResearchModelState.inheritedReason}
+            effectiveModel={deepResearchModelState.effectiveOption}
+            effectiveModelSource={deepResearchModelState.effectiveSource}
             indexedKbs={indexedResearchKbs}
             activeKb={activeResearchKb}
             selectedKb={selectedResearchKb}
@@ -2688,7 +2987,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
       {/* ── Input area ── */}
       <div className="kc-input-area">
         {!!composerBanner && (
-          <div className={`kc-composer-state${chat.streaming ? ' kc-composer-state--running' : ' kc-composer-state--awaiting'}`}>
+          <div className={`kc-composer-state${composerRunActive ? ' kc-composer-state--running' : ' kc-composer-state--awaiting'}`}>
             {composerBanner}
           </div>
         )}
@@ -2696,8 +2995,8 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
           <div className="kc-attach-bar">
             {showInlineAttachmentTools && (
               <div className="kc-attach-actions">
-                <button className="kc-attach-btn" onClick={attachFiles} disabled={chat.streaming}>+ Files</button>
-                {studioMode && <button className="kc-attach-btn" onClick={attachFolder} disabled={chat.streaming}>+ Folder</button>}
+                <button className="kc-attach-btn" onClick={attachFiles} disabled={composerRunActive}>+ Files</button>
+                {studioMode && <button className="kc-attach-btn" onClick={attachFolder} disabled={composerRunActive}>+ Folder</button>}
                 {chat.mode === 'agent' || chat.mode === 'plan' ? (
                   <span
                     className={`kc-mcp-indicator${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-indicator--warn' : ''}`}
@@ -2711,7 +3010,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
                   <button
                     className={`kc-attach-btn kc-mcp-toggle${mcpEnabled ? ' kc-mcp-toggle--on' : ''}${mcpEnabled && mcpUndiscovered > 0 ? ' kc-mcp-toggle--warn' : ''}`}
                     onClick={() => setMcpEnabled(v => !v)}
-                    disabled={chat.streaming}
+                    disabled={composerRunActive}
                     title={
                       mcpEnabled && mcpUndiscovered > 0
                         ? `${mcpUndiscovered} server${mcpUndiscovered !== 1 ? 's have' : ' has'} no tools discovered — open MCP Settings to run discovery`
@@ -2754,7 +3053,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
                 />
               </div>
             </div>
-            <button className="kc-attach-btn" onClick={compactContext} title="Compact context and continue in a fresh backend session" disabled={chat.streaming}>
+            <button className="kc-attach-btn" onClick={compactContext} title="Compact context and continue in a fresh backend session" disabled={composerRunActive}>
               Compact
             </button>
           </div>
@@ -2779,7 +3078,7 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
         <div className="kc-input-row">
           {minimalStudio && (
             <div className="kc-composer-menu" ref={composerMenuRef}>
-              <button className="kc-composer-plus" onClick={() => setComposerMenuOpen((value) => !value)} title="Add files or tools" disabled={chat.streaming}>
+              <button className="kc-composer-plus" onClick={() => setComposerMenuOpen((value) => !value)} title="Add files or tools" disabled={composerRunActive}>
                 +
               </button>
               {composerMenuOpen && (
@@ -2861,22 +3160,22 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
             onPaste={handlePaste}
             onKeyDown={handleKey}
             rows={minimalStudio ? 1 : 3}
-            disabled={chat.streaming}
+            disabled={composerRunActive}
           />
           <button
-            className={`kc-send-btn ${chat.streaming ? 'kc-send-btn--stop' : ''}`}
-            onClick={chat.streaming ? () => stopRun() : () => send()}
-            disabled={!chat.streaming && !input.trim()}
-            title={chat.streaming ? 'Stop (sends cancellation)' : 'Send (Ctrl+Enter)'}
+            className={`kc-send-btn ${composerRunActive ? 'kc-send-btn--stop' : ''}`}
+            onClick={composerRunActive ? () => stopRun() : () => send()}
+            disabled={!composerRunActive && !input.trim()}
+            title={composerRunActive ? 'Stop active run' : 'Send (Ctrl+Enter)'}
           >
-            {chat.streaming ? 'Stop' : <SendIcon />}
+            {composerRunActive ? 'Stop' : <SendIcon />}
           </button>
         </div>
         {showInlineFlowStrip && (
           <div className="kc-flow-strip">
             <span className={`kc-flow-chip kc-flow-chip--${chat.mode}`}>{chat.mode === 'plan' ? 'Plan first' : chat.mode === 'agent' ? 'Agent run' : chat.mode === 'research' ? 'Research flow' : 'Quick answer'}</span>
             {!studioMode && appState.projectRoot && <span className="kc-flow-chip">Workspace · {basename(appState.projectRoot)}</span>}
-            <span className="kc-flow-chip">{selectedModelMeta.model ? selectedModelMeta.label : 'Backend auto'}</span>
+            <span className="kc-flow-chip">{composerModelMeta.model ? composerModelMeta.label : 'Backend auto'}</span>
             {chat.mode === 'plan' && <span className="kc-flow-chip kc-flow-chip--muted">waits before implement</span>}
           </div>
         )}
@@ -2886,7 +3185,22 @@ export default function ChatPanel({ fullWidth = false, hideHeader = false, studi
 }
 
 // ─── Deep Research Panel ──────────────────────────────────────────────────────
-function DeepResearchPanel({ dr, updateDr, collapsed = false, indexedKbs = [], activeKb = null, selectedKb = null, projectRoot = '', apiBase = '', refreshKbs = null }) {
+function DeepResearchPanel({
+  dr,
+  updateDr,
+  collapsed = false,
+  modelOptions = [],
+  inheritedModel = null,
+  inheritedReason = '',
+  effectiveModel = null,
+  effectiveModelSource = 'none',
+  indexedKbs = [],
+  activeKb = null,
+  selectedKb = null,
+  projectRoot = '',
+  apiBase = '',
+  refreshKbs = null,
+}) {
   const api = window.kendrAPI
   const [kbSetupState, setKbSetupState] = useState({ status: 'idle', message: '' })
 
@@ -3046,8 +3360,16 @@ function DeepResearchPanel({ dr, updateDr, collapsed = false, indexedKbs = [], a
           <span className="dr-panel-title">🔬 Deep Research Settings</span>
           <div className="dr-summary">
             <span className="dr-sum-pill">~{dr.pages}p</span>
+            {effectiveModel?.model && <span className="dr-sum-pill">{effectiveModel.model}</span>}
             <span className="dr-sum-pill">{dr.citationStyle.toUpperCase()}</span>
             <span className="dr-sum-pill">{dr.outputFormats.join('·')}</span>
+            {dr.webSearchEnabled && effectiveModel?.model && (
+              <span className="dr-sum-pill">
+                {hasNativeWebSearchCapability(effectiveModel.provider, effectiveModel.model, effectiveModel.capabilities)
+                  ? 'Native web'
+                  : 'Kendr search'}
+              </span>
+            )}
             {!dr.webSearchEnabled && <span className="dr-sum-pill dr-sum-warn">Local only</span>}
           </div>
           <span className="dr-collapse-btn">{dr.collapsed ? '▸' : '▾'}</span>
@@ -3066,6 +3388,48 @@ function DeepResearchPanel({ dr, updateDr, collapsed = false, indexedKbs = [], a
                   <option value={100}>~100 pages</option>
                 </select>
                 <div className="dr-note">Aiming near this length; citations and formatting can shift the final page count.</div>
+              </div>
+              <div className="dr-field">
+                <label className="dr-label">Deep Research Model</label>
+                <select
+                  className="dr-select"
+                  value={dr.researchModel || ''}
+                  onChange={e => updateDr({ researchModel: e.target.value })}
+                >
+                  <option value="">
+                    {inheritedModel?.shortLabel
+                      ? `Use selected chat model · ${inheritedModel.shortLabel}`
+                      : 'Use the chat header model'}
+                  </option>
+                  {modelOptions.map(option => (
+                    <option
+                      key={option.value}
+                      value={option.value}
+                      disabled={!!option.disabledReason}
+                    >
+                      {option.disabledReason
+                        ? `${option.shortLabel} — ${option.disabledReason}`
+                        : option.shortLabel}
+                    </option>
+                  ))}
+                </select>
+                <div className="dr-note">
+                  {effectiveModel
+                    ? `Active for Deep Research: ${effectiveModel.shortLabel}${effectiveModelSource === 'recommended' ? ' (recommended)' : effectiveModelSource === 'header' ? ' (from header model)' : ''}.`
+                    : 'No compatible Deep Research model is available with the current settings.'}
+                </div>
+                {dr.webSearchEnabled ? (
+                  <div className="dr-note">
+                    {effectiveModel && hasNativeWebSearchCapability(effectiveModel.provider, effectiveModel.model, effectiveModel.capabilities)
+                      ? 'This model can use native web search for Deep Research.'
+                      : 'This model will use Kendr web search fallback: Kendr gathers sources, then the selected model synthesizes the report.'}
+                  </div>
+                ) : (
+                  <div className="dr-note">Local-only runs can use local models or any configured provider with enough context.</div>
+                )}
+                {!dr.researchModel && inheritedReason && effectiveModel && (
+                  <div className="dr-note">The current chat-header model is incompatible here, so this run will fall back to {effectiveModel.shortLabel}.</div>
+                )}
               </div>
               <div className="dr-field">
                 <label className="dr-label">Citation Style</label>
@@ -3344,7 +3708,7 @@ function UserMessage({ msg }) {
 }
 
 // ─── Assistant message ────────────────────────────────────────────────────────
-function AssistantMessage({ msg, onQuickReply, onSendSuggestion, onOpenArtifact, onReviewArtifact }) {
+function AssistantMessage({ msg, onQuickReply, onSendSuggestion, onOpenArtifact, onDownloadArtifact, onReviewArtifact }) {
   const [copied, setCopied] = useState(false)
   const [nowMs, setNowMs] = useState(Date.now())
   const [logsExpanded, setLogsExpanded] = useState(true)
@@ -3446,7 +3810,7 @@ function AssistantMessage({ msg, onQuickReply, onSendSuggestion, onOpenArtifact,
         )}
 
         {showActivityCards && (
-          <RunArtifactCards cards={activityCards} onOpenItem={onOpenArtifact} onReviewItem={onReviewArtifact} />
+          <RunArtifactCards cards={activityCards} runId={msg.runId} onOpenItem={onOpenArtifact} onDownloadItem={onDownloadArtifact} onReviewItem={onReviewArtifact} />
         )}
 
         {msg.runId && ['thinking', 'streaming', 'awaiting'].includes(String(msg.status || '')) && (
@@ -3552,7 +3916,7 @@ function ExecutionLogPanel({ logs, expanded, onToggle }) {
             <div className="kc-log-empty">Waiting for execution log output...</div>
           ) : (
             <div className="kc-log-lines">
-              {items.slice(0, 18).map((item) => (
+              {items.slice(-18).map((item) => (
                 <div key={item.id} className="kc-log-line">
                   {item.clock && <span className="kc-log-clock">{item.clock}</span>}
                   <span className="kc-log-text">{item.text}</span>
@@ -3566,7 +3930,7 @@ function ExecutionLogPanel({ logs, expanded, onToggle }) {
   )
 }
 
-function RunArtifactCards({ cards, onOpenItem, onReviewItem }) {
+function RunArtifactCards({ cards, runId, onOpenItem, onDownloadItem, onReviewItem }) {
   return (
     <div className="kc-activity-grid">
       {cards.map((card) => (
@@ -3583,9 +3947,25 @@ function RunArtifactCards({ cards, onOpenItem, onReviewItem }) {
             )}
           </div>
           {Array.isArray(card.items) && card.items.length > 0 && (
-            <div className="kc-activity-card-items">
-              {card.items.slice(0, 3).map((item) => (
-                item?.path ? (
+            <div className={`kc-activity-card-items${card.kind === 'artifact' ? ' kc-activity-card-items--stack' : ''}`}>
+              {card.items.slice(0, card.kind === 'artifact' ? 6 : 3).map((item) => (
+                card.kind === 'artifact' ? (
+                  <div key={`${item.path || item.name || item.label}-${item.label}`} className="kc-activity-card-file">
+                    <span className="kc-activity-card-file-label">{item.label}</span>
+                    <div className="kc-activity-card-file-actions">
+                      {(runId || item?.downloadUrl) && (
+                        <button className="kc-activity-card-mini" onClick={() => onDownloadItem?.(item, runId)}>
+                          Download
+                        </button>
+                      )}
+                      {item?.path && (
+                        <button className="kc-activity-card-mini kc-activity-card-mini--ghost" onClick={() => onOpenItem?.(item)}>
+                          Open
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ) : item?.path ? (
                   <button key={`${item.path}-${item.label}`} className="kc-activity-card-item kc-activity-card-item--action" onClick={() => onOpenItem?.(item)}>
                     {item.label}
                   </button>

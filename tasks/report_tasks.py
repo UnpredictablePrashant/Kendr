@@ -60,6 +60,12 @@ def _collect_report_context(state: dict) -> dict:
         "final_output": state.get("final_output", ""),
         "search_summary": state.get("search_summary", ""),
         "research_result": state.get("research_result", ""),
+        "research_source_summary": state.get("research_source_summary", []),
+        "research_kb_used": state.get("research_kb_used", False),
+        "research_kb_name": state.get("research_kb_name", ""),
+        "research_kb_hit_count": state.get("research_kb_hit_count", 0),
+        "research_kb_warning": state.get("research_kb_warning", ""),
+        "deep_research_result_card": state.get("deep_research_result_card", {}),
         "excel_analysis": state.get("excel_analysis", ""),
         "report_target_pages": state.get("report_target_pages", 0),
         "review_reason": state.get("review_reason", ""),
@@ -87,6 +93,41 @@ def _collect_report_context(state: dict) -> dict:
     }
 
 
+def _result_card_section_body(card: dict) -> str:
+    if not isinstance(card, dict) or not card:
+        return ""
+
+    ordered_lines: list[str] = []
+    preferred_keys = [
+        ("kind", "Kind"),
+        ("title", "Title"),
+        ("query", "Query"),
+        ("mode", "Mode"),
+        ("web_search_enabled", "Web search enabled"),
+        ("local_sources", "Local sources"),
+        ("provided_urls", "Provided URLs"),
+        ("research_kb_used", "Knowledge base used"),
+        ("research_kb_name", "Knowledge base name"),
+        ("research_kb_hit_count", "Knowledge base hits"),
+        ("research_kb_warning", "Knowledge base warning"),
+    ]
+
+    for key, label in preferred_keys:
+        value = card.get(key)
+        if value in ("", None, [], {}):
+            continue
+        ordered_lines.append(f"- {label}: {value}")
+
+    for key, value in card.items():
+        if any(existing_key == key for existing_key, _ in preferred_keys):
+            continue
+        if value in ("", None, [], {}):
+            continue
+        ordered_lines.append(f"- {key}: {value}")
+
+    return "\n".join(ordered_lines)
+
+
 def _manual_report_fallback(title: str, context: dict) -> dict:
     summary = (
         context.get("final_output")
@@ -110,6 +151,12 @@ def _manual_report_fallback(title: str, context: dict) -> dict:
         sections.append({"heading": "Plan", "body": context["plan"]})
     if context.get("review_reason"):
         sections.append({"heading": "Review Notes", "body": context["review_reason"]})
+    result_card_body = _result_card_section_body(context.get("deep_research_result_card", {}))
+    if result_card_body:
+        sections.append({"heading": "Research Brief Card", "body": result_card_body})
+    source_summary = context.get("research_source_summary", [])
+    if isinstance(source_summary, list) and source_summary:
+        sections.append({"heading": "Research Sources", "body": "\n".join(str(item) for item in source_summary if str(item).strip())})
     return {
         "title": title,
         "summary": summary,

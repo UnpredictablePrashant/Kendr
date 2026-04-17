@@ -20,7 +20,7 @@ import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 _log = logging.getLogger("kendr.ui")
 from kendr.chat_context import (
@@ -32,6 +32,7 @@ from kendr.chat_context import (
 )
 from kendr.orchestration import state_awaiting_user_input
 from kendr.path_utils import bundled_resource_path, normalize_host_path_str
+from kendr.unicode_utils import safe_json_dumps, sanitize_text
 
 from tasks.setup_config_store import (
     apply_setup_env_defaults,
@@ -2744,6 +2745,8 @@ def _collect_artifacts(run_id: str, output_dir: str) -> tuple[list[dict], list[d
                         "name": fname,
                         "path": fp,
                         "size": os.path.getsize(fp),
+                        "download_url": f"/api/artifacts/download?run_id={quote(run_id)}&name={quote(fname)}",
+                        "view_url": f"/api/artifacts/view?run_id={quote(run_id)}&name={quote(fname)}",
                     })
     except Exception:
         pass
@@ -2824,6 +2827,9 @@ def _start_run_background(run_id: str, payload: dict) -> None:
                                 "size": os.path.getsize(fpath),
                                 "label": label,
                                 "ext": ext,
+                                "kind": "report",
+                                "download_url": f"/api/artifacts/download?run_id={quote(run_id)}&name={quote(fname)}",
+                                "view_url": f"/api/artifacts/view?run_id={quote(run_id)}&name={quote(fname)}",
                             })
                             existing_names.add(fname)
                             long_doc_exports.append({"ext": ext, "label": label, "name": fname})
@@ -13254,13 +13260,13 @@ class KendrUIHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _json(self, status: int, payload: dict | list) -> None:
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        body = safe_json_dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         path = getattr(self, "path", "")
         cors = any(path.startswith(p) for p in self._CORS_SAFE_PREFIXES)
         self._send(status, "application/json; charset=utf-8", body, cors=cors)
 
     def _html(self, status: int, content: str) -> None:
-        self._send(status, "text/html; charset=utf-8", content.encode("utf-8"), cors=False)
+        self._send(status, "text/html; charset=utf-8", sanitize_text(content).encode("utf-8"), cors=False)
 
     def _handle_docs(self) -> None:
         import re, html as _html_mod
@@ -14326,6 +14332,7 @@ strong { color: var(--text); }
                     "workflow_type", "deep_research_mode",
                     "execution_mode", "planner_mode",
                     "long_document_mode", "long_document_pages", "long_document_title",
+                    "research_model",
                     "research_output_formats", "research_citation_style",
                     "research_enable_plagiarism_check", "research_web_search_enabled", "research_date_range",
                     "research_sources", "research_max_sources", "research_checkpoint_enabled",
@@ -14686,7 +14693,7 @@ strong { color: var(--text); }
 
         def write_event(event_type: str, data: dict) -> bool:
             try:
-                msg = f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+                msg = f"event: {sanitize_text(event_type)}\ndata: {safe_json_dumps(data, ensure_ascii=False)}\n\n"
                 self.wfile.write(msg.encode("utf-8"))
                 self.wfile.flush()
                 return True
@@ -15048,7 +15055,7 @@ strong { color: var(--text); }
         self.end_headers()
 
         def emit(event: str, data: dict) -> None:
-            msg = "event: " + event + "\ndata: " + json.dumps(data) + "\n\n"
+            msg = "event: " + sanitize_text(event) + "\ndata: " + safe_json_dumps(data, ensure_ascii=False) + "\n\n"
             try:
                 self.wfile.write(msg.encode("utf-8"))
                 self.wfile.flush()

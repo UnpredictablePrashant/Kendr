@@ -29,6 +29,7 @@ class RuntimeRoutingTests(unittest.TestCase):
             patch("tasks.a2a_protocol.insert_message"),
             patch("tasks.a2a_protocol.upsert_task"),
             patch("tasks.a2a_protocol.insert_artifact"),
+            patch("kendr.runtime.append_privileged_audit_event"),
         ):
             runtime = AgentRuntime(build_registry())
             state = runtime.build_initial_state("Build an investor-focused analysis from the uploaded files.")
@@ -74,6 +75,7 @@ class RuntimeRoutingTests(unittest.TestCase):
             patch("tasks.a2a_protocol.insert_message"),
             patch("tasks.a2a_protocol.upsert_task"),
             patch("tasks.a2a_protocol.insert_artifact"),
+            patch("kendr.runtime.append_privileged_audit_event"),
         ):
             runtime = AgentRuntime(build_registry())
             state = runtime.build_initial_state("Create a funding report from the local drive files.")
@@ -630,6 +632,39 @@ class RuntimeRoutingTests(unittest.TestCase):
 
         self.assertEqual(routed_state["next_agent"], "__finish__")
         self.assertEqual(routed_state["final_output"], "Research completed.")
+
+    def test_reviewer_approval_does_not_restart_drive_informed_long_document_after_completion(self):
+        with (
+            patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
+            patch("tasks.a2a_protocol.upsert_agent_card"),
+            patch("tasks.a2a_protocol.insert_message"),
+            patch("tasks.a2a_protocol.upsert_task"),
+            patch("tasks.a2a_protocol.insert_artifact"),
+            patch("kendr.runtime.append_privileged_audit_event"),
+        ):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Do deep research on this dataset and produce a full report.")
+            state["last_agent"] = "reviewer_agent"
+            state["review_pending"] = False
+            state["review_decision"] = "approve"
+            state["review_subject_agent"] = "long_document_agent"
+            state["review_target_agent"] = "finish"
+            state["draft_response"] = "Research completed."
+            state["plan_ready"] = True
+            state["plan_approval_status"] = "approved"
+            state["plan_steps"] = []
+            state["local_drive_force_long_document"] = True
+            state["local_drive_calls"] = 1
+            state["long_document_mode"] = True
+            state["long_document_compiled_path"] = "output/final_report.md"
+            state["deep_research_result_card"] = {"kind": "result"}
+
+            with patch("kendr.runtime.llm.invoke") as mock_invoke:
+                routed_state = runtime.orchestrator_agent(state)
+
+        self.assertEqual(routed_state["next_agent"], "__finish__")
+        self.assertEqual(routed_state["final_output"], "Research completed.")
+        self.assertFalse(mock_invoke.called)
 
     def test_planned_step_dispatch_includes_step_context_for_review(self):
         with patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot):

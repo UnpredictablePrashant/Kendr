@@ -8,8 +8,13 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
+from kendr.unicode_utils import sanitize_text
+
 
 _LOG = logging.getLogger(__name__)
+
+
+sqlite3.register_adapter(str, sanitize_text)
 
 
 def _repo_root() -> Path:

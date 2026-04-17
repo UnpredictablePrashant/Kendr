@@ -50,6 +50,7 @@ from kendr.skill_manager import (
     resolve_runtime_skill,
     test_skill,
 )
+from kendr.unicode_utils import safe_json_dumps, sanitize_text
 
 
 REGISTRY = build_registry()
@@ -251,7 +252,7 @@ def _html_page(title: str, body: str) -> bytes:
 
 class GatewayHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: dict | list):
-        body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        body = safe_json_dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -259,7 +260,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_html(self, status: int, title: str, body: str):
-        page = _html_page(title, body)
+        page = _html_page(sanitize_text(title), sanitize_text(body))
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(page)))

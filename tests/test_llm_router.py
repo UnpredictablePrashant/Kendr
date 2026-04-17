@@ -192,6 +192,15 @@ class LlmRouterTests(unittest.TestCase):
         self.assertTrue(status["model_capabilities"]["tool_calling"])
         self.assertTrue(status["model_capabilities"]["vision"])
         self.assertTrue(status["model_capabilities"]["structured_output"])
+        self.assertTrue(status["model_capabilities"]["native_web_search"])
+
+    def test_native_web_search_requires_openai_provider(self):
+        from kendr.llm_router import supports_native_web_search
+
+        self.assertTrue(supports_native_web_search("gpt-4o-mini", "openai"))
+        self.assertTrue(supports_native_web_search("o4-mini-deep-research", "openai"))
+        self.assertFalse(supports_native_web_search("gpt-4o-mini", "custom"))
+        self.assertFalse(supports_native_web_search("llama3.2", "ollama"))
 
 
 if __name__ == "__main__":

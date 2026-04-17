@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import html
 import json
 import math
 import os
@@ -20,12 +19,14 @@ from openai import OpenAI
 
 from kendr.domain.deep_research import build_source_strategy, discover_research_intent
 from kendr.execution_trace import append_execution_event
+from kendr.llm_router import supports_native_web_search
 from kendr.rag_manager import build_research_grounding
 from kendr.workflow_contract import approval_request_to_text, build_approval_request
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.coding_tasks import _extract_output_text
 from tasks.file_memory import bootstrap_file_memory, update_planning_file
 from tasks.planning_tasks import build_plan_approval_prompt, normalize_plan_data, plan_as_markdown
+from tasks.plagiarism_checker import build_plagiarism_report as _dedicated_build_plagiarism_report
 from tasks.research_infra import fetch_search_results, fetch_url_content, llm_json, llm_text
 from tasks.utils import OUTPUT_DIR, log_task_update, model_selection_for_agent, write_text_file, resolve_output_path
 
@@ -34,6 +35,7 @@ DEFAULT_DEEP_RESEARCH_MODEL = os.getenv("OPENAI_DEEP_RESEARCH_MODEL", "o4-mini-d
 DEFAULT_RESEARCH_FORMATS = ["pdf", "docx", "html", "md"]
 SUPPORTED_CITATION_STYLES = {"apa", "mla", "chicago", "ieee", "vancouver", "harvard"}
 DEEP_RESEARCH_LABEL = "Deep Research"
+OPENAI_WEB_SEARCH_TOOL = os.getenv("OPENAI_WEB_SEARCH_TOOL", "web_search").strip() or "web_search"
 
 
 def _trace_now() -> str:
@@ -169,6 +171,7 @@ AGENT_METADATA = {
             "long_document_compiled_docx_path",
             "long_document_compiled_pdf_path",
             "long_document_outline_md_path",
+            "long_document_subplan_md_path",
             "long_document_coherence_base_path",
             "long_document_coherence_live_path",
             "long_document_references_path",
@@ -183,7 +186,7 @@ AGENT_METADATA = {
             "research_kb_warning",
             "draft_response",
         ],
-        "requirements": ["openai"],
+        "requirements": ["configured_llm", "openai_for_web_search"],
         "display_name": "Deep Research Report Agent",
         "category": "documents",
         "intent_patterns": [
@@ -191,8 +194,8 @@ AGENT_METADATA = {
             "generate a handbook", "produce a whitepaper", "write a guide",
             "document about", "full report on", "comprehensive guide to",
         ],
-        "active_when": ["env:OPENAI_API_KEY"],
-        "config_hint": "Add your OpenAI API key in Setup → Providers.",
+        "active_when": [],
+        "config_hint": "Choose a configured model in Studio. OpenAI is still required when Deep Research web search is enabled.",
     }
 }
 
@@ -217,6 +220,30 @@ def _normalize_title(value: str, fallback: str) -> str:
     if title:
         return title
     return fallback
+
+
+def _strip_heading_attributes(value: str) -> str:
+    return re.sub(r"\s*\{#[^}]+\}\s*$", "", str(value or "").strip())
+
+
+def _slugify_heading(value: str, *, fallback: str = "section") -> str:
+    cleaned = _strip_heading_attributes(value).lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", cleaned).strip("-")
+    return slug or fallback
+
+
+def _heading_with_anchor(level: int, title: str, anchor: str) -> str:
+    normalized_title = _strip_heading_attributes(title)
+    normalized_anchor = _slugify_heading(anchor or title, fallback=f"heading-{level}")
+    return f"{'#' * max(1, level)} {normalized_title} {{#{normalized_anchor}}}"
+
+
+def _normalized_heading_candidate(value: str) -> str:
+    cleaned = _strip_heading_attributes(value)
+    cleaned = re.sub(r"^\s*#+\s*", "", cleaned)
+    cleaned = re.sub(r"^\s*section\s+\d+\s*[:.\-]\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*\d+\s*[:.\-]\s*", "", cleaned)
+    return re.sub(r"[^a-z0-9]+", " ", cleaned.lower()).strip()
 
 
 def _read_text_file(path_value: str, fallback: str = "") -> str:
@@ -1652,7 +1679,7 @@ def _collect_section_images(
 
 def _image_appendix_markdown(all_image_entries: list[dict]) -> str:
     """Build Appendix D — Image Gallery markdown from all collected section images."""
-    lines = ["## Appendix D - Image Gallery", ""]
+    lines = [_heading_with_anchor(2, "Appendix D - Image Gallery", "appendix-d-image-gallery"), ""]
     if not all_image_entries:
         lines.append("_No images were collected during research._")
         return "\n".join(lines)
@@ -2102,6 +2129,29 @@ def _remap_section_citations(section_text: str, section_sources: list[dict], con
 
     # Match any source citation tag of the form [S1], [S12], [P1], etc.
     return re.sub(r"\[([A-Z]\d+)\]", _swap, section_text)
+
+
+def _strip_leading_section_heading(section_text: str, *, section_title: str, section_index: int) -> str:
+    lines = str(section_text or "").splitlines()
+    first_content_index = 0
+    while first_content_index < len(lines) and not lines[first_content_index].strip():
+        first_content_index += 1
+    if first_content_index >= len(lines):
+        return ""
+
+    first_line = lines[first_content_index].strip()
+    normalized_first = _normalized_heading_candidate(first_line)
+    heading_variants = {
+        _normalized_heading_candidate(section_title),
+        _normalized_heading_candidate(f"{section_index}. {section_title}"),
+        _normalized_heading_candidate(f"Section {section_index}: {section_title}"),
+    }
+    if normalized_first and normalized_first in heading_variants:
+        next_index = first_content_index + 1
+        while next_index < len(lines) and not lines[next_index].strip():
+            next_index += 1
+        return "\n".join(lines[next_index:]).strip()
+    return str(section_text or "").strip()
 
 
 def _consolidate_references(section_outputs: list[dict]) -> list[dict]:
@@ -2767,6 +2817,38 @@ def _deep_research_subplan_summary_prompt(
     return "\n".join(lines).strip()
 
 
+def _deep_research_subplan_auto_approved_message(
+    *,
+    title: str,
+    outline: dict,
+    target_pages: int,
+    section_pages: int,
+    web_search_enabled: bool,
+    outline_storage_path: str,
+    subplan_storage_path: str,
+    version: int,
+) -> str:
+    sections = outline.get("sections", []) if isinstance(outline, dict) else []
+    lines = [
+        f"Deep research section plan v{version} auto-approved.",
+        "",
+        "Execution handoff",
+        f"- Title: {title}",
+        f"- Target pages: {target_pages}",
+        f"- Sections: {len(sections)}",
+        f"- Approx pages per section: {section_pages}",
+        f"- Web search: {'enabled' if web_search_enabled else 'disabled'}",
+        "- Next phase: evidence collection and report drafting",
+    ]
+    if outline_storage_path or subplan_storage_path:
+        lines.extend(["", "Saved artifacts"])
+        if outline_storage_path:
+            lines.append(f"- Outline: {outline_storage_path}")
+        if subplan_storage_path:
+            lines.append(f"- Step-by-step plan: {subplan_storage_path}")
+    return "\n".join(lines).strip()
+
+
 def _build_deep_research_confirmation_prompt(analysis_md: str, *, version: int) -> str:
     return build_plan_approval_prompt(
         analysis_md,
@@ -2988,121 +3070,72 @@ def _ensure_section_citations(section_text: str, section_sources: list[dict]) ->
     return "\n".join(lines).strip()
 
 
-def _tokenize_words(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", str(text or "").lower())
+def _build_plagiarism_source_texts(
+    *,
+    evidence_bank_md: str,
+    section_packages: list[dict],
+    local_entries: list[dict],
+    url_entries: list[dict],
+) -> list[dict]:
+    entries: list[dict[str, str]] = []
+    seen: set[str] = set()
 
+    def _add_entry(*, label: str, text: str, url: str = "", kind: str = "external_source") -> None:
+        cleaned_text = str(text or "").strip()
+        if not cleaned_text:
+            return
+        normalized = re.sub(r"\s+", " ", cleaned_text).strip().lower()
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        entries.append({"label": label, "url": url, "text": cleaned_text, "kind": kind})
 
-def _cosine_similarity(left: str, right: str) -> float:
-    left_tokens = _tokenize_words(left)
-    right_tokens = _tokenize_words(right)
-    if not left_tokens or not right_tokens:
-        return 0.0
-    left_counts: dict[str, int] = {}
-    right_counts: dict[str, int] = {}
-    for token in left_tokens:
-        left_counts[token] = left_counts.get(token, 0) + 1
-    for token in right_tokens:
-        right_counts[token] = right_counts.get(token, 0) + 1
-    numerator = sum(left_counts[token] * right_counts.get(token, 0) for token in left_counts)
-    left_norm = math.sqrt(sum(value * value for value in left_counts.values()))
-    right_norm = math.sqrt(sum(value * value for value in right_counts.values()))
-    if not left_norm or not right_norm:
-        return 0.0
-    return numerator / (left_norm * right_norm)
-
-
-def _ngram_overlap(left: str, right: str, *, n: int = 3) -> float:
-    def _ngrams(value: str) -> set[tuple[str, ...]]:
-        tokens = _tokenize_words(value)
-        if len(tokens) < n:
-            return set()
-        return {tuple(tokens[idx : idx + n]) for idx in range(0, len(tokens) - n + 1)}
-
-    left_ngrams = _ngrams(left)
-    right_ngrams = _ngrams(right)
-    if not left_ngrams or not right_ngrams:
-        return 0.0
-    return len(left_ngrams & right_ngrams) / max(1, len(left_ngrams))
-
-
-def _estimate_ai_content_score(text: str) -> float:
-    tokens = _tokenize_words(text)
-    if not tokens:
-        return 0.0
-    unique_ratio = len(set(tokens)) / max(1, len(tokens))
-    sentence_starts = re.findall(r"(?:^|[.!?]\s+)([A-Z][a-z]+)", str(text or ""))
-    repeated_start_ratio = 0.0
-    if sentence_starts:
-        counts: dict[str, int] = {}
-        for item in sentence_starts:
-            counts[item] = counts.get(item, 0) + 1
-        repeated = sum(value for value in counts.values() if value > 1)
-        repeated_start_ratio = repeated / max(1, len(sentence_starts))
-    citation_density = len(re.findall(r"\[[A-Z]\d+\]", str(text or ""))) / max(1, len(_section_text_blocks(text)))
-    score = 55.0 * max(0.0, 0.45 - unique_ratio) + 25.0 * repeated_start_ratio + 8.0 * max(0.0, 1.0 - citation_density)
-    return round(max(0.0, min(100.0, score)), 1)
+    _add_entry(label="Evidence bank", text=evidence_bank_md, kind="evidence_bank")
+    for package in section_packages or []:
+        title = str(package.get("title", "")).strip() or "Section research"
+        _add_entry(
+            label=f"{title} research memo",
+            text=str(package.get("research_text", "")).strip(),
+            kind="research_memo",
+        )
+    for entry in local_entries or []:
+        if str(entry.get("error", "")).strip():
+            continue
+        path_value = str(entry.get("path", "")).strip()
+        label = str(entry.get("file_name", "")).strip() or Path(path_value).name or "Local file"
+        source_text = "\n\n".join(
+            part
+            for part in (
+                f"Summary:\n{str(entry.get('summary', '')).strip()}" if str(entry.get("summary", "")).strip() else "",
+                f"Excerpt:\n{str(entry.get('excerpt', '')).strip()}" if str(entry.get("excerpt", "")).strip() else "",
+            )
+            if part
+        )
+        _add_entry(
+            label=label,
+            text=source_text,
+            url=_file_source_url(path_value) if path_value else "",
+            kind="local_file",
+        )
+    for entry in url_entries or []:
+        if str(entry.get("error", "")).strip():
+            continue
+        url = str(entry.get("url", "")).strip()
+        label = str(entry.get("label", "")).strip() or _source_label(url)
+        source_text = "\n\n".join(
+            part
+            for part in (
+                f"Summary:\n{str(entry.get('summary', '')).strip()}" if str(entry.get("summary", "")).strip() else "",
+                f"Excerpt:\n{str(entry.get('excerpt', '')).strip()}" if str(entry.get("excerpt", "")).strip() else "",
+            )
+            if part
+        )
+        _add_entry(label=label or "Provided URL", text=source_text, url=url, kind="provided_url")
+    return entries
 
 
 def _build_plagiarism_report(section_outputs: list[dict], source_texts: list[dict]) -> dict:
-    source_blocks: list[dict[str, str]] = []
-    for item in source_texts:
-        label = str(item.get("label", "")).strip() or "source"
-        url = str(item.get("url", "")).strip()
-        for block in _section_text_blocks(item.get("text", "")):
-            if len(block.split()) < 12:
-                continue
-            source_blocks.append({"label": label, "url": url, "text": block})
-
-    sections_payload = []
-    total_paragraphs = 0
-    flagged_paragraphs_total = 0
-    ai_scores: list[float] = []
-    for section in section_outputs:
-        flagged = []
-        paragraphs = [block for block in _section_text_blocks(section.get("section_text", "")) if len(block.split()) >= 12]
-        total_paragraphs += len(paragraphs)
-        section_ai = _estimate_ai_content_score(section.get("section_text", ""))
-        ai_scores.append(section_ai)
-        for paragraph in paragraphs:
-            best_match = None
-            best_similarity = 0.0
-            best_overlap = 0.0
-            for source in source_blocks[:250]:
-                cosine = _cosine_similarity(paragraph, source["text"])
-                overlap = _ngram_overlap(paragraph, source["text"])
-                if cosine > best_similarity or overlap > best_overlap:
-                    best_similarity = max(best_similarity, cosine)
-                    best_overlap = max(best_overlap, overlap)
-                    best_match = source
-            if best_match and (best_similarity >= 0.85 or best_overlap >= 0.65):
-                flagged.append(
-                    {
-                        "text_excerpt": _trim_text(paragraph, 240),
-                        "similarity": round(max(best_similarity, best_overlap), 3),
-                        "source_url": best_match.get("url", ""),
-                        "type": "near-verbatim" if best_similarity >= 0.85 else "mosaic",
-                        "recommendation": "rephrase or add citation",
-                    }
-                )
-        flagged_paragraphs_total += len(flagged)
-        section_score = round((len(flagged) / max(1, len(paragraphs))) * 100.0, 1) if paragraphs else 0.0
-        sections_payload.append(
-            {
-                "section_title": section.get("title", ""),
-                "plagiarism_score": section_score,
-                "ai_score": section_ai,
-                "flagged_paragraphs": flagged[:8],
-            }
-        )
-    overall = round((flagged_paragraphs_total / max(1, total_paragraphs)) * 100.0, 1) if total_paragraphs else 0.0
-    ai_content = round(sum(ai_scores) / max(1, len(ai_scores)), 1) if ai_scores else 0.0
-    status = "PASS" if overall < 10 else "WARN" if overall <= 20 else "FAIL"
-    return {
-        "overall_score": overall,
-        "ai_content_score": ai_content,
-        "status": status,
-        "sections": sections_payload,
-    }
+    return _dedicated_build_plagiarism_report(section_outputs, source_texts)
 
 
 def _format_citation(entry: dict, *, style: str, index: int) -> str:
@@ -3126,7 +3159,7 @@ def _format_citation(entry: dict, *, style: str, index: int) -> str:
 
 
 def _bibliography_markdown(entries: list[dict], *, style: str) -> str:
-    lines = [f"## Bibliography ({style.upper()})", ""]
+    lines = [_heading_with_anchor(2, f"Bibliography ({style.upper()})", "bibliography"), ""]
     if not entries:
         lines.append("- No sources were available for bibliography generation.")
         return "\n".join(lines).strip() + "\n"
@@ -3140,10 +3173,23 @@ def _bibliography_markdown(entries: list[dict], *, style: str) -> str:
 
 
 def _plagiarism_report_markdown(report: dict) -> str:
-    lines = ["## Appendix B - Plagiarism Report", ""]
-    lines.append(f"- Overall plagiarism score: {report.get('overall_score', 0)}%")
-    lines.append(f"- AI content score: {report.get('ai_content_score', 0)}%")
+    lines = [_heading_with_anchor(2, "Appendix B - Plagiarism Report", "appendix-b-plagiarism-report"), ""]
+    lines.append(f"- Overall similarity score: {report.get('overall_score', 0)}%")
+    lines.append(f"- AI-writing risk score: {report.get('ai_content_score', 0)}%")
     lines.append(f"- Status: {report.get('status', 'PASS')}")
+    summary = str(report.get("summary", "")).strip()
+    if summary:
+        lines.append(f"- Summary: {summary}")
+    source_block_count = int(report.get("source_block_count", 0) or 0)
+    if source_block_count:
+        lines.append(f"- Source passages scanned: {source_block_count}")
+    method = report.get("method", {}) if isinstance(report, dict) else {}
+    matching = method.get("matching", []) if isinstance(method, dict) else []
+    ai_scoring = method.get("ai_scoring", []) if isinstance(method, dict) else []
+    if matching:
+        lines.append(f"- Matching signals: {', '.join(str(item) for item in matching)}")
+    if ai_scoring:
+        lines.append(f"- AI signals: {', '.join(str(item) for item in ai_scoring)}")
     sections = report.get("sections", []) if isinstance(report, dict) else []
     if not sections:
         lines.append("- No section-level findings.")
@@ -3153,19 +3199,45 @@ def _plagiarism_report_markdown(report: dict) -> str:
             [
                 "",
                 f"### {section.get('section_title', 'Section')}",
-                f"- Plagiarism score: {section.get('plagiarism_score', 0)}%",
-                f"- AI score: {section.get('ai_score', 0)}%",
+                f"- Similarity score: {section.get('plagiarism_score', 0)}%",
+                f"- AI-writing risk: {section.get('ai_score', 0)}%",
+                f"- Passages scanned: {section.get('passages_scanned', 0)}",
+                f"- Words scanned: {section.get('words_scanned', 0)}",
             ]
         )
-        flagged = section.get("flagged_paragraphs", []) if isinstance(section, dict) else []
+        ai_components = section.get("ai_components", {}) if isinstance(section, dict) else {}
+        ranked_components = [
+            (str(key).replace("_", " "), float(value))
+            for key, value in ai_components.items()
+            if float(value or 0) > 0
+        ]
+        ranked_components.sort(key=lambda item: item[1], reverse=True)
+        if ranked_components:
+            top_components = ", ".join(f"{label}={round(value, 1)}" for label, value in ranked_components[:4])
+            lines.append(f"- Strongest AI signals: {top_components}")
+        flagged = []
+        if isinstance(section, dict):
+            flagged = section.get("flagged_passages", []) or section.get("flagged_paragraphs", [])
         if not flagged:
-            lines.append("- No flagged paragraphs.")
+            lines.append("- No flagged passages.")
             continue
+        lines.append("- Matched passages:")
         for item in flagged[:5]:
+            match_type = str(item.get("type", "flagged")).replace("_", " ")
+            source_label = str(item.get("source_label", "")).strip() or str(item.get("source_url", "")).strip() or "unknown source"
             lines.append(
-                f"- {item.get('type', 'flagged')}: {item.get('text_excerpt', '')} "
-                f"(similarity={item.get('similarity', 0)}, source={item.get('source_url', '')})"
+                f"  - {match_type} | severity={item.get('severity', 'n/a')} | "
+                f"similarity={item.get('similarity', 0)} | source={source_label}"
             )
+            excerpt = str(item.get("text_excerpt", "")).strip()
+            if excerpt:
+                lines.append(f"    Excerpt: {excerpt}")
+            matched_phrase = str(item.get("matched_phrase", "")).strip()
+            if matched_phrase:
+                lines.append(f"    Matched phrase: {matched_phrase}")
+            recommendation = str(item.get("recommendation", "")).strip()
+            if recommendation:
+                lines.append(f"    Recommendation: {recommendation}")
     return "\n".join(lines).strip() + "\n"
 
 
@@ -3269,7 +3341,7 @@ def _run_research_pass(
         "background": True,
         "max_tool_calls": max_tool_calls,
         "reasoning": {"summary": "auto"},
-        "tools": [{"type": "web_search_preview"}],
+        "tools": [{"type": OPENAI_WEB_SEARCH_TOOL}],
     }
     if max_output_tokens is not None and max_output_tokens > 0:
         create_kwargs["max_output_tokens"] = max_output_tokens
@@ -3339,6 +3411,7 @@ def _collect_section_research_package(
     continuity_notes: list[str],
     coherence_context_md: str,
     web_search_enabled: bool,
+    native_web_search_enabled: bool,
     research_model: str,
     research_instructions: str,
     max_tool_calls: int,
@@ -3435,33 +3508,55 @@ def _collect_section_research_package(
         section_sources = _merge_sources(section_sources, section_search_sources)
     else:
         if web_search_enabled:
-            if callable(cancel_check):
-                cancel_check()
-            query_lines = [
-                f"Global objective: {objective}",
-                f"Section {section_index} title: {section_title}",
-                f"Section objective: {section_objective}",
-                "Key questions:",
-                *[f"- {item}" for item in section_questions[:12]],
-                "Continuity notes from previous sections:",
-                *[f"- {item}" for item in continuity_notes[-10:]],
-                "Markdown coherence anchors:",
-                _trim_text(coherence_context_md, 4000),
-            ]
-            research_pass = _run_research_pass(
-                OpenAI(api_key=api_key),
-                query="\n".join(query_lines),
-                model=research_model,
-                instructions=research_instructions,
-                max_tool_calls=max_tool_calls,
-                max_output_tokens=max_output_tokens_int,
-                poll_interval_seconds=poll_interval_seconds,
-                max_wait_seconds=max_wait_seconds,
-                heartbeat_interval_seconds=heartbeat_seconds,
-                heartbeat_label=f"Section {section_index} research in progress",
-                cancel_check=cancel_check,
-            )
-            research_output = str(research_pass.get("output_text", "")).strip()
+            if native_web_search_enabled:
+                if callable(cancel_check):
+                    cancel_check()
+                query_lines = [
+                    f"Global objective: {objective}",
+                    f"Section {section_index} title: {section_title}",
+                    f"Section objective: {section_objective}",
+                    "Key questions:",
+                    *[f"- {item}" for item in section_questions[:12]],
+                    "Continuity notes from previous sections:",
+                    *[f"- {item}" for item in continuity_notes[-10:]],
+                    "Markdown coherence anchors:",
+                    _trim_text(coherence_context_md, 4000),
+                ]
+                research_pass = _run_research_pass(
+                    OpenAI(api_key=api_key),
+                    query="\n".join(query_lines),
+                    model=research_model,
+                    instructions=research_instructions,
+                    max_tool_calls=max_tool_calls,
+                    max_output_tokens=max_output_tokens_int,
+                    poll_interval_seconds=poll_interval_seconds,
+                    max_wait_seconds=max_wait_seconds,
+                    heartbeat_interval_seconds=heartbeat_seconds,
+                    heartbeat_label=f"Section {section_index} research in progress",
+                    cancel_check=cancel_check,
+                )
+                research_output = str(research_pass.get("output_text", "")).strip()
+            else:
+                if not search_query:
+                    search_query = f"{section_title} {section_objective}"
+                if not section_search_text:
+                    if callable(cancel_check):
+                        cancel_check()
+                    section_search_results = _collect_google_search_evidence(search_query, num=section_search_results_count)
+                    section_search_sources = _sources_from_search_results(section_search_results.get("results", []))
+                    section_search_text = _search_results_markdown(section_search_results.get("results", []))
+                research_pass = {
+                    "response_id": f"kendr_web_search_section_{section_index}",
+                    "status": "fallback_web_search",
+                    "elapsed_seconds": 0,
+                    "output_text": local_section_notes,
+                    "raw": {
+                        "reason": "native_web_search_unavailable",
+                        "search_provider": str((section_search_results or {}).get("provider", "")).strip(),
+                        "search_providers_tried": list((section_search_results or {}).get("providers_tried", []) or []),
+                    },
+                }
+                research_output = local_section_notes
         else:
             research_pass = {
                 "response_id": f"local_only_section_{section_index}",
@@ -3564,7 +3659,7 @@ def _record_section_research_package(
             log_task_update(DEEP_RESEARCH_LABEL, f"Section {index} web search error: {section_search_results.get('error')}")
 
     section_research_status = str(research_pass.get("status", "")).strip() or "completed"
-    if section_research_status not in {"completed", "", "local_only", "evidence_bank"}:
+    if section_research_status not in {"completed", "", "local_only", "evidence_bank", "fallback_web_search"}:
         log_task_update(DEEP_RESEARCH_LABEL, f"Section {index} research status: {research_pass.get('status')}")
 
     _trace_research_event(
@@ -3576,11 +3671,11 @@ def _record_section_research_package(
                 if from_cache
                 else f"{section_title} completed with {len(section_sources)} sources."
             )
-            if section_research_status in {"completed", "local_only", "evidence_bank"}
+            if section_research_status in {"completed", "local_only", "evidence_bank", "fallback_web_search"}
             else f"{section_title} finished with status '{section_research_status}'. Using partial research output."
         ),
         command=str(package.get("objective", "")).strip(),
-        status="completed" if section_research_status in {"completed", "local_only", "evidence_bank"} else "failed",
+        status="completed" if section_research_status in {"completed", "local_only", "evidence_bank", "fallback_web_search"} else "failed",
         started_at=section_research_started_at,
         completed_at=_trace_now(),
         metadata={
@@ -3672,6 +3767,7 @@ Requirements:
 - Keep conceptual continuity with prior sections.
 - Keep factual claims tied to evidence gathered in the research notes below.
 - Use the editorial correlation briefing to avoid overlap and to cross-reference related sections.
+- Do not repeat the section title as a heading; the compiler adds the section heading for you.
 - Include a short "Section Takeaways" list at the end.
 - Use source tags like "[S1]" inline for factual claims that come from the source ledger.
 - Do not cite source ids that are not present in the source ledger.
@@ -3739,160 +3835,12 @@ def _markdown_to_plain_text(markdown_text: str) -> str:
 def _markdown_to_html(markdown_text: str) -> str:
     input_chars = len(markdown_text or "")
     log_task_update(DEEP_RESEARCH_LABEL, f"_markdown_to_html: converting {input_chars} chars of markdown to HTML.")
-    lines = (markdown_text or "").splitlines()
-    html_lines: list[str] = []
-    in_code = False
-    in_ul = False
-    in_ol = False
-    index = 0
-    heading_count = 0
-    list_item_count = 0
-    table_count = 0
+    from tasks.md_to_pdf import build_html_from_markdown
 
-    def close_lists() -> None:
-        nonlocal in_ul, in_ol
-        if in_ul:
-            html_lines.append("</ul>")
-            in_ul = False
-        if in_ol:
-            html_lines.append("</ol>")
-            in_ol = False
-
-    def render_table(table_lines: list[str]) -> None:
-        rows = []
-        for row_line in table_lines:
-            if not row_line.strip():
-                continue
-            parts = [cell.strip() for cell in row_line.strip().strip("|").split("|")]
-            rows.append(parts)
-        if not rows:
-            return
-        header = rows[0]
-        body_rows = rows[2:] if len(rows) > 2 else rows[1:]
-        html_lines.append("<table>")
-        html_lines.append("<thead><tr>" + "".join(f"<th>{html.escape(cell)}</th>" for cell in header) + "</tr></thead>")
-        if body_rows:
-            html_lines.append("<tbody>")
-            for row in body_rows:
-                html_lines.append("<tr>" + "".join(f"<td>{html.escape(cell)}</td>" for cell in row) + "</tr>")
-            html_lines.append("</tbody>")
-        html_lines.append("</table>")
-
-    while index < len(lines):
-        line = lines[index]
-        if line.strip().startswith("```"):
-            if in_code:
-                html_lines.append("</code></pre>")
-                in_code = False
-            else:
-                close_lists()
-                html_lines.append("<pre><code>")
-                in_code = True
-            index += 1
-            continue
-        if in_code:
-            html_lines.append(html.escape(line))
-            index += 1
-            continue
-
-        # Table detection (header + separator line)
-        if "|" in line and index + 1 < len(lines):
-            sep = lines[index + 1]
-            if re.match(r"^\s*\|?\s*[:\-\s|]+\|?\s*$", sep):
-                table_block = [line, sep]
-                index += 2
-                while index < len(lines) and "|" in lines[index] and lines[index].strip():
-                    table_block.append(lines[index])
-                    index += 1
-                close_lists()
-                render_table(table_block)
-                table_count += 1
-                continue
-
-        heading = re.match(r"^(#{1,6})\s+(.*)$", line)
-        if heading:
-            close_lists()
-            level = min(len(heading.group(1)), 6)
-            html_lines.append(f"<h{level}>{html.escape(heading.group(2).strip())}</h{level}>")
-            heading_count += 1
-            index += 1
-            continue
-
-        ul_item = re.match(r"^[-*]\s+(.*)$", line)
-        if ul_item:
-            if not in_ul:
-                close_lists()
-                html_lines.append("<ul>")
-                in_ul = True
-            html_lines.append(f"<li>{html.escape(ul_item.group(1).strip())}</li>")
-            list_item_count += 1
-            index += 1
-            continue
-
-        ol_item = re.match(r"^\d+\.\s+(.*)$", line)
-        if ol_item:
-            if not in_ol:
-                close_lists()
-                html_lines.append("<ol>")
-                in_ol = True
-            html_lines.append(f"<li>{html.escape(ol_item.group(1).strip())}</li>")
-            list_item_count += 1
-            index += 1
-            continue
-
-        if not line.strip():
-            close_lists()
-            html_lines.append("<p></p>")
-            index += 1
-            continue
-
-        # Image syntax: ![alt text](path)
-        img_match = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)$", line.strip())
-        if img_match:
-            close_lists()
-            img_alt = html.escape(img_match.group(1).strip())
-            img_src = html.escape(img_match.group(2).strip())
-            html_lines.append(
-                f'<figure style="margin:18px 0;text-align:center;">'
-                f'<img src="{img_src}" alt="{img_alt}" style="max-width:100%;border-radius:6px;border:1px solid var(--line);">'
-                f'<figcaption style="font-size:0.85em;color:var(--muted);margin-top:6px;">{img_alt}</figcaption>'
-                f'</figure>'
-            )
-            index += 1
-            continue
-
-        close_lists()
-        html_lines.append(f"<p>{html.escape(line.strip())}</p>")
-        index += 1
-
-    close_lists()
-    if in_code:
-        html_lines.append("</code></pre>")
-
-    style = (
-        "<style>"
-        ":root{color-scheme:light dark;--bg:#ffffff;--text:#111827;--muted:#475569;--line:#dbe4ee;--panel:#f8fafc;}"
-        "@media (prefers-color-scheme:dark){:root{--bg:#0f172a;--text:#e2e8f0;--muted:#94a3b8;--line:#334155;--panel:#111827;}}"
-        "body{font-family:Georgia,'Times New Roman',serif;line-height:1.6;margin:40px auto;max-width:920px;padding:0 18px;background:var(--bg);color:var(--text);}"
-        "h1{font-size:30px;border-bottom:1px solid var(--line);padding-bottom:8px;}"
-        "h2{font-size:22px;margin-top:32px;}"
-        "h3{font-size:17px;margin-top:22px;}"
-        "p{margin:10px 0;}"
-        "table{border-collapse:collapse;width:100%;margin:14px 0;background:var(--panel);}"
-        "th,td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top;}"
-        "th{background:#0f172a;color:#f8fafc;}"
-        "tr:nth-child(even) td{background:rgba(148,163,184,0.08);}"
-        "pre{background:var(--panel);padding:12px;border-radius:6px;overflow:auto;border:1px solid var(--line);}"
-        "code{font-family:'Courier New',monospace;font-size:0.95em;}"
-        "ul,ol{padding-left:22px;}"
-        "</style>"
-    )
-    html_result = (
-        "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Deep Research Report</title>"
-        f"{style}</head><body>\n"
-        + "\n".join(html_lines)
-        + "\n</body></html>"
-    )
+    heading_count = len(re.findall(r"^#{1,6}\s+", markdown_text or "", flags=re.MULTILINE))
+    list_item_count = len(re.findall(r"^(?:[-*]|\d+\.)\s+", markdown_text or "", flags=re.MULTILINE))
+    table_count = len(re.findall(r"^\|.*\|\s*$", markdown_text or "", flags=re.MULTILINE))
+    html_result = build_html_from_markdown(markdown_text or "", for_pdf=False)
     log_task_update(
         DEEP_RESEARCH_LABEL,
         f"_markdown_to_html: done — {heading_count} headings, {list_item_count} list items, "
@@ -3907,55 +3855,203 @@ def _markdown_to_docx(markdown_text: str, output_path: str) -> None:
     if not _ensure_python_package("python-docx", "docx"):
         raise RuntimeError("python-docx not available")
     from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt, RGBColor
 
     doc = Document()
-    in_code = False
+    for section in doc.sections:
+        section.top_margin = Inches(0.82)
+        section.bottom_margin = Inches(0.86)
+        section.left_margin = Inches(0.72)
+        section.right_margin = Inches(0.72)
+
+    normal_style = doc.styles["Normal"]
+    normal_style.font.name = "Georgia"
+    normal_style.font.size = Pt(11)
+    normal_style.paragraph_format.space_after = Pt(9)
+    normal_style.paragraph_format.line_spacing = 1.5
+
+    title_style = doc.styles["Title"]
+    title_style.font.name = "Georgia"
+    title_style.font.size = Pt(25)
+    title_style.font.bold = True
+    title_style.font.color.rgb = RGBColor(15, 23, 42)
+
+    for style_name, font_size, color in (
+        ("Heading 1", 17, RGBColor(15, 23, 42)),
+        ("Heading 2", 15, RGBColor(15, 118, 110)),
+        ("Heading 3", 12.5, RGBColor(20, 78, 74)),
+    ):
+        style = doc.styles[style_name]
+        style.font.name = "Georgia"
+        style.font.size = Pt(font_size)
+        style.font.bold = True
+        style.font.color.rgb = color
+
+    bookmark_id = 1
     heading_count = 0
     bullet_count = 0
     numbered_count = 0
     para_count = 0
-    for raw in (markdown_text or "").splitlines():
-        line = raw.rstrip()
+
+    def _strip_inline_markdown(value: str) -> str:
+        text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", str(value or ""))
+        text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+        text = re.sub(r"\*([^*]+)\*", r"\1", text)
+        return text
+
+    def _add_bookmark(paragraph, name: str) -> None:
+        nonlocal bookmark_id
+        anchor = _slugify_heading(name, fallback=f"bookmark-{bookmark_id}")
+        start = OxmlElement("w:bookmarkStart")
+        start.set(qn("w:id"), str(bookmark_id))
+        start.set(qn("w:name"), anchor)
+        end = OxmlElement("w:bookmarkEnd")
+        end.set(qn("w:id"), str(bookmark_id))
+        paragraph._p.insert(0, start)
+        paragraph._p.append(end)
+        bookmark_id += 1
+
+    def _append_internal_hyperlink(paragraph, text: str, anchor: str) -> None:
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(qn("w:anchor"), _slugify_heading(anchor, fallback="section"))
+        run = OxmlElement("w:r")
+        run_properties = OxmlElement("w:rPr")
+        color = OxmlElement("w:color")
+        color.set(qn("w:val"), "0F766E")
+        underline = OxmlElement("w:u")
+        underline.set(qn("w:val"), "single")
+        run_properties.append(color)
+        run_properties.append(underline)
+        run.append(run_properties)
+        text_node = OxmlElement("w:t")
+        text_node.text = text
+        run.append(text_node)
+        hyperlink.append(run)
+        paragraph._p.append(hyperlink)
+
+    def _append_inline_runs(paragraph, text: str) -> None:
+        token_pattern = re.compile(r"(\[[^\]]+\]\([^)]+\)|\*\*[^*]+\*\*|\*[^*]+\*)")
+        cursor = 0
+        for match in token_pattern.finditer(text):
+            if match.start() > cursor:
+                paragraph.add_run(text[cursor:match.start()])
+            token = match.group(0)
+            if token.startswith("**"):
+                run = paragraph.add_run(token[2:-2])
+                run.bold = True
+            elif token.startswith("*"):
+                run = paragraph.add_run(token[1:-1])
+                run.italic = True
+            else:
+                link_match = re.match(r"\[([^\]]+)\]\(([^)]+)\)", token)
+                if link_match:
+                    label = link_match.group(1)
+                    target = link_match.group(2)
+                    if target.startswith("#"):
+                        _append_internal_hyperlink(paragraph, label, target[1:])
+                    else:
+                        run = paragraph.add_run(label)
+                        run.font.color.rgb = RGBColor(15, 118, 110)
+                        run.underline = True
+            cursor = match.end()
+        if cursor < len(text):
+            paragraph.add_run(text[cursor:])
+
+    lines = (markdown_text or "").splitlines()
+    in_code = False
+    index = 0
+    while index < len(lines):
+        line = lines[index].rstrip()
         if line.strip().startswith("```"):
             in_code = not in_code
+            index += 1
             continue
         if in_code:
             para = doc.add_paragraph()
             run = para.add_run(line)
             run.font.name = "Courier New"
+            run.font.size = Pt(9.5)
+            index += 1
             continue
         if not line.strip():
             doc.add_paragraph("")
+            index += 1
+            continue
+        if "|" in line and index + 1 < len(lines) and re.match(r"^\s*\|?\s*[:\-\s|]+\|?\s*$", lines[index + 1]):
+            table_lines = [line, lines[index + 1]]
+            index += 2
+            while index < len(lines) and "|" in lines[index] and lines[index].strip():
+                table_lines.append(lines[index])
+                index += 1
+            rows = []
+            for row_line in table_lines:
+                parts = [part.strip() for part in row_line.strip().strip("|").split("|")]
+                rows.append(parts)
+            if rows:
+                header = rows[0]
+                body_rows = rows[2:] if len(rows) > 2 else rows[1:]
+                table = doc.add_table(rows=1 + len(body_rows), cols=len(header))
+                table.style = "Table Grid"
+                for col_index, value in enumerate(header):
+                    cell = table.rows[0].cells[col_index]
+                    cell.text = _strip_inline_markdown(value)
+                    if cell.paragraphs:
+                        cell.paragraphs[0].runs[0].bold = True
+                for row_index, row_values in enumerate(body_rows, start=1):
+                    padded = row_values + [""] * max(0, len(header) - len(row_values))
+                    for col_index, value in enumerate(padded[:len(header)]):
+                        table.rows[row_index].cells[col_index].text = _strip_inline_markdown(value)
             continue
         heading_match = re.match(r"^(#{1,6})\s+(.*)$", line)
         if heading_match:
             level = min(len(heading_match.group(1)), 6)
-            doc.add_heading(heading_match.group(2).strip(), level=level)
+            raw_heading = heading_match.group(2).strip()
+            anchor_match = re.match(r"^(.*?)(?:\s+\{#([^}]+)\})?$", raw_heading)
+            heading_text = _strip_heading_attributes(anchor_match.group(1).strip() if anchor_match else raw_heading)
+            anchor_name = anchor_match.group(2).strip() if anchor_match and anchor_match.group(2) else _slugify_heading(heading_text, fallback=f"heading-{level}")
+            if level == 1 and heading_count == 0:
+                paragraph = doc.add_paragraph(heading_text, style="Title")
+                paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            else:
+                paragraph = doc.add_heading(heading_text, level=level)
+            _add_bookmark(paragraph, anchor_name)
             heading_count += 1
+            index += 1
             continue
-        if re.match(r"^[-*]\s+", line):
-            doc.add_paragraph(re.sub(r"^[-*]\s+", "", line), style="List Bullet")
+        bullet_match = re.match(r"^[-*]\s+(.*)$", line)
+        if bullet_match:
+            paragraph = doc.add_paragraph(style="List Bullet")
+            bullet_text = bullet_match.group(1).strip()
+            link_match = re.fullmatch(r"\[([^\]]+)\]\((#[^)]+)\)", bullet_text)
+            if link_match:
+                _append_internal_hyperlink(paragraph, link_match.group(1), link_match.group(2)[1:])
+            else:
+                _append_inline_runs(paragraph, bullet_text)
             bullet_count += 1
+            index += 1
             continue
-        if re.match(r"^\d+\.\s+", line):
-            doc.add_paragraph(re.sub(r"^\d+\.\s+", "", line), style="List Number")
+        numbered_match = re.match(r"^\d+\.\s+(.*)$", line)
+        if numbered_match:
+            paragraph = doc.add_paragraph(style="List Number")
+            _append_inline_runs(paragraph, numbered_match.group(1).strip())
             numbered_count += 1
+            index += 1
             continue
-        # Image syntax: ![alt text](path or url)
         img_match = re.match(r"^!\[([^\]]*)\]\(([^)]+)\)$", line.strip())
         if img_match:
             img_alt = img_match.group(1).strip()
             img_path = img_match.group(2).strip()
-            # Only embed local file paths (not http URLs which docx can't fetch)
             if not img_path.startswith("http"):
                 try:
-                    # Resolve relative to compiled markdown's output dir
                     abs_img = resolve_output_path(img_path) if not os.path.isabs(img_path) else img_path
                     if os.path.isfile(abs_img):
-                        from docx.shared import Inches  # type: ignore
                         doc.add_picture(abs_img, width=Inches(5.5))
                         caption_para = doc.add_paragraph(img_alt or "Figure")
                         caption_para.style = "Caption" if "Caption" in [s.name for s in doc.styles] else "Normal"
+                        caption_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                         log_task_update(DEEP_RESEARCH_LABEL, f"  Embedded image in DOCX: {abs_img}")
                     else:
                         doc.add_paragraph(f"[Image not found: {img_path}]")
@@ -3965,10 +4061,25 @@ def _markdown_to_docx(markdown_text: str, output_path: str) -> None:
                     log_task_update(DEEP_RESEARCH_LABEL, f"  DOCX image embed failed ({img_path}): {img_exc}")
             else:
                 doc.add_paragraph(f"[Image: {img_alt or img_path}]")
+            index += 1
+            continue
+        if re.match(r"^\s*>\s*", line):
+            paragraph = doc.add_paragraph(style="Intense Quote" if "Intense Quote" in [s.name for s in doc.styles] else "Normal")
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            _append_inline_runs(paragraph, re.sub(r"^\s*>\s*", "", line))
+            para_count += 1
+            index += 1
+            continue
+        if re.match(r"^\s*-{3,}\s*$", line):
+            doc.add_paragraph("")
+            index += 1
             continue
 
-        doc.add_paragraph(line)
+        paragraph = doc.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        _append_inline_runs(paragraph, line)
         para_count += 1
+        index += 1
 
     doc.save(output_path)
     log_task_update(
@@ -4191,43 +4302,65 @@ def _build_compiled_markdown(
     deep_research_tier: int,
     image_entries: list[dict] | None = None,
 ) -> str:
-    escaped_title = title.replace('"', '\\"')
-    lines = [
-        "---",
-        f'title: "{escaped_title}"',
-        f"generated_at: {generated_at}",
-        f"citation_style: {citation_style}",
-        f"deep_research_tier: {deep_research_tier}",
-        f"model: {model_name}",
-        "---",
-        "",
-        f"# {title}",
-        "",
-        f"_Generated by Kendr Deep Research on {generated_at} using {model_name}_",
-        "",
-        "## Executive Summary",
-        executive_summary.strip(),
-        "",
-        "## Table of Contents",
+    toc_entries = [
+        ("executive-summary", "Executive Summary"),
+        ("methodology", "Methodology"),
+        *[
+            (f"section-{item['index']}-{_slugify_heading(item['title'], fallback=f'section-{item['index']}')}", f"{item['index']}. {item['title']}")
+            for item in section_outputs
+        ],
+        ("bibliography", f"Bibliography ({citation_style.upper()})"),
+        ("appendix-a-source-list", "Appendix A - Source List"),
+        ("appendix-b-plagiarism-report", "Appendix B - Plagiarism Report"),
+        ("appendix-c-research-log", "Appendix C - Research Log"),
     ]
-    for item in section_outputs:
-        lines.append(f"- {item['index']}. {item['title']}")
-    lines.append("")
+    if image_entries:
+        toc_entries.append(("appendix-d-image-gallery", "Appendix D - Image Gallery"))
+    lines = [
+        _heading_with_anchor(1, title, "report-title"),
+        "",
+        _heading_with_anchor(2, "Table of Contents", "table-of-contents"),
+    ]
+    for anchor, label in toc_entries:
+        lines.append(f"- [{label}](#{anchor})")
     lines.extend(
         [
-            "## Methodology",
+            "",
+            _heading_with_anchor(2, "Executive Summary", "executive-summary"),
+        ]
+    )
+    if objective.strip():
+        lines.extend(
+            [
+                "",
+                f"> Objective: {objective.strip()}",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            f"_Generated on {generated_at}_",
+            "",
+        ]
+    )
+    lines.extend(
+        [
+        executive_summary.strip(),
+        "",
+            _heading_with_anchor(2, "Methodology", "methodology"),
             methodology_text.strip(),
             "",
         ]
     )
     for item in section_outputs:
-        lines.append(f"## {item['index']}. {item['title']}")
+        section_anchor = f"section-{item['index']}-{_slugify_heading(item['title'], fallback=f'section-{item['index']}')}"
+        lines.append(_heading_with_anchor(2, f"{item['index']}. {item['title']}", section_anchor))
         lines.append("")
-        lines.append(item["section_text"].strip())
+        lines.append(_strip_leading_section_heading(item["section_text"], section_title=item["title"], section_index=int(item["index"])))
         lines.append("")
     bibliography_md = _bibliography_markdown(consolidated_references, style=citation_style).strip()
     lines.extend([bibliography_md, ""])
-    lines.extend(["## Appendix A - Source List", ""])
+    lines.extend([_heading_with_anchor(2, "Appendix A - Source List", "appendix-a-source-list"), ""])
     if source_entries:
         for item in source_entries:
             lines.append(f"- [{item.get('id', '')}] {item.get('label', '')} - {item.get('url', '')}")
@@ -4236,7 +4369,7 @@ def _build_compiled_markdown(
     lines.append("")
     lines.append(_plagiarism_report_markdown(plagiarism_report).strip())
     lines.append("")
-    lines.extend(["## Appendix C - Research Log", ""])
+    lines.extend([_heading_with_anchor(2, "Appendix C - Research Log", "appendix-c-research-log"), ""])
     if research_log_lines:
         for line in research_log_lines:
             lines.append(f"- {line}")
@@ -4244,7 +4377,15 @@ def _build_compiled_markdown(
         lines.append("- No research log lines were captured.")
     lines.append("")
     lines.append(_image_appendix_markdown(image_entries or []))
-    lines.append("")
+    lines.extend(
+        [
+            "",
+            "---",
+            "",
+            f"_Prepared with Kendr Deep Research on {generated_at}._",
+            "",
+        ]
+    )
     return "\n".join(lines).strip() + "\n"
 
 
@@ -4264,22 +4405,22 @@ def long_document_agent(state):
     if not soul_file or not Path(soul_file).exists():
         state = bootstrap_file_memory(state)
 
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is required for long_document_agent.")
-
     target_pages = _safe_int(state.get("long_document_pages") or state.get("report_target_pages"), 50, 5, 500)
     section_pages = _safe_int(state.get("long_document_section_pages"), 5, 2, 20)
     section_count_default = max(3, math.ceil(target_pages / max(1, section_pages)))
     section_count = _safe_int(state.get("long_document_sections"), section_count_default, 1, 40)
-    title = _normalize_title(state.get("long_document_title", ""), f"Deep Research Report ({target_pages} pages)")
+    title = _normalize_title(state.get("long_document_title", ""), "Deep Research Report")
 
-    _raw_research_model = str(state.get("research_model", "")).strip()
+    draft_selection = model_selection_for_agent("long_document_agent")
+    selected_provider = str(state.get("provider") or draft_selection.get("provider") or "").strip().lower()
+    selected_model = str(state.get("model") or draft_selection.get("model") or "").strip()
+
+    _raw_research_model = str(state.get("research_model") or selected_model).strip()
     _PROVIDER_NAMES = {"openai", "anthropic", "google", "xai", "ollama", "openrouter", "custom", "minimax", "qwen", "glm"}
     if not _raw_research_model or _raw_research_model in _PROVIDER_NAMES:
         if _raw_research_model in _PROVIDER_NAMES:
             log_task_update(DEEP_RESEARCH_LABEL, f"state.research_model='{_raw_research_model}' looks like a provider name, not a model ID — ignoring and using OPENAI_DEEP_RESEARCH_MODEL default.")
-        research_model = DEFAULT_DEEP_RESEARCH_MODEL
+        research_model = selected_model or DEFAULT_DEEP_RESEARCH_MODEL
     else:
         research_model = _raw_research_model
     max_tool_calls = _safe_int(state.get("research_max_tool_calls"), 8, 1, 64)
@@ -4293,6 +4434,25 @@ def long_document_agent(state):
     include_section_references = bool(state.get("long_document_section_references", False))
     section_search_flag = state.get("long_document_section_search")
     web_search_enabled = bool(state.get("research_web_search_enabled", True))
+    native_web_search_enabled = bool(web_search_enabled and supports_native_web_search(research_model, selected_provider))
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if native_web_search_enabled and not api_key:
+        raise ValueError("OPENAI_API_KEY is required when the selected Deep Research model uses native web search.")
+    if web_search_enabled and not native_web_search_enabled:
+        log_task_update(
+            DEEP_RESEARCH_LABEL,
+            (
+                f"{selected_provider or 'selected'} / {research_model} does not expose native web search here. "
+                "Using the Kendr web search client for source gathering instead."
+            ),
+        )
+    web_search_mode = (
+        "native_model"
+        if native_web_search_enabled
+        else "kendr_search"
+        if web_search_enabled
+        else "disabled"
+    )
     use_section_search = web_search_enabled if section_search_flag is None else bool(section_search_flag) and web_search_enabled
     section_search_results_count = _safe_int(state.get("long_document_section_search_results"), 6, 1, 20)
     deep_research_mode = bool(state.get("deep_research_mode", False))
@@ -4346,6 +4506,7 @@ def long_document_agent(state):
             "target_pages": target_pages,
             "section_count": section_count,
             "research_model": research_model,
+            "web_search_mode": web_search_mode,
             "research_kb_enabled": research_kb_enabled,
             "research_kb_id": research_kb_id,
         },
@@ -4359,6 +4520,7 @@ def long_document_agent(state):
     state["research_citation_style"] = citation_style
     state["research_enable_plagiarism_check"] = plagiarism_enabled
     state["research_web_search_enabled"] = web_search_enabled
+    state["research_web_search_mode"] = web_search_mode
     state["research_date_range"] = date_range
     state["research_checkpoint_enabled"] = checkpoint_enabled
     if max_sources > 0:
@@ -4544,6 +4706,8 @@ def long_document_agent(state):
         if str(state.get("approval_pending_scope", "") or "").strip() == "deep_research_confirmation":
             state["approval_request"] = {}
 
+    auto_approve_subplan = bool(state.get("auto_approve", False)) or bool(state.get("auto_approve_plan", False))
+
     approved_outline = state.get("long_document_outline", {})
     if not isinstance(approved_outline, dict):
         approved_outline = {}
@@ -4609,18 +4773,12 @@ def long_document_agent(state):
         state["long_document_plan_data"] = subplan_data
         state["long_document_plan_markdown"] = subplan_md
         state["long_document_plan_version"] = subplan_version
-        state["long_document_plan_waiting_for_approval"] = True
-        state["long_document_plan_status"] = "pending"
-        state["pending_user_input_kind"] = "subplan_approval"
-        state["approval_pending_scope"] = "long_document_plan"
-        state["approval_request"] = approval_request
-        state["pending_user_question"] = approval_request_to_text(approval_request) or approval_prompt
-        state["draft_response"] = state["pending_user_question"]
-        state["_skip_review_once"] = True
-        state["_hold_planned_step_completion_once"] = True
+        state["long_document_outline_md_path"] = outline_storage_path
+        state["long_document_subplan_md_path"] = subplan_storage_path
         state["long_document_replan_requested"] = False
         state["deep_research_result_card"] = {
             "kind": "plan",
+            "status": "approved" if auto_approve_subplan else "pending_approval",
             "title": title,
             "tier": analysis.get("tier", 0),
             "subtopics": analysis.get("subtopics", []),
@@ -4638,34 +4796,68 @@ def long_document_agent(state):
             "selection_rationale": source_strategy.get("selection_rationale", []),
         }
 
-        update_planning_file(
-            state,
-            status="awaiting_subplan_approval",
-            objective=objective,
-            plan_text=state.get("plan", ""),
-            clarifications=state.get("plan_clarification_questions", []),
-            execution_note=f"Deep research subplan v{subplan_version} generated and queued for approval.",
-        )
-        log_task_update(DEEP_RESEARCH_LABEL, "Prepared a section-by-section deep research plan for approval.", subplan_md)
-        _trace_research_event(
-            state,
-            title="Research section plan prepared",
-            detail=f"Generated a section-by-section plan with {len(outline.get('sections', []))} sections and queued it for approval.",
-            status="completed",
-            metadata={"phase": "planning", "section_count": len(outline.get("sections", [])), "version": subplan_version},
-            subtask="Review section plan",
-        )
-        return publish_agent_output(
-            state,
-            "long_document_agent",
-            state["draft_response"],
-            f"deep_research_subplan_{subplan_version}",
-            recipients=["orchestrator_agent", "reviewer_agent", "report_agent"],
-        )
+        if auto_approve_subplan:
+            approved_outline = outline
+            state["long_document_plan_waiting_for_approval"] = False
+            state["long_document_plan_status"] = "approved"
+            state["long_document_execute_from_saved_outline"] = True
+            state["pending_user_input_kind"] = ""
+            state["approval_pending_scope"] = ""
+            state["approval_request"] = {}
+            state["pending_user_question"] = ""
+            state["draft_response"] = _deep_research_subplan_auto_approved_message(
+                title=title,
+                outline=outline,
+                target_pages=target_pages,
+                section_pages=section_pages,
+                web_search_enabled=web_search_enabled,
+                outline_storage_path=outline_storage_path,
+                subplan_storage_path=subplan_storage_path,
+                version=subplan_version,
+            )
+            log_task_update(
+                DEEP_RESEARCH_LABEL,
+                f"Auto-approved section plan v{subplan_version}; continuing to execution.",
+            )
+        else:
+            state["long_document_plan_waiting_for_approval"] = True
+            state["long_document_plan_status"] = "pending"
+            state["pending_user_input_kind"] = "subplan_approval"
+            state["approval_pending_scope"] = "long_document_plan"
+            state["approval_request"] = approval_request
+            state["pending_user_question"] = approval_request_to_text(approval_request) or approval_prompt
+            state["draft_response"] = state["pending_user_question"]
+            state["_skip_review_once"] = True
+            state["_hold_planned_step_completion_once"] = True
+
+        if not auto_approve_subplan:
+            update_planning_file(
+                state,
+                status="awaiting_subplan_approval",
+                objective=objective,
+                plan_text=state.get("plan", ""),
+                clarifications=state.get("plan_clarification_questions", []),
+                execution_note=f"Deep research subplan v{subplan_version} generated and queued for approval.",
+            )
+            log_task_update(DEEP_RESEARCH_LABEL, "Prepared a section-by-section deep research plan for approval.", subplan_md)
+            _trace_research_event(
+                state,
+                title="Research section plan prepared",
+                detail=f"Generated a section-by-section plan with {len(outline.get('sections', []))} sections and queued it for approval.",
+                status="completed",
+                metadata={"phase": "planning", "section_count": len(outline.get("sections", [])), "version": subplan_version},
+                subtask="Review section plan",
+            )
+            return publish_agent_output(
+                state,
+                "long_document_agent",
+                state["draft_response"],
+                f"deep_research_subplan_{subplan_version}",
+                recipients=["orchestrator_agent", "reviewer_agent", "report_agent"],
+            )
     if str(state.get("approval_pending_scope", "") or "").strip() == "long_document_plan":
         state["approval_request"] = {}
 
-    client = OpenAI(api_key=api_key)
     evidence_bank_md = ""
     evidence_sources: list[dict] = []
     evidence_excerpt = ""
@@ -4799,36 +4991,65 @@ def long_document_agent(state):
                     _kb_grounding_summary(kb_grounding),
                     "Task: Build a source-backed evidence bank with URLs, disagreements, numbers, and explicit citations.",
                 ]
-                evidence_pass = _run_research_pass(
-                    client,
-                    query="\n".join(line for line in evidence_query_lines if str(line).strip()),
-                    model=research_model,
-                    instructions=evidence_instructions,
-                    max_tool_calls=max_tool_calls,
-                    max_output_tokens=max_output_tokens_int,
-                    poll_interval_seconds=poll_interval_seconds,
-                    max_wait_seconds=max_wait_seconds,
-                    heartbeat_interval_seconds=heartbeat_seconds,
-                    heartbeat_label="Evidence bank research in progress",
-                    heartbeat_callback=lambda elapsed: _trace_research_event(
-                        state,
-                        title="Collecting evidence bank",
-                        detail=f"Shared evidence bank research still running ({elapsed}s elapsed).",
-                        command=objective,
-                        status="running",
-                        metadata={"phase": "evidence_bank", "elapsed_seconds": elapsed},
-                        subtask="Build cross-report evidence bank",
-                    ),
-                    cancel_check=lambda: _raise_if_cancelled(state, phase="evidence_bank"),
-                )
+                if native_web_search_enabled:
+                    evidence_pass = _run_research_pass(
+                        OpenAI(api_key=api_key),
+                        query="\n".join(line for line in evidence_query_lines if str(line).strip()),
+                        model=research_model,
+                        instructions=evidence_instructions,
+                        max_tool_calls=max_tool_calls,
+                        max_output_tokens=max_output_tokens_int,
+                        poll_interval_seconds=poll_interval_seconds,
+                        max_wait_seconds=max_wait_seconds,
+                        heartbeat_interval_seconds=heartbeat_seconds,
+                        heartbeat_label="Evidence bank research in progress",
+                        heartbeat_callback=lambda elapsed: _trace_research_event(
+                            state,
+                            title="Collecting evidence bank",
+                            detail=f"Shared evidence bank research still running ({elapsed}s elapsed).",
+                            command=objective,
+                            status="running",
+                            metadata={"phase": "evidence_bank", "elapsed_seconds": elapsed},
+                            subtask="Build cross-report evidence bank",
+                        ),
+                        cancel_check=lambda: _raise_if_cancelled(state, phase="evidence_bank"),
+                    )
+                    evidence_sources = _merge_sources(
+                        explicit_source_entries,
+                        _extract_source_entries(evidence_pass, max_sources=max_sources or 60),
+                        max_sources=max_sources or 120,
+                    )
+                    evidence_notes_text = str(evidence_pass.get("output_text", "")).strip()
+                else:
+                    evidence_pass = {
+                        "response_id": "kendr_search_evidence_bank",
+                        "status": "fallback_web_search",
+                        "elapsed_seconds": 0,
+                        "output_text": _build_local_only_research_notes(
+                            objective=objective,
+                            focus="overall report evidence bank",
+                            local_entries=local_entries,
+                            url_entries=url_entries,
+                        ),
+                        "raw": {
+                            "reason": "native_web_search_unavailable",
+                            "search_provider": str((search_results or {}).get("provider", "")).strip(),
+                            "search_providers_tried": list((search_results or {}).get("providers_tried", []) or []),
+                        },
+                    }
+                    evidence_sources = _merge_sources(
+                        explicit_source_entries,
+                        _sources_from_kb_grounding(kb_grounding),
+                        max_sources=max_sources or 120,
+                    )
+                    evidence_sources = _merge_sources(
+                        evidence_sources,
+                        _sources_from_search_results(search_results.get("results", [])),
+                        max_sources=max_sources or 120,
+                    )
+                    evidence_notes_text = str(evidence_pass.get("output_text", "")).strip()
                 evidence_pass["research_kb"] = kb_grounding
                 evidence_pass["research_kb_warning"] = kb_warning
-                evidence_sources = _merge_sources(
-                    explicit_source_entries,
-                    _extract_source_entries(evidence_pass, max_sources=max_sources or 60),
-                    max_sources=max_sources or 120,
-                )
-                evidence_notes_text = str(evidence_pass.get("output_text", "")).strip()
             else:
                 search_results = {"results": [], "error": "Web search disabled by user."}
                 evidence_pass = {
@@ -4882,7 +5103,7 @@ def long_document_agent(state):
             state["long_document_evidence_bank_excerpt"] = evidence_excerpt
             state["long_document_evidence_sources"] = evidence_sources
             evidence_status = str(evidence_pass.get("status", "")).strip() or "completed"
-            evidence_completed = "completed" if evidence_status in {"completed", "local_only", "evidence_bank"} else "failed"
+            evidence_completed = "completed" if evidence_status in {"completed", "local_only", "evidence_bank", "fallback_web_search"} else "failed"
             evidence_detail = (
                 f"Evidence bank ready with {len(evidence_sources)} consolidated sources."
                 if evidence_completed == "completed"
@@ -5045,6 +5266,7 @@ def long_document_agent(state):
                         continuity_notes=continuity_notes,
                         coherence_context_md=coherence_context_md,
                         web_search_enabled=web_search_enabled,
+                        native_web_search_enabled=native_web_search_enabled,
                         research_model=research_model,
                         research_instructions=research_instructions,
                         max_tool_calls=max_tool_calls,
@@ -5106,6 +5328,7 @@ def long_document_agent(state):
                         continuity_notes=continuity_notes,
                         coherence_context_md=coherence_context_md,
                         web_search_enabled=web_search_enabled,
+                        native_web_search_enabled=native_web_search_enabled,
                         research_model=research_model,
                         research_instructions=research_instructions,
                         max_tool_calls=max_tool_calls,
@@ -5516,7 +5739,8 @@ def long_document_agent(state):
         )
         section_text = llm_text(section_prompt).strip()
         if not section_text:
-            section_text = f"## {section_title}\n\nNo section text was generated."
+            section_text = "No section text was generated."
+        section_text = _strip_leading_section_heading(section_text, section_title=section_title, section_index=write_index)
         section_text = _ensure_section_citations(section_text, package.get("sources", []))
         existing_tables = _extract_markdown_tables(section_text)
         existing_flowcharts = _extract_mermaid_blocks(section_text)
@@ -5798,15 +6022,12 @@ Section continuity notes:
         )
     else:
         log_task_update(DEEP_RESEARCH_LABEL, "Plagiarism check disabled — skipping.")
-    plagiarism_sources = [{"label": "Evidence bank", "url": "", "text": evidence_bank_md}]
-    for package in section_packages:
-        plagiarism_sources.append(
-            {
-                "label": str(package.get("title", "")).strip() or "Section research",
-                "url": "",
-                "text": str(package.get("research_text", "")).strip(),
-            }
-        )
+    plagiarism_sources = _build_plagiarism_source_texts(
+        evidence_bank_md=evidence_bank_md,
+        section_packages=section_packages,
+        local_entries=local_entries,
+        url_entries=url_entries,
+    )
     plagiarism_report = (
         _build_plagiarism_report(section_outputs, plagiarism_sources)
         if plagiarism_enabled
@@ -6100,6 +6321,16 @@ Section continuity notes:
             subtask="Build image gallery appendix",
         )
 
+    downloadable_report_formats: list[str] = []
+    if alias_results.get("pdf"):
+        downloadable_report_formats.append("PDF")
+    if alias_results.get("docx"):
+        downloadable_report_formats.append("DOCX")
+    if alias_results.get("html"):
+        downloadable_report_formats.append("HTML")
+    downloadable_report_formats.append("MD")
+    export_issue_line = f"- Export issues: {'; '.join(export_errors)}\n" if export_errors else ""
+
     final_summary = (
         f"Deep research pipeline completed.\n"
         f"- Title: {title}\n"
@@ -6108,27 +6339,18 @@ Section continuity notes:
         f"- Sections produced: {len(section_outputs)}\n"
         f"- Words: {total_words}\n"
         f"- Sources: {total_sources}\n"
-        f"- Web search: {'enabled' if web_search_enabled else 'disabled'}\n"
+        f"- Web search: {'disabled' if not web_search_enabled else 'enabled via native model web search' if native_web_search_enabled else 'enabled via Kendr search client'}\n"
         f"- Local file sources: {len(local_entries)}\n"
         f"- Explicit URL sources: {len(url_entries)}\n"
         f"- Knowledge base: {str(kb_grounding.get('kb_name', '') or 'disabled') if research_kb_enabled else 'disabled'}\n"
         f"- Knowledge base hits: {int(kb_grounding.get('hit_count', 0) or 0)}\n"
         f"- Citations: {len(consolidated_references)}\n"
         f"- Plagiarism: {plagiarism_report.get('overall_score', 0)}% ({plagiarism_report.get('status', 'PASS')})\n"
-        f"- Compiled markdown: {OUTPUT_DIR}/{compiled_filename}\n"
-        f"- Compiled HTML: {export_paths.get('html', 'n/a') or 'n/a'}\n"
-        f"- Compiled DOCX: {export_paths.get('docx', 'n/a') or 'n/a'}\n"
-        f"- Compiled PDF: {export_paths.get('pdf', 'n/a') or 'n/a'}\n"
-        f"- References: {OUTPUT_DIR}/{references_md_filename}\n"
-        f"- Visual index: {OUTPUT_DIR}/{visual_index_md_filename}\n"
-        f"- Plagiarism report: {OUTPUT_DIR}/{plagiarism_json_filename}\n"
-        f"- Evidence bank: {state.get('long_document_evidence_bank_path', 'n/a')}\n"
-        f"- Source ledger: {OUTPUT_DIR}/{source_ledger_filename}\n"
-        f"- Coverage report: {OUTPUT_DIR}/{coverage_report_filename}\n"
-        f"- Quality report: {OUTPUT_DIR}/{quality_report_filename}\n"
+        f"- Report downloads in chat: {', '.join(downloadable_report_formats)}\n"
+        f"- Supporting research files: references, evidence bank, source ledger, coverage report, quality report, manifest\n"
         f"- Visual assets generated: {total_tables} tables, {total_flowcharts} flowcharts\n"
         f"- Web images collected: {total_images} (Appendix D)\n"
-        f"- Manifest: {OUTPUT_DIR}/{manifest_filename}\n"
+        f"{export_issue_line}"
         "\nExecutive summary:\n"
         f"{_trim_text(executive_summary, 1800)}\n"
     )
@@ -6241,7 +6463,9 @@ Section continuity notes:
         "quality_status": quality_report.get("status", ""),
         "quality_flags": quality_report.get("flags", []),
         "created_artifacts": created_artifacts,
+        "downloadable_reports": [artifact for artifact in created_artifacts if artifact.get("kind") == "report"],
         "export_errors": export_errors,
+        "web_search_mode": web_search_mode,
         "image_count": total_images,
         "images": [
             {"section": e.get("section_title", ""), "file": e.get("filename", ""), "path": e.get("abs_path", "")}

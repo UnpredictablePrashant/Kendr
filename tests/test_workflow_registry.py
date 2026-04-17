@@ -221,7 +221,29 @@ class WorkflowRegistryTests(unittest.TestCase):
         self.assertEqual(plan.agent_name, "long_document_agent")
         self.assertEqual(plan.intent, "drive-informed-long-document")
         self.assertEqual(plan.state_updates["long_document_pages"], 50)
+        self.assertTrue(plan.state_mutations["long_document_mode"])
+        self.assertTrue(plan.state_mutations["long_document_job_started"])
         self.assertIn("Quarterly revenue and churn evidence", plan.content)
+
+    def test_match_explicit_workflow_blocks_drive_informed_long_document_after_completion(self):
+        with (
+            patch("kendr.runtime.build_setup_snapshot", side_effect=self._fake_setup_snapshot),
+            patch("tasks.a2a_protocol.upsert_agent_card"),
+            patch("tasks.a2a_protocol.insert_message"),
+            patch("tasks.a2a_protocol.upsert_task"),
+            patch("tasks.a2a_protocol.insert_artifact"),
+        ):
+            runtime = AgentRuntime(build_registry())
+            state = runtime.build_initial_state("Do deep research on this dataset and produce a full report.")
+            state["local_drive_force_long_document"] = True
+            state["local_drive_calls"] = 1
+            state["long_document_mode"] = True
+            state["local_drive_summary"] = "Quarterly revenue and churn evidence from uploaded spreadsheets."
+            state["long_document_compiled_path"] = "output/final_report.md"
+            state["last_agent"] = "reviewer_agent"
+            plan = match_explicit_workflow(runtime, state, stage="post_approval")
+
+        self.assertIsNone(plan)
 
     def test_match_explicit_workflow_returns_research_pipeline_continue_plan(self):
         with (

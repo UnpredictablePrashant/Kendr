@@ -57,10 +57,15 @@ class DeepResearchAgentTests(unittest.TestCase):
         self.assertTrue(result["research_kb_used"])
         self.assertEqual(result["research_kb_name"], "finance-kb")
         self.assertEqual(result["research_kb_hit_count"], 2)
+        self.assertIn("Deep Research Brief", result["research_result"])
+        self.assertIn("Coverage:", result["research_result"])
         self.assertIn("Sources:", result["research_result"])
         self.assertIn("Knowledge base: finance-kb (2 hits)", result["research_result"])
         self.assertIn("KB source: file:///tmp/report.md", result["research_result"])
+        self.assertIn("Recommended Next Steps:", result["research_result"])
         self.assertIn("Knowledge base: finance-kb (2 hits)", result["research_source_summary"][0])
+        self.assertEqual(result["deep_research_result_card"]["kind"], "brief")
+        self.assertTrue(result["deep_research_result_card"]["web_search_enabled"])
 
     def test_deep_research_agent_rejects_kb_only_run_when_kb_fails(self):
         from tasks import research_tasks
@@ -113,7 +118,11 @@ class DeepResearchAgentTests(unittest.TestCase):
         self.assertTrue(result["research_kb_used"])
         self.assertEqual(result["research_kb_hit_count"], 1)
         self.assertEqual(result["research_raw"]["provided_url_count"], 1)
+        self.assertIn("Deep Research Brief", result["research_result"])
+        self.assertIn("Coverage:", result["research_result"])
         self.assertIn("Sources:", result["research_result"])
         self.assertIn("Knowledge base: finance-kb (1 hit)", result["research_result"])
         self.assertIn("Provided URL: https://example.com/report", result["research_result"])
+        self.assertIn("Recommended Next Steps:", result["research_result"])
         self.assertIn("- Provided URL: https://example.com/report", result["research_source_summary"])
+        self.assertEqual(result["deep_research_result_card"]["mode"], "local_only")

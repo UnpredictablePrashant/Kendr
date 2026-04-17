@@ -2,11 +2,12 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
 import { randomUUID } from 'crypto'
 import { join } from 'path'
 import { existsSync, readdirSync, statSync, readFileSync, writeFileSync, mkdirSync, rmSync, renameSync } from 'fs'
-import { exec, execSync } from 'child_process'
+import { exec } from 'child_process'
 import { Store } from './store.js'
 import os from 'os'
 import path from 'path'
 import { BackendManager } from './backend.js'
+import { UpdateManager } from './updater.js'
 
 let pty
 try {
@@ -30,6 +31,13 @@ const store = new Store({
     gitEmail:        '',
     githubPat:       '',
     autoStartBackend: true,
+    updatesEnabled:  true,
+    updateBaseUrl:   '',
+    updateChannel:   'latest',
+    autoDownloadUpdates: true,
+    autoInstallOnQuit: true,
+    allowPrereleaseUpdates: false,
+    updateCheckIntervalMinutes: 240,
     windowBounds:    { width: 1400, height: 900 },
     sidebarWidth:    260,
     chatPanelWidth:  380,
@@ -43,6 +51,7 @@ const store = new Store({
 })
 
 const backend = new BackendManager(store)
+const updates = new UpdateManager(store, { getMainWindow: () => mainWindow })
 const ptyProcesses = new Map()
 let mainWindow = null
 
@@ -97,6 +106,10 @@ app.whenReady().then(async () => {
   backend.onChange((status) => {
     mainWindow?.webContents.send('backend:status-push', status)
   })
+  updates.onChange((status) => {
+    mainWindow?.webContents.send('updates:status-push', status)
+  })
+  updates.init()
 
   // Auto-start gateway + UI server
   if (store.get('autoStartBackend')) {
@@ -130,9 +143,18 @@ ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false)
 ipcMain.handle('settings:get', (_, key) => key ? store.get(key) : store.store)
 ipcMain.handle('settings:set', (_, key, value) => {
   store.set(key, value)
+  if (updates.isUpdateSettingKey(key)) {
+    updates.refreshConfig()
+  }
   return true
 })
 ipcMain.handle('settings:getAll', () => store.store)
+
+// ─── Application Updates ─────────────────────────────────────────────────────
+ipcMain.handle('updates:status', () => updates.status())
+ipcMain.handle('updates:check', () => updates.checkForUpdates({ manual: true }))
+ipcMain.handle('updates:download', () => updates.downloadUpdate())
+ipcMain.handle('updates:install', () => ({ ok: updates.quitAndInstall() }))
 
 // ─── Backend Management ───────────────────────────────────────────────────────
 ipcMain.handle('backend:status',  () => backend.status())

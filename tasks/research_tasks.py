@@ -10,6 +10,7 @@ from kendr.rag_manager import build_research_grounding
 from tasks.a2a_agent_utils import begin_agent_session, publish_agent_output
 from tasks.coding_tasks import _extract_output_text
 from tasks.research_infra import fetch_url_content, llm_text, parse_documents
+from tasks.research_output import render_phase0_report, split_sources_section
 from tasks.utils import OUTPUT_DIR, log_task_update, write_text_file
 
 
@@ -43,6 +44,7 @@ AGENT_METADATA = {
             "research_kb_citations",
             "research_kb_warning",
             "research_source_summary",
+            "deep_research_result_card",
         ],
         "requirements": ["openai"],
         "display_name": "Deep Research Agent",
@@ -129,15 +131,81 @@ def _research_source_summary_lines(
     return lines
 
 
-def _ensure_sources_section(output_text: str, source_lines: list[str]) -> str:
-    text = str(output_text or "").strip()
-    if not source_lines:
-        return text
-    if "\nSources:\n" in text or text.startswith("Sources:\n"):
-        return text
-    if text:
-        return f"{text}\n\nSources:\n" + "\n".join(source_lines)
-    return "Sources:\n" + "\n".join(source_lines)
+def _research_coverage_lines(
+    *,
+    web_search_enabled: bool,
+    model: str,
+    local_meta: dict,
+    kb_enabled: bool,
+    kb_grounding: dict[str, Any],
+    kb_warning: str,
+) -> list[str]:
+    lines = [
+        f"Mode: {'web-backed' if web_search_enabled else 'local-only'}",
+        f"Web search: {'enabled' if web_search_enabled else 'disabled'}",
+        f"Model: {model if web_search_enabled else 'local-only-synthesis'}",
+        f"Local files reviewed: {int((local_meta or {}).get('local_file_count', 0) or 0)}",
+        f"Provided URLs reviewed: {int((local_meta or {}).get('provided_url_count', 0) or 0)}",
+    ]
+
+    kb_name = str((kb_grounding or {}).get("kb_name", "") or "").strip()
+    kb_hits = int((kb_grounding or {}).get("hit_count", 0) or 0)
+    if kb_enabled or kb_name or kb_hits:
+        lines.append(f"Knowledge base: {kb_name or 'configured'}")
+        lines.append(f"Knowledge base hits: {kb_hits}")
+    else:
+        lines.append("Knowledge base: disabled")
+
+    if kb_warning:
+        lines.append(f"Knowledge base note: {kb_warning}")
+    return lines
+
+
+def _research_next_steps(
+    *,
+    web_search_enabled: bool,
+    local_meta: dict,
+    kb_enabled: bool,
+    kb_grounding: dict[str, Any],
+) -> list[str]:
+    steps: list[str] = []
+    if int((local_meta or {}).get("local_file_count", 0) or 0) > 0:
+        steps.append("Review the highest-signal local files for exact numbers, dates, and quotations before sharing this brief.")
+    if web_search_enabled or int((local_meta or {}).get("provided_url_count", 0) or 0) > 0:
+        steps.append("Cross-check the highest-impact claims against a second independent source before treating them as final.")
+    if int((kb_grounding or {}).get("hit_count", 0) or 0) > 0:
+        steps.append("Inspect the cited knowledge-base entries to confirm they still match the current evidence set.")
+    elif kb_enabled:
+        steps.append("Rebuild or retune the knowledge-base index if you expected internal grounding for this query.")
+    if not steps:
+        steps.append("Gather at least one primary source before relying on this brief for external decisions.")
+    return steps[:3]
+
+
+def _build_research_result_card(
+    *,
+    query: str,
+    web_search_enabled: bool,
+    local_meta: dict,
+    kb_grounding: dict[str, Any],
+    kb_warning: str,
+    source_summary: list[str],
+) -> dict[str, Any]:
+    return {
+        "kind": "brief",
+        "title": "Deep Research Brief",
+        "query": query,
+        "mode": "web" if web_search_enabled else "local_only",
+        "web_search_enabled": web_search_enabled,
+        "local_sources": int((local_meta or {}).get("local_file_count", 0) or 0),
+        "provided_urls": int((local_meta or {}).get("provided_url_count", 0) or 0),
+        "research_kb_used": bool((kb_grounding or {}).get("prompt_context")),
+        "research_kb_name": str((kb_grounding or {}).get("kb_name", "") or ""),
+        "research_kb_hit_count": int((kb_grounding or {}).get("hit_count", 0) or 0),
+        "research_kb_citations": list((kb_grounding or {}).get("citations", []) or []),
+        "research_kb_warning": kb_warning,
+        "source_summary": list(source_summary or []),
+    }
 
 
 def _build_local_source_context(state: dict, query: str, *, include_urls: bool) -> tuple[str, dict]:
@@ -289,6 +357,28 @@ def deep_research_agent(state):
         if str(part).strip()
     ).strip()
     source_summary = _research_source_summary_lines(state, local_meta=local_meta, kb_grounding=kb_grounding)
+    coverage_summary = _research_coverage_lines(
+        web_search_enabled=web_search_enabled,
+        model=str(model),
+        local_meta=local_meta,
+        kb_enabled=kb_enabled,
+        kb_grounding=kb_grounding,
+        kb_warning=kb_warning,
+    )
+    recommended_next_steps = _research_next_steps(
+        web_search_enabled=web_search_enabled,
+        local_meta=local_meta,
+        kb_enabled=kb_enabled,
+        kb_grounding=kb_grounding,
+    )
+    result_card = _build_research_result_card(
+        query=query,
+        web_search_enabled=web_search_enabled,
+        local_meta=local_meta,
+        kb_grounding=kb_grounding,
+        kb_warning=kb_warning,
+        source_summary=source_summary,
+    )
 
     if not web_search_enabled:
         local_only_prompt = f"""
@@ -306,7 +396,16 @@ Write a source-aware research memo that:
 - calls out gaps or uncertainty clearly
 - ends with a concise recommended next-steps section
 """
-        output_text = _ensure_sources_section(llm_text(local_only_prompt).strip(), source_summary)
+        raw_output_text = llm_text(local_only_prompt).strip()
+        findings_text, cited_sources = split_sources_section(raw_output_text)
+        output_text = render_phase0_report(
+            title="Deep Research Brief",
+            objective=query,
+            findings=findings_text or raw_output_text,
+            coverage_lines=coverage_summary,
+            next_steps=recommended_next_steps,
+            sources_lines=[*source_summary, *cited_sources],
+        )
         payload = {
             "mode": "local_only",
             "query": query,
@@ -316,7 +415,10 @@ Write a source-aware research memo that:
             "research_kb": kb_grounding,
             "research_kb_used": bool(kb_grounding.get("prompt_context")),
             "research_kb_warning": kb_warning,
-            "source_summary": source_summary,
+            "source_summary": [*source_summary, *cited_sources],
+            "coverage_summary": coverage_summary,
+            "recommended_next_steps": recommended_next_steps,
+            "raw_output_text": raw_output_text,
             "output_text": output_text,
         }
         raw_filename = f"deep_research_raw_{call_number}.json"
@@ -333,7 +435,11 @@ Write a source-aware research memo that:
         state["research_kb_hit_count"] = int((kb_grounding or {}).get("hit_count", 0) or 0)
         state["research_kb_citations"] = list((kb_grounding or {}).get("citations", []) or [])
         state["research_kb_warning"] = kb_warning
-        state["research_source_summary"] = source_summary
+        state["research_source_summary"] = payload["source_summary"]
+        state["deep_research_result_card"] = {
+            **result_card,
+            "source_summary": list(payload["source_summary"]),
+        }
         state["draft_response"] = output_text
         log_task_update(
             "Deep Research",
@@ -411,9 +517,20 @@ Write a source-aware research memo that:
     payload["research_kb"] = kb_grounding
     payload["research_kb_used"] = bool(kb_grounding.get("prompt_context"))
     payload["research_kb_warning"] = kb_warning
-    payload["source_summary"] = source_summary
-    output_text = getattr(response, "output_text", None) or _extract_output_text(payload)
-    output_text = _ensure_sources_section(output_text, source_summary)
+    raw_output_text = getattr(response, "output_text", None) or _extract_output_text(payload)
+    findings_text, cited_sources = split_sources_section(raw_output_text)
+    payload["source_summary"] = [*source_summary, *cited_sources]
+    payload["coverage_summary"] = coverage_summary
+    payload["recommended_next_steps"] = recommended_next_steps
+    payload["raw_output_text"] = raw_output_text
+    output_text = render_phase0_report(
+        title="Deep Research Brief",
+        objective=query,
+        findings=findings_text or raw_output_text,
+        coverage_lines=coverage_summary,
+        next_steps=recommended_next_steps,
+        sources_lines=payload["source_summary"],
+    )
     payload["output_text"] = output_text
 
     raw_filename = f"deep_research_raw_{call_number}.json"
@@ -432,7 +549,11 @@ Write a source-aware research memo that:
     state["research_kb_hit_count"] = int((kb_grounding or {}).get("hit_count", 0) or 0)
     state["research_kb_citations"] = list((kb_grounding or {}).get("citations", []) or [])
     state["research_kb_warning"] = kb_warning
-    state["research_source_summary"] = source_summary
+    state["research_source_summary"] = payload["source_summary"]
+    state["deep_research_result_card"] = {
+        **result_card,
+        "source_summary": list(payload["source_summary"]),
+    }
     state["draft_response"] = output_text
 
     log_task_update(

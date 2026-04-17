@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
+from kendr.unicode_utils import sanitize_text
 from tasks.setup_config_store import apply_setup_env_defaults
 
 load_dotenv()
@@ -235,6 +236,7 @@ file_handler = logging.FileHandler(
     os.path.join(ACTIVE_OUTPUT_DIR, "execution.log"),
     mode="w",
     encoding="utf-8",
+    errors="replace",
 )
 file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 
@@ -254,27 +256,27 @@ def normalize_llm_text(value) -> str:
     if value is None:
         return ""
     if isinstance(value, str):
-        return value
+        return sanitize_text(value)
     if isinstance(value, bytes):
         try:
-            return value.decode("utf-8")
+            return sanitize_text(value.decode("utf-8"))
         except Exception:
-            return str(value)
+            return sanitize_text(str(value))
     if isinstance(value, list):
         parts: list[str] = []
         for item in value:
             if isinstance(item, str):
-                parts.append(item)
+                parts.append(sanitize_text(item))
                 continue
             if isinstance(item, dict):
                 text_value = item.get("text")
                 if text_value is None:
                     text_value = item.get("content")
-                parts.append(str(text_value) if text_value is not None else str(item))
+                parts.append(sanitize_text(text_value if text_value is not None else item))
                 continue
-            parts.append(str(item))
+            parts.append(sanitize_text(item))
         return "\n".join(part for part in parts if part is not None)
-    return str(value)
+    return sanitize_text(value)
 
 
 def resolve_output_path(filename: str | os.PathLike[str]) -> str:
@@ -300,6 +302,7 @@ def set_active_output_dir(path: str, *, append: bool = False) -> str:
         os.path.join(ACTIVE_OUTPUT_DIR, "execution.log"),
         mode="a" if append else "w",
         encoding="utf-8",
+        errors="replace",
     )
     file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(file_handler)
@@ -317,13 +320,13 @@ def create_run_output_dir(run_id: str, base_dir: str | None = None) -> str:
 
 
 def log_task_update(task_name: str, message: str, content: str | None = None):
-    logger.info(f"[{task_name}] {message}")
+    logger.info(f"[{sanitize_text(task_name)}] {sanitize_text(message)}")
     if content:
-        logger.info(content.strip())
+        logger.info(sanitize_text(content).strip())
 
 
 def log_file_action(action: str, path: str) -> None:
-    logger.info(f"[files] {action}: {path}")
+    logger.info(f"[files] {sanitize_text(action)}: {sanitize_text(path)}")
 
 
 def normalize_llm_response(response) -> str:
@@ -346,7 +349,7 @@ def _to_str(content) -> str:
 def write_text_file(filename: str, content):
     filepath = resolve_output_path(filename)
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w", encoding="utf-8") as f:
+    with open(filepath, "w", encoding="utf-8", errors="replace") as f:
         f.write(_to_str(content))
     log_file_action("wrote", filepath)
 
@@ -362,14 +365,14 @@ def write_binary_file(filename: str, content: bytes):
 def append_text_file(filename: str, content):
     filepath = resolve_output_path(filename)
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "a", encoding="utf-8") as f:
+    with open(filepath, "a", encoding="utf-8", errors="replace") as f:
         f.write(_to_str(content))
 
 
 def reset_text_file(filename: str, content=""):
     filepath = resolve_output_path(filename)
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w", encoding="utf-8") as f:
+    with open(filepath, "w", encoding="utf-8", errors="replace") as f:
         f.write(_to_str(content))
 
 

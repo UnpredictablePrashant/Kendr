@@ -542,6 +542,8 @@ def _match_drive_informed_long_document(runtime: Any, state: dict[str, Any]) -> 
     return bool(
         not state.get("plan_steps")
         and bool(state.get("local_drive_force_long_document", False))
+        and not bool(state.get("long_document_job_started", False))
+        and not _deep_research_pipeline_completed(state)
         and runtime._is_long_document_request(state)
         and runtime._is_agent_available(state, "long_document_agent")
         and state.get("last_agent") != "long_document_agent"
@@ -575,6 +577,10 @@ def _build_drive_informed_long_document_plan(runtime: Any, state: dict[str, Any]
         intent="drive-informed-long-document",
         content=long_doc_objective,
         state_updates=updates,
+        state_mutations={
+            "long_document_mode": True,
+            "long_document_job_started": True,
+        },
         decision_note=(
             "next_agent=long_document_agent\n"
             f"reason={reason}\n"

@@ -4413,6 +4413,42 @@ Return ONLY valid JSON in this exact schema:
     def _restore_pending_user_input(self, initial_state: RuntimeState, prior_channel_state: Mapping[str, Any], user_query: str) -> None:
         restore_pending_user_input(self, initial_state, prior_channel_state, user_query)
 
+    def _seed_resumed_plan_step_statuses(self, state: RuntimeState, *, resume_index: int) -> None:
+        steps = state.get("plan_steps", [])
+        if not isinstance(steps, list) or not steps:
+            return
+        if any(str(step.get("status", "")).strip() for step in steps if isinstance(step, dict)):
+            return
+
+        resolved_index = max(0, min(int(resume_index or 0), len(steps) - 1))
+        completed_count = 0
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                continue
+            step["started_at"] = None
+            step["completed_at"] = None
+            step["result_summary"] = None
+            step["error"] = None
+            if index < resolved_index:
+                step["status"] = "completed"
+                completed_count += 1
+            elif index == resolved_index:
+                step["status"] = "ready"
+            else:
+                step["status"] = "waiting"
+
+        if resolved_index > 0 and not str(state.get("last_completed_plan_step_id", "")).strip():
+            previous_step = steps[resolved_index - 1]
+            if isinstance(previous_step, dict):
+                previous_id = self._plan_step_id(previous_step, resolved_index - 1)
+                state["last_completed_plan_step_id"] = previous_id
+                state["last_completed_plan_step_title"] = str(
+                    previous_step.get("title")
+                    or previous_step.get("task")
+                    or previous_id
+                ).strip()
+        state["plan_execution_count"] = max(int(state.get("plan_execution_count", 0) or 0), completed_count)
+
     def _restore_from_resume_checkpoint(
         self,
         initial_state: RuntimeState,
@@ -4559,6 +4595,10 @@ Return ONLY valid JSON in this exact schema:
                 initial_state["plan_step_index"] = max(
                     0,
                     min(failed_index, max(0, len(initial_state.get("plan_steps", [])) - 1)),
+                )
+                self._seed_resumed_plan_step_statuses(
+                    initial_state,
+                    resume_index=int(initial_state.get("plan_step_index", 0) or 0),
                 )
                 initial_state["plan_ready"] = initial_state.get("plan_approval_status") == "approved" and not state_awaiting_user_input(initial_state)
                 initial_state["plan_needs_clarification"] = False
